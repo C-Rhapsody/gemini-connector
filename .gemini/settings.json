@@ -1,0 +1,12 @@
+{
+    "context": {
+        "fileName": [
+            "gemini.md",
+            "personality.md"
+        ]
+    },
+    "model": {
+        "compressionThreshold": 0.5,
+        "disableLoopDetection": true
+    }
+}

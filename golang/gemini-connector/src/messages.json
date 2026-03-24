@@ -1,0 +1,14 @@
+{
+  "StartupWelcome": "🔔 텔레그램 컨트롤러 모드 가동 완료. 명령을 기다립니다.\n\n━━━━━━━━━━━━━\ngemini-connector 가동 완료",
+  "CommandStartHelp": "텔레그램 컨트롤러 모드 가동 중. 메시지를 입력하시면 처리합니다.",
+  "CommandUnknown": "알 수 없는 명령어입니다.",
+  "ErrorMediaNotSupported": "⚠️ 현재 시스템은 동영상, 음성 및 일반 문서 파일 분석을 지원하지 않습니다. 텍스트 및 이미지 파일만 전송해 주십시오.",
+  "ErrorMediaDownloadFail": "미디어 다운로드에 실패했습니다.",
+  "ErrorMissingUUID": "❌ 봇 설정 오류: .env 파일에 GEMINI_SESSION_UUID가 설정되지 않았습니다.",
+  "ErrorCLIFailure": "❌ 시스템 실행 오류 발생.\n\nError: %v\n\nLog: ...%s",
+  "ErrorNoValidJSON": "❌ 시스템 응답에서 유효한 데이터를 찾지 못했습니다.",
+  "ErrorJSONParseFail": "❌ 시스템 응답을 해석하는 데 실패했습니다.",
+  "ErrorSystemResponse": "⚠️ 시스템 응답 오류: %s",
+  "ErrorEmptyResponse": "⚠️ 명령이 빈 응답을 반환했습니다.",
+  "DefaultMediaPrompt": "Analyze the attached media file(s) comprehensively. Describe the contents, text, and context in detail. Please provide the final response in Korean."
+}

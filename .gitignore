@@ -1,0 +1,34 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Environment Variables
+.env
+
+# Go workspace
+go.work
+go.work.sum
+
+# Go build
+bin/
+obj/
+dist/
+
+# Test output
+*.out
+*.coverprofile
+
+# Project Directories
+Microsoft/
+script/*
+!script/.gitkeep
+
+# Gemini AI Configuration
+.gemini/gemini.md
+.gemini/personality.md
+
+# Logs
+bot.log
+*.log
