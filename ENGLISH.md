@@ -19,6 +19,7 @@ To build and run this connector, the following software must be installed on you
 -   **Media Album Buffering:** When multiple photos or files are sent simultaneously via Telegram (as an album), a 2-second debounce buffer collects them into a single, unified prompt for the AI.
 -   **Intelligent Retry & Resilience:** Detects `429 Too Many Requests` (Rate Limit) errors from the Telegram API, parses the `Retry-After` headers, and safely waits before retrying.
 -   **Externalized Messaging:** All welcome messages and error text are managed externally in a `messages.json` file, allowing easy customization without recompiling the source code.
+-   **Interactive Session Helper (TUI):** If `GEMINI_SESSION_UUID` is missing in `.env`, the connector automatically fetches existing Gemini sessions and displays them in a paginated list (10 per page, sorted by latest activity). Users can simply pick a number to link the session. If no sessions exist, it automatically creates a new one and then displays the updated list for the user to select.
 
 ## Directory Structure
 
@@ -47,23 +48,21 @@ Following the new architecture, source code, executables, and data are clearly s
 1.  **Obtain Telegram Bot Token:**
     -   Talk to `@BotFather` on Telegram to create a new bot and obtain the `TELEGRAM_BOT_TOKEN`.
 
-2.  **Create a Gemini CLI Session (Get UUID):**
-    -   Open a terminal and start a new session dedicated to Telegram.
+2.  **Gemini CLI Session Setup (UUID):**
+    -   **Automatic Setup (Recommended):** When you run the connector in Step 3, an interactive TUI helper will automatically list your sessions. Simply enter the number of the session you want to use, and the UUID will be saved to `.env` automatically.
+    -   **Manual Setup:** If you prefer to manually create a session and obtain its UUID:
         ```bash
         gemini -y -p "You are my Telegram assistant."
-        ```
-    -   List the sessions to copy the unique UUID of the newly created session.
-        ```bash
         gemini --list-sessions
         ```
 
 3.  **Configuration (.env):**
     -   Create a `.env` file inside the `src/` folder, or run the connector once to trigger the setup wizard.
-    -   Fill in your token, chat ID, and the copied UUID:
+    -   Enter your Telegram Bot Token, and then follow the **Session Selection TUI** to pick your Gemini session.
     ```ini
     TELEGRAM_BOT_TOKEN=your_telegram_bot_token
     TELEGRAM_CHAT_ID=your_chat_id
-    GEMINI_SESSION_UUID=your_gemini_session_uuid_here
+    GEMINI_SESSION_UUID=auto_or_manually_entered_uuid
     ```
 
 4.  **Configure AI Personality & Guidelines (Optional):**
