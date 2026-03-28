@@ -49,7 +49,7 @@ Following the new architecture, source code, executables, and data are clearly s
     -   Talk to `@BotFather` on Telegram to create a new bot and obtain the `TELEGRAM_BOT_TOKEN`.
 
 2.  **Gemini CLI Session Setup (UUID):**
-    -   **Automatic Setup (Recommended):** When you run the connector in Step 3, an interactive TUI helper will automatically list your sessions. Simply enter the number of the session you want to use, and the UUID will be saved to `.env` automatically.
+    -   **Automatic Setup (Recommended):** When you run the connector, an interactive TUI helper will automatically list your sessions. Simply enter the number of the session you want to use, and the UUID will be saved to `.env` automatically.
     -   **Manual Setup:** If you prefer to manually create a session and obtain its UUID:
         ```bash
         gemini -y -p "You are my Telegram assistant."
