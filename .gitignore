@@ -28,9 +28,10 @@ script/*
 golang/gemini-connector/downloads/*
 !golang/gemini-connector/downloads/.gitkeep
 
-# Gemini AI Configuration
+# AI Configuration
 .gemini/gemini.md
 .gemini/personality.md
+.claude/
 
 # Logs
 bot.log
