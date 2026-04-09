@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,8 +22,13 @@ import (
 // --- Configuration & Messages ---
 
 type Config struct {
+	ActiveMessengers  []string
 	TelegramBotToken  string
 	TelegramChatID    int64
+	TeamsTenantID     string
+	TeamsAppID        string
+	TeamsAppSecret    string
+	TeamsChatID       string
 	GeminiSessionUUID string
 }
 
@@ -42,8 +48,8 @@ type Messages struct {
 }
 
 var defaultMessages = Messages{
-	StartupWelcome:         "🔔 텔레그램 컨트롤러 모드 가동 완료. 명령을 기다립니다.\n\n━━━━━━━━━━━━━\ngemini-connector 가동 완료",
-	CommandStartHelp:       "텔레그램 컨트롤러 모드 가동 중. 메시지를 입력하시면 처리합니다.",
+	StartupWelcome:         "🔔 컨트롤러 모드 가동 완료. 명령을 기다립니다.\n\n━━━━━━━━━━━━━\ngemini-connector 가동 완료",
+	CommandStartHelp:       "컨트롤러 모드 가동 중. 메시지를 입력하시면 처리합니다.",
 	CommandUnknown:         "알 수 없는 명령어입니다.",
 	ErrorMediaNotSupported: "⚠️ 현재 시스템은 동영상, 음성 및 일반 문서 파일 분석을 지원하지 않습니다. 텍스트 및 이미지 파일만 전송해 주십시오.",
 	ErrorMediaDownloadFail: "미디어 다운로드에 실패했습니다.",
@@ -95,6 +101,18 @@ func loadConfig() (*Config, error) {
 		return nil, err
 	}
 
+	// Active messengers (default: telegram only)
+	activeStr := os.Getenv("ACTIVE_MESSENGERS")
+	var activeMessengers []string
+	if activeStr == "" {
+		activeMessengers = []string{"telegram"}
+	} else {
+		for _, m := range strings.Split(activeStr, ",") {
+			activeMessengers = append(activeMessengers, strings.TrimSpace(m))
+		}
+	}
+
+	// Telegram
 	token := os.Getenv("TELEGRAM_BOT_TOKEN")
 	chatIDStr := os.Getenv("TELEGRAM_CHAT_ID")
 	var chatID int64
@@ -105,70 +123,190 @@ func loadConfig() (*Config, error) {
 		}
 	}
 
+	// Teams
+	teamsTenantID := os.Getenv("TEAMS_TENANT_ID")
+	teamsAppID := os.Getenv("TEAMS_APP_ID")
+	teamsAppSecret := os.Getenv("TEAMS_APP_SECRET")
+	teamsChatID := os.Getenv("TEAMS_CHAT_ID")
+
+	// Gemini
 	sessionUUID := strings.TrimSpace(os.Getenv("GEMINI_SESSION_UUID"))
 	if sessionUUID == "" {
 		log.Println("Warning: GEMINI_SESSION_UUID is not set. Bot will not be able to trigger AI.")
 	}
 
 	return &Config{
+		ActiveMessengers:  activeMessengers,
 		TelegramBotToken:  token,
 		TelegramChatID:    chatID,
+		TeamsTenantID:     teamsTenantID,
+		TeamsAppID:        teamsAppID,
+		TeamsAppSecret:    teamsAppSecret,
+		TeamsChatID:       teamsChatID,
 		GeminiSessionUUID: sessionUUID,
 	}, nil
 }
 
 func ensureEnvVars(envPath string) error {
-	token := os.Getenv("TELEGRAM_BOT_TOKEN")
-	chatID := os.Getenv("TELEGRAM_CHAT_ID")
-	uuid := os.Getenv("GEMINI_SESSION_UUID")
+	// Collect all env vars (existing values as defaults)
+	vars := map[string]string{
+		"ACTIVE_MESSENGERS":    os.Getenv("ACTIVE_MESSENGERS"),
+		"TELEGRAM_BOT_TOKEN":   os.Getenv("TELEGRAM_BOT_TOKEN"),
+		"TELEGRAM_CHAT_ID":     os.Getenv("TELEGRAM_CHAT_ID"),
+		"TEAMS_TENANT_ID":      os.Getenv("TEAMS_TENANT_ID"),
+		"TEAMS_APP_ID":         os.Getenv("TEAMS_APP_ID"),
+		"TEAMS_APP_SECRET":     os.Getenv("TEAMS_APP_SECRET"),
+		"TEAMS_CHAT_ID":        os.Getenv("TEAMS_CHAT_ID"),
+		"GEMINI_SESSION_UUID":  os.Getenv("GEMINI_SESSION_UUID"),
+	}
 
 	updated := false
 	reader := bufio.NewReader(os.Stdin)
+	headerShown := false
 
-	if token == "" {
-		fmt.Println("\n=== Gemini Connector Setup ===")
-		fmt.Print("Enter Telegram Bot Token (Required): ")
-		t, _ := reader.ReadString('\n')
-		token = strings.TrimSpace(t)
-		if token == "" {
-			return fmt.Errorf("bot token cannot be empty")
+	showHeader := func() {
+		if !headerShown {
+			fmt.Println("\n=== Gemini Connector Setup ===")
+			headerShown = true
 		}
-		updated = true
 	}
 
-	if chatID == "" {
-		if !updated {
-			fmt.Println("\n=== Gemini Connector Setup ===")
+	promptRequired := func(key, label string) error {
+		showHeader()
+		fmt.Printf("Enter %s (Required): ", label)
+		v, _ := reader.ReadString('\n')
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return fmt.Errorf("%s cannot be empty", label)
 		}
-		fmt.Print("Enter Telegram Chat ID (Optional, press Enter to skip): ")
-		c, _ := reader.ReadString('\n')
-		chatID = strings.TrimSpace(c)
-		if chatID != "" {
+		vars[key] = v
+		updated = true
+		return nil
+	}
+
+	promptOptional := func(key, label string) {
+		showHeader()
+		fmt.Printf("Enter %s (Optional, press Enter to skip): ", label)
+		v, _ := reader.ReadString('\n')
+		v = strings.TrimSpace(v)
+		if v != "" {
+			vars[key] = v
 			updated = true
 		}
 	}
 
-	if uuid == "" {
-		if !updated {
-			fmt.Println("\n=== Gemini Connector Setup ===")
+	// 1. Active messengers — infer default from existing env vars if not set
+	if vars["ACTIVE_MESSENGERS"] == "" {
+		// Detect which platforms already have tokens configured
+		var detected []string
+		if vars["TELEGRAM_BOT_TOKEN"] != "" {
+			detected = append(detected, "telegram")
 		}
+		if vars["TEAMS_APP_ID"] != "" && vars["TEAMS_TENANT_ID"] != "" {
+			detected = append(detected, "teams")
+		}
+
+		if len(detected) > 0 {
+			// Existing config found — auto-detect without prompting
+			vars["ACTIVE_MESSENGERS"] = strings.Join(detected, ",")
+			updated = true
+		} else {
+			// No config at all — ask user
+			showHeader()
+			fmt.Print("Enter active messengers (comma-separated, e.g. telegram,teams) [default: telegram]: ")
+			v, _ := reader.ReadString('\n')
+			v = strings.TrimSpace(v)
+			if v == "" {
+				v = "telegram"
+			}
+			vars["ACTIVE_MESSENGERS"] = v
+			updated = true
+		}
+	}
+
+	activeList := strings.Split(vars["ACTIVE_MESSENGERS"], ",")
+	activeSet := make(map[string]bool)
+	for _, m := range activeList {
+		activeSet[strings.TrimSpace(m)] = true
+	}
+
+	// 2. Telegram setup
+	if activeSet["telegram"] {
+		if vars["TELEGRAM_BOT_TOKEN"] == "" {
+			if err := promptRequired("TELEGRAM_BOT_TOKEN", "Telegram Bot Token"); err != nil {
+				return err
+			}
+		}
+		if vars["TELEGRAM_CHAT_ID"] == "" {
+			promptOptional("TELEGRAM_CHAT_ID", "Telegram Chat ID")
+		}
+	}
+
+	// 3. Teams setup
+	if activeSet["teams"] {
+		fmt.Println("\n--- Teams Configuration ---")
+		if vars["TEAMS_TENANT_ID"] == "" {
+			if err := promptRequired("TEAMS_TENANT_ID", "Teams Tenant ID"); err != nil {
+				return err
+			}
+		}
+		if vars["TEAMS_APP_ID"] == "" {
+			if err := promptRequired("TEAMS_APP_ID", "Teams App ID"); err != nil {
+				return err
+			}
+		}
+		if vars["TEAMS_APP_SECRET"] == "" {
+			if err := promptRequired("TEAMS_APP_SECRET", "Teams App Secret"); err != nil {
+				return err
+			}
+		}
+		if vars["TEAMS_CHAT_ID"] == "" {
+			if err := promptRequired("TEAMS_CHAT_ID", "Teams Chat ID"); err != nil {
+				return err
+			}
+		}
+	}
+
+	// 4. Gemini session UUID
+	if vars["GEMINI_SESSION_UUID"] == "" {
 		newUUID, err := interactiveSessionSelect(reader)
 		if err != nil {
 			fmt.Printf("⚠️ Session selection error: %v\n", err)
-			fmt.Print("Enter Gemini Session UUID manually (Required for AI, press Enter to skip): ")
-			u, _ := reader.ReadString('\n')
-			uuid = strings.TrimSpace(u)
-			if uuid != "" {
-				updated = true
-			}
+			promptOptional("GEMINI_SESSION_UUID", "Gemini Session UUID")
 		} else if newUUID != "" {
-			uuid = newUUID
+			vars["GEMINI_SESSION_UUID"] = newUUID
 			updated = true
 		}
 	}
 
+	// Write .env — only include sections for active messengers
 	if updated {
-		envContent := fmt.Sprintf("TELEGRAM_BOT_TOKEN=%s\nTELEGRAM_CHAT_ID=%s\nGEMINI_SESSION_UUID=%s\n", token, chatID, uuid)
+		var envLines []string
+		envLines = append(envLines, "# Global")
+		envLines = append(envLines, fmt.Sprintf("ACTIVE_MESSENGERS=%s", vars["ACTIVE_MESSENGERS"]))
+
+		if activeSet["telegram"] {
+			envLines = append(envLines, "")
+			envLines = append(envLines, "# Telegram")
+			envLines = append(envLines, fmt.Sprintf("TELEGRAM_BOT_TOKEN=%s", vars["TELEGRAM_BOT_TOKEN"]))
+			envLines = append(envLines, fmt.Sprintf("TELEGRAM_CHAT_ID=%s", vars["TELEGRAM_CHAT_ID"]))
+		}
+
+		if activeSet["teams"] {
+			envLines = append(envLines, "")
+			envLines = append(envLines, "# Teams")
+			envLines = append(envLines, fmt.Sprintf("TEAMS_TENANT_ID=%s", vars["TEAMS_TENANT_ID"]))
+			envLines = append(envLines, fmt.Sprintf("TEAMS_APP_ID=%s", vars["TEAMS_APP_ID"]))
+			envLines = append(envLines, fmt.Sprintf("TEAMS_APP_SECRET=%s", vars["TEAMS_APP_SECRET"]))
+			envLines = append(envLines, fmt.Sprintf("TEAMS_CHAT_ID=%s", vars["TEAMS_CHAT_ID"]))
+		}
+
+		envLines = append(envLines, "")
+		envLines = append(envLines, "# Gemini")
+		envLines = append(envLines, fmt.Sprintf("GEMINI_SESSION_UUID=%s", vars["GEMINI_SESSION_UUID"]))
+		envLines = append(envLines, "")
+
+		envContent := strings.Join(envLines, "\n")
 		if err := os.WriteFile(envPath, []byte(envContent), 0600); err != nil {
 			return fmt.Errorf("failed to save .env file: %v", err)
 		}
@@ -184,6 +322,26 @@ func truncateString(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "..."
+}
+
+// fanIn merges multiple InternalMessage channels into one.
+func fanIn(channels ...<-chan InternalMessage) <-chan InternalMessage {
+	merged := make(chan InternalMessage, 100)
+	var wg sync.WaitGroup
+	for _, ch := range channels {
+		wg.Add(1)
+		go func(c <-chan InternalMessage) {
+			defer wg.Done()
+			for msg := range c {
+				merged <- msg
+			}
+		}(ch)
+	}
+	go func() {
+		wg.Wait()
+		close(merged)
+	}()
+	return merged
 }
 
 // --- Main ---
@@ -259,26 +417,59 @@ func main() {
 		log.Printf("Target Gemini Session UUID: %s", cfg.GeminiSessionUUID)
 	}
 
-	// Initialize messenger adapter
-	var adapter Messenger = NewTelegramAdapter(cfg.TelegramBotToken, cfg.TelegramChatID, msgs)
-	if err := adapter.Init(); err != nil {
-		log.Fatalf("Adapter Init Error: %v", err)
+	// Build adapters based on ACTIVE_MESSENGERS
+	adapters := make(map[string]Messenger)
+	var listenChannels []<-chan InternalMessage
+
+	for _, name := range cfg.ActiveMessengers {
+		switch name {
+		case "telegram":
+			adapters["telegram"] = NewTelegramAdapter(cfg.TelegramBotToken, cfg.TelegramChatID, msgs)
+		case "teams":
+			adapters["teams"] = NewTeamsAdapter(cfg.TeamsTenantID, cfg.TeamsAppID, cfg.TeamsAppSecret, cfg.TeamsChatID, msgs)
+		default:
+			log.Printf("Unknown messenger: %s (skipped)", name)
+		}
 	}
 
-	if cfg.TelegramChatID != 0 {
-		adapter.Send(strconv.FormatInt(cfg.TelegramChatID, 10), msgs.StartupWelcome)
-		log.Println("Startup message sent.")
+	if len(adapters) == 0 {
+		log.Fatalf("No active messengers configured.")
 	}
 
-	msgChan, err := adapter.Listen()
-	if err != nil {
-		log.Fatalf("Listen Error: %v", err)
+	// Init and Listen for all adapters
+	for name, adapter := range adapters {
+		if err := adapter.Init(); err != nil {
+			log.Fatalf("%s adapter init error: %v", name, err)
+		}
+		ch, err := adapter.Listen()
+		if err != nil {
+			log.Fatalf("%s adapter listen error: %v", name, err)
+		}
+		listenChannels = append(listenChannels, ch)
+		log.Printf("Adapter [%s] started.", name)
 	}
+
+	// Send startup welcome to each adapter's configured chat
+	if tg, ok := adapters["telegram"]; ok && cfg.TelegramChatID != 0 {
+		tg.Send(strconv.FormatInt(cfg.TelegramChatID, 10), msgs.StartupWelcome)
+	}
+	if teams, ok := adapters["teams"]; ok {
+		teams.Send(cfg.TeamsChatID, msgs.StartupWelcome)
+	}
+
+	// Merge all adapter channels
+	msgChan := fanIn(listenChannels...)
 
 	log.Println("Waiting for messages...")
 
 	for msg := range msgChan {
 		go func(m InternalMessage) {
+			adapter, ok := adapters[m.Platform]
+			if !ok {
+				log.Printf("No adapter for platform: %s", m.Platform)
+				return
+			}
+
 			if cfg.GeminiSessionUUID == "" {
 				adapter.Send(m.ChatID, msgs.ErrorMissingUUID)
 				return

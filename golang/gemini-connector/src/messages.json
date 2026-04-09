@@ -1,6 +1,6 @@
 {
-  "StartupWelcome": "🔔 텔레그램 컨트롤러 모드 가동 완료. 명령을 기다립니다.\n\n━━━━━━━━━━━━━\ngemini-connector 가동 완료",
-  "CommandStartHelp": "텔레그램 컨트롤러 모드 가동 중. 메시지를 입력하시면 처리합니다.",
+  "StartupWelcome": "🔔 컨트롤러 모드 가동 완료. 명령을 기다립니다.\n\n━━━━━━━━━━━━━\ngemini-connector 가동 완료",
+  "CommandStartHelp": "컨트롤러 모드 가동 중. 메시지를 입력하시면 처리합니다.",
   "CommandUnknown": "알 수 없는 명령어입니다.",
   "ErrorMediaNotSupported": "⚠️ 현재 시스템은 동영상, 음성 및 일반 문서 파일 분석을 지원하지 않습니다. 텍스트 및 이미지 파일만 전송해 주십시오.",
   "ErrorMediaDownloadFail": "미디어 다운로드에 실패했습니다.",
