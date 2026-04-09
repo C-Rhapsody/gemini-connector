@@ -334,20 +334,8 @@ func triggerGemini(bot *tgbotapi.BotAPI, chatID int64, prompt string, sessionUUI
 
 	cmd := exec.Command("gemini", "-y", "-o", "json", "--resume", sessionUUID, "-p", prompt)
 
-	searchDir, errExe := os.Executable()
-	if errExe == nil {
-		searchDir = filepath.Dir(searchDir)
-		for {
-			if info, err := os.Stat(filepath.Join(searchDir, ".gemini")); err == nil && info.IsDir() {
-				cmd.Dir = searchDir
-				break
-			}
-			parentDir := filepath.Dir(searchDir)
-			if parentDir == searchDir {
-				break
-			}
-			searchDir = parentDir
-		}
+	if projectRoot := findProjectRoot(); projectRoot != "" {
+		cmd.Dir = projectRoot
 	}
 
 	outputBytes, err := cmd.CombinedOutput()
@@ -372,7 +360,7 @@ func triggerGemini(bot *tgbotapi.BotAPI, chatID int64, prompt string, sessionUUI
 		return
 	}
 	
-	jsonStr := outputStr[loc[0]:]
+	jsonStr := extractJSONObject(outputStr[loc[0]:])
 
 	var result GeminiResponse
 	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
@@ -392,6 +380,39 @@ func triggerGemini(bot *tgbotapi.BotAPI, chatID int64, prompt string, sessionUUI
 	} else {
 		sendTelegramMsg(bot, chatID, msgs.ErrorEmptyResponse)
 	}
+}
+
+// extractJSONObject extracts the first complete JSON object from a string by matching braces.
+func extractJSONObject(s string) string {
+	depth := 0
+	inString := false
+	escaped := false
+	for i, ch := range s {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' && inString {
+			escaped = true
+			continue
+		}
+		if ch == '"' {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+		if ch == '{' {
+			depth++
+		} else if ch == '}' {
+			depth--
+			if depth == 0 {
+				return s[:i+1]
+			}
+		}
+	}
+	return s
 }
 
 func findProjectRoot() string {
@@ -449,15 +470,6 @@ func downloadMediaWithRetry(bot *tgbotapi.BotAPI, msg *tgbotapi.Message, chatID 
 		photo := msg.Photo[len(msg.Photo)-1]
 		fileID = photo.FileID
 		ext = ".jpg"
-	} else if msg.Audio != nil {
-		fileID = msg.Audio.FileID
-		ext = filepath.Ext(msg.Audio.FileName)
-		if ext == "" {
-			ext = ".mp3"
-		}
-	} else if msg.Voice != nil {
-		fileID = msg.Voice.FileID
-		ext = ".ogg"
 	}
 
 	if fileID == "" {
@@ -575,6 +587,7 @@ func main() {
 	logPath := filepath.Join(logDir, "bot.log")
 	logFile, logErr := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
 	if logErr == nil {
+		defer logFile.Close()
 		log.SetOutput(logFile)
 	} else {
 		log.SetOutput(os.Stderr)
