@@ -35,9 +35,11 @@
 2. **[2단계] 모델 자가 진단 (LLM Self-Assessment - ★제미나이 추천★)**
    - **방식**: 모든 텍스트 메시지를 먼저 Gemma 4에게 전달하고, Gemma가 자신의 답변 능력을 스스로 판단하여 **JSON 포맷**으로 응답하도록 강제함.
    - **Gemma 응답 규격**:
-     - **로컬 처리 가능 시**: `{"answer": true, "message": "최종 답변 내용..."}`
-     - **Gemini 위임 필요 시**: `{"answer": false, "message": "none"}`
-   - **로직**: Go 코드는 JSON의 `answer` 필드값만 보고 즉시 사용자에게 전달할지, 아니면 원본 메시지를 Gemini Pro로 넘길지 결정함.
+     - **로컬 처리 가능 시**: 
+       `{"answer": true, "message": "최종 답변 내용...", "confidence": 0.95, "reason": "none"}`
+     - **Gemini 위임 필요 시**: 
+       `{"answer": false, "message": "none", "confidence": 0.30, "reason": "complex reasoning required"}`
+   - **로직**: Go 코드는 `answer` 값과 함께 `confidence` 수치를 참고하여 응답의 신뢰성을 2차 검증할 수 있으며, 위임 시에는 `reason`을 로그에 기록하여 추후 시스템 최적화 데이터로 활용함.
    - **장점**: 별도의 분류 모델 없이 AI의 판단력을 게이트웨이(Gateway)로 활용하며, 프로그램 친화적인 JSON 통신으로 파싱 안정성 확보.
 
 3. **[3단계] 메타데이터 임계값 (Metadata Thresholds)**
