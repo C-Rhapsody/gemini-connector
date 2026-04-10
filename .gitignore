@@ -32,6 +32,7 @@ golang/gemini-connector/downloads/*
 .gemini/gemini.md
 .gemini/personality.md
 .claude/
+AGENTS.md
 
 # Logs
 bot.log
