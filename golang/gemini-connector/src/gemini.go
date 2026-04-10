@@ -26,7 +26,7 @@ func (e *GeminiError) Error() string {
 }
 
 func executeGemini(prompt string, sessionUUID string) (string, error) {
-	log.Printf("Triggering Gemini CLI for message: %s", truncateString(prompt, 50))
+	log.Printf("Triggering Gemini CLI for message: %s", truncateString(prompt, 250))
 
 	cmd := exec.Command("gemini", "-y", "-o", "json", "--resume", sessionUUID, "-p", prompt)
 
