@@ -27,11 +27,11 @@ func (e *GeminiError) Error() string {
 }
 
 func executeGemini(prompt string, sessionUUID string) (string, error) {
-	log.Printf("Triggering Gemini CLI for message (via Stdin+Headless): %s", truncateString(prompt, 50))
+	log.Printf("Triggering Gemini CLI for message (via Stdin): %s", truncateString(prompt, 50))
 
-	// -p 옵션에 최소한의 지시어를 주어 비대화형(Headless) 모드를 강제하고,
-	// 실제 본문은 Stdin으로 전달하여 모든 특수문자와 길이 제한을 우회함.
-	cmd := exec.Command("gemini", "-y", "-o", "json", "--resume", sessionUUID, "-p", "Process the following telegram message:")
+	// -p "" 를 사용하여 Headless 모드만 활성화하고, 추가적인 안내 문구(Prefix)를 제거함.
+	// 이를 통해 /directory add 와 같은 명령어가 간섭 없이 실행되도록 함.
+	cmd := exec.Command("gemini", "-y", "-o", "json", "--resume", sessionUUID, "-p", "")
 	cmd.Stdin = strings.NewReader(prompt)
 
 	if projectRoot := findProjectRoot(); projectRoot != "" {

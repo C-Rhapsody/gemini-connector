@@ -37,3 +37,6 @@ AGENTS.md
 # Logs
 bot.log
 *.log
+
+# Codex Configuration
+.agent/
