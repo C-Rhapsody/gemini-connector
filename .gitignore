@@ -40,3 +40,6 @@ bot.log
 
 # Codex Configuration
 .agent/
+
+# Custom Skills to exclude
+.gemini/skills/idea-planner/
