@@ -1,4 +1,4 @@
-# Binaries
+﻿# Binaries
 *.exe
 *.dll
 *.so
@@ -42,4 +42,5 @@ bot.log
 .agent/
 
 # Custom Skills to exclude
-.gemini/skills/idea-planner/
+
+
