@@ -1,6 +1,6 @@
 ---
 name: evidence-guard
-description: "Use for fact-checking, evidence-based answers, hallucination prevention, repository verification, log/config/file validation, and Korean requests such as 검증, 확인, 팩트체크, 근거, 추측 금지, 실제로, 진짜인지, 맞는지, 파일 확인, 로그 확인, 답변 품질, ai slop. Force claims to be grounded in observed evidence and clearly label assumptions or unknowns."
+description: "Use for fact-checking, evidence-based answers, hallucination prevention, repository verification, log/config/file validation, and Korean requests such as 검증, 확인, 팩트체크, 근거, 추측 금지, 실제로, 진짜인지, 맞는지, 파일 확인, 로그 확인, 답변 품질, ai slop. Can optionally consult local Claude Code as a second-pass verifier. Force claims to be grounded in observed evidence and clearly label assumptions or unknowns."
 ---
 
 # Evidence Guard Skill: Grounded Answer Protocol
@@ -42,6 +42,26 @@ When the user questions a previous answer:
 3. Correct the answer.
 4. State the prevention rule that should have blocked the mistake.
 5. Avoid generic apologies without analysis.
+
+## Claude Consultation Policy
+- Local Claude Code is an optional second-pass verifier, not the primary source of truth.
+- Invoke Claude when the evidence set is large, conflicting, interpretation-heavy, or when the user explicitly requests deeper verification.
+- Do not invoke Claude for simple checks, trivial facts, or when the context is sensitive and cannot be shared safely.
+- If the user asks not to use external models, or if the evidence cannot be shared safely, skip Claude and answer directly from verified evidence.
+
+## Invocation Procedure
+1. Distill the question into claims, verified evidence, unknowns, and the exact verification goal.
+2. Pass only distilled evidence, not raw secrets or unnecessary file contents.
+3. Use non-interactive `claude -p` with safe options.
+4. Treat Claude output as advisory, not authoritative.
+5. Reconcile Claude output against local evidence before presenting it.
+6. Synthesize the final answer in Korean.
+
+Suggested command:
+
+```powershell
+claude -p --permission-mode plan --tools "" --no-session-persistence --output-format text "<prompt>"
+```
 
 ## Response Pattern
 Use this structure when it fits:
