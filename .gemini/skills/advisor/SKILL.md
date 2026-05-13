@@ -1,6 +1,6 @@
 ---
 name: advisor
-description: Use for project planning, brainstorming, requirements refinement, MVP scoping, roadmap drafting, architecture planning, risk analysis, decision support, code review, implementation review, and Korean requests such as 기획, 요구사항 정리, 로드맵, 스펙, MVP, 아키텍처 초안, 리스크 분석, 의사결정, 검토, 기획 검토, 전략 검토, 방향성 검토. Can optionally consult local Claude Code for deeper strategic reasoning. Planning and advisory only: do not edit files, write production code, build, test, or execute implementation tasks.
+description: "Use for project planning, brainstorming, requirements refinement, MVP scoping, roadmap drafting, architecture planning, risk analysis, decision support, code review, implementation review, and Korean requests such as 기획, 요구사항 정리, 로드맵, 스펙, MVP, 아키텍처 초안, 리스크 분석, 의사결정, 검토, 기획 검토, 전략 검토, 방향성 검토. Can optionally consult local Claude Code for deeper strategic reasoning. Planning and advisory only: do not edit files, write production code, build, test, or execute implementation tasks."
 ---
 
 # Advisor Skill: Strategic Planning and Review Partner
