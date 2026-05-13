@@ -52,12 +52,3 @@ Use this structure when it fits:
 ## Unknowns
 ## Answer
 ## Next Verification
-
-## Good Triggers
-- "검증해줘"
-- "확인해줘"
-- "팩트체크"
-- "추측하지 말고 말해줘"
-- "진짜인지 확인"
-- "로그나 파일로 확인"
-- "ai slop 줄여줘"
