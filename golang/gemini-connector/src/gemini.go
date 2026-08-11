@@ -1,108 +1,98 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 )
 
-type GeminiResponse struct {
-	Response string `json:"response"`
-	Error    string `json:"error,omitempty"`
+type AgyResponse struct {
+	ConversationID  string  `json:"conversation_id"`
+	Status          string  `json:"status"`
+	Response        string  `json:"response"`
+	Error           string  `json:"error,omitempty"`
+	DurationSeconds float64 `json:"duration_seconds"`
+	NumTurns        int     `json:"num_turns"`
 }
 
-type GeminiError struct {
-	Type   string // "cli_failure", "no_valid_json", "json_parse_fail", "system_error"
+type AgyUsage struct {
+	InputTokens     int `json:"input_tokens"`
+	OutputTokens    int `json:"output_tokens"`
+	ThinkingTokens  int `json:"thinking_tokens"`
+	CacheReadTokens int `json:"cache_read_tokens"`
+	TotalTokens     int `json:"total_tokens"`
+}
+
+type AgyError struct {
+	Type   string
 	Err    error
 	Detail string
 }
 
-func (e *GeminiError) Error() string {
+func (e *AgyError) Error() string {
 	return fmt.Sprintf("%s: %s", e.Type, e.Detail)
 }
 
-func executeGemini(prompt string, sessionUUID string) (string, error) {
-	log.Printf("Triggering Gemini CLI for message (via Stdin): %s", truncateString(prompt, 50))
+func executeAgy(prompt string, conversationID string) (string, error) {
+	log.Printf("Triggering agy CLI for message (via Stdin): %s", truncateString(prompt, 50))
 
-	// -p "" 를 사용하여 Headless 모드만 활성화하고, 추가적인 안내 문구(Prefix)를 제거함.
-	// 이를 통해 /directory add 와 같은 명령어가 간섭 없이 실행되도록 함.
-	cmd := exec.Command("gemini", "-y", "-o", "json", "--resume", sessionUUID, "-p", "")
+	args := []string{
+		"--output-format", "json",
+		"--dangerously-skip-permissions",
+		"--print-timeout", "5m",
+	}
+	if conversationID != "" {
+		args = append(args, "--conversation", conversationID)
+	}
+
+	cmd := exec.Command("agy", args...)
 	cmd.Stdin = strings.NewReader(prompt)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 
 	if projectRoot := findProjectRoot(); projectRoot != "" {
 		cmd.Dir = projectRoot
 	}
 
-	outputBytes, err := cmd.CombinedOutput()
-	if err != nil {
-		log.Printf("Gemini CLI execution error: %v\nOutput: %s", err, string(outputBytes))
-		errMsg := string(outputBytes)
-		if len(errMsg) > 200 {
-			errMsg = errMsg[len(errMsg)-200:]
+	if err := cmd.Run(); err != nil {
+		stderrMsg := strings.TrimSpace(stderr.String())
+		log.Printf("agy CLI execution error: %v\nStderr: %s", err, stderrMsg)
+
+		if strings.Contains(stderrMsg, "authentication required") {
+			return "", &AgyError{Type: "authentication_required", Err: err, Detail: stderrMsg}
 		}
-		return "", &GeminiError{Type: "cli_failure", Err: err, Detail: errMsg}
+
+		detail := stderrMsg
+		if len(detail) > 200 {
+			detail = detail[len(detail)-200:]
+		}
+		return "", &AgyError{Type: "cli_failure", Err: err, Detail: detail}
 	}
 
-	outputStr := string(outputBytes)
-	re := regexp.MustCompile(`(?s){\s*"session_id"|{\s*"response"`)
-	loc := re.FindStringIndex(outputStr)
-
-	if loc == nil {
-		log.Printf("No valid JSON structure found in output. Raw Output: %s", outputStr)
-		return "", &GeminiError{Type: "no_valid_json"}
+	stdoutBytes := stdout.Bytes()
+	var result AgyResponse
+	if err := json.Unmarshal(stdoutBytes, &result); err != nil {
+		log.Printf("Failed to parse agy JSON response: %v\nStdout: %s", err, string(stdoutBytes))
+		return "", &AgyError{Type: "json_parse_fail", Err: err, Detail: string(stdoutBytes)}
 	}
 
-	jsonStr := extractJSONObject(outputStr[loc[0]:])
-
-	var result GeminiResponse
-	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
-		log.Printf("Failed to parse JSON response: %v\nCleaned JSON String: %s", err, jsonStr)
-		return "", &GeminiError{Type: "json_parse_fail"}
-	}
-
-	if result.Error != "" {
-		log.Printf("Gemini CLI returned error in JSON: %s", result.Error)
-		return "", &GeminiError{Type: "system_error", Detail: result.Error}
+	if result.Status != "SUCCESS" {
+		detail := result.Error
+		if detail == "" {
+			detail = "agy returned status: " + result.Status
+		}
+		log.Printf("agy returned non-success status: %s, error: %s", result.Status, detail)
+		return "", &AgyError{Type: "error_status", Detail: detail}
 	}
 
 	return result.Response, nil
-}
-
-func extractJSONObject(s string) string {
-	depth := 0
-	inString := false
-	escaped := false
-	for i, ch := range s {
-		if escaped {
-			escaped = false
-			continue
-		}
-		if ch == '\\' && inString {
-			escaped = true
-			continue
-		}
-		if ch == '"' {
-			inString = !inString
-			continue
-		}
-		if inString {
-			continue
-		}
-		if ch == '{' {
-			depth++
-		} else if ch == '}' {
-			depth--
-			if depth == 0 {
-				return s[:i+1]
-			}
-		}
-	}
-	return s
 }
 
 func findProjectRoot() string {

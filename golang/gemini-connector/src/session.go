@@ -2,60 +2,79 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
-	"regexp"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 )
 
-type SessionInfo struct {
-	UUID  string
-	Title string
-	Time  string
+const agyConversationCacheRelPath = ".gemini/antigravity-cli/cache/last_conversations.json"
+
+func agyInstallHint() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "Run PowerShell: irm https://antigravity.google/cli/install.ps1 | iex"
+	case "darwin":
+		return "Run: curl -fsSL https://antigravity.google/cli/install.sh | bash"
+	default:
+		return "Run: curl -fsSL https://antigravity.google/cli/install.sh | bash"
+	}
 }
 
-func interactiveSessionSelect(reader *bufio.Reader) (string, error) {
-	_, err := exec.LookPath("gemini")
-	if err != nil {
-		return "", fmt.Errorf("gemini-cli is not installed or not in PATH. Please run 'npm install -g @google/gemini-cli'")
+func interactiveConversationSelect(reader *bufio.Reader) (string, error) {
+	if _, err := exec.LookPath("agy"); err != nil {
+		return "", fmt.Errorf("agy (Antigravity CLI) is not installed or not in PATH. %s", agyInstallHint())
 	}
 
 	for {
-		fmt.Println("\n🔍 Fetching Gemini sessions...")
-		cmd := exec.Command("gemini", "--list-sessions")
-		cmd.Dir = findProjectRoot()
-		out, err := cmd.CombinedOutput()
+		fmt.Println("\n🔍 Fetching Antigravity conversations from local cache...")
+		entries, err := loadConversationCache()
 		if err != nil {
-			return "", fmt.Errorf("failed to fetch sessions: %v", err)
+			fmt.Printf("⚠️ Could not read conversation cache: %v\n", err)
 		}
 
-		sessions := parseSessions(string(out))
-
-		if len(sessions) == 0 {
-			fmt.Println("💡 No existing sessions found. Creating a new session...")
-			if err := createNewSession(); err != nil {
-				return "", err
+		if len(entries) == 0 {
+			fmt.Println("💡 No cached conversations found. Creating a new conversation...")
+			if newID, cerr := createNewConversation(); cerr != nil {
+				fmt.Printf("❌ Error: %v\n", cerr)
+				fmt.Println("You can also enter a conversation ID manually.")
+			} else if newID != "" {
+				fmt.Printf("✅ New conversation created: %s\n", newID)
+				return newID, nil
 			}
-			continue
+			fmt.Print("✍️ Enter Antigravity Conversation ID (or [x] to exit): ")
+			mInput, _ := reader.ReadString('\n')
+			mInput = strings.TrimSpace(mInput)
+			if strings.EqualFold(mInput, "x") || mInput == "" {
+				return "", errors.New("no conversation selected")
+			}
+			return mInput, nil
 		}
 
 		const pageSize = 10
 		page := 0
-		totalPages := (len(sessions) + pageSize - 1) / pageSize
+		totalPages := (len(entries) + pageSize - 1) / pageSize
 
 		for {
 			start := page * pageSize
 			end := start + pageSize
-			if end > len(sessions) {
-				end = len(sessions)
+			if end > len(entries) {
+				end = len(entries)
 			}
 
-			fmt.Printf("\n=== 🤖 Select Gemini Session (Page %d/%d) ===\n", page+1, totalPages)
+			fmt.Printf("\n=== 🤖 Select Antigravity Conversation (Page %d/%d) ===\n", page+1, totalPages)
 			for i := start; i < end; i++ {
-				fmt.Printf("[%d] %s (%s) [%s]\n", i+1, truncateString(sessions[i].Title, 20), sessions[i].Time, sessions[i].UUID)
+				conv := entries[i]
+				id := truncateString(conv.ID, 36)
+				path := truncateString(conv.Workspace, 60)
+				fmt.Printf("[%d] %s   (%s)\n", i+1, id, path)
 			}
 			fmt.Println("-------------------------------------------------")
 
@@ -83,12 +102,18 @@ func interactiveSessionSelect(reader *bufio.Reader) (string, error) {
 			} else if input == "r" {
 				break
 			} else if input == "c" {
-				if err := createNewSession(); err != nil {
-					fmt.Printf("❌ Error: %v\n", err)
+				newID, cerr := createNewConversation()
+				if cerr != nil {
+					fmt.Printf("❌ Error: %v\n", cerr)
+					break
+				}
+				if newID != "" {
+					fmt.Printf("✅ New conversation created: %s\n", newID)
+					return newID, nil
 				}
 				break
 			} else if input == "m" {
-				fmt.Print("✍️ Enter UUID manually: ")
+				fmt.Print("✍️ Enter Antigravity Conversation ID manually: ")
 				mInput, _ := reader.ReadString('\n')
 				return strings.TrimSpace(mInput), nil
 			} else if input == "x" {
@@ -97,10 +122,10 @@ func interactiveSessionSelect(reader *bufio.Reader) (string, error) {
 			}
 
 			idx, err := strconv.Atoi(input)
-			if err == nil && idx >= 1 && idx <= len(sessions) {
-				selected := sessions[idx-1]
-				fmt.Printf("✅ Selected: %s\n", selected.UUID)
-				return selected.UUID, nil
+			if err == nil && idx >= 1 && idx <= len(entries) {
+				selected := entries[idx-1]
+				fmt.Printf("✅ Selected: %s\n", selected.ID)
+				return selected.ID, nil
 			}
 
 			fmt.Println("❌ Invalid input. Please try again.")
@@ -108,84 +133,65 @@ func interactiveSessionSelect(reader *bufio.Reader) (string, error) {
 	}
 }
 
-func parseSessions(output string) []SessionInfo {
-	ansiRegex := regexp.MustCompile(`\x1b\[[0-9;]*m`)
-	cleanOut := ansiRegex.ReplaceAllString(output, "")
+type ConversationEntry struct {
+	Workspace string
+	ID        string
+}
 
-	var sessions []SessionInfo
-	lines := strings.Split(cleanOut, "\n")
+func loadConversationCache() ([]ConversationEntry, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("could not resolve user home directory: %w", err)
+	}
+	cachePath := filepath.Join(home, agyConversationCacheRelPath)
 
-	re := regexp.MustCompile(`^\s*\d+\.\s*(.*?)\s*\(([^)]+)\)\s*\[([a-fA-F0-9\-]{36})\]`)
-
-	for _, line := range lines {
-		matches := re.FindStringSubmatch(line)
-		if len(matches) == 4 {
-			title := strings.TrimSpace(matches[1])
-			if title == "" {
-				title = "(No Title)"
-			}
-			sessions = append(sessions, SessionInfo{
-				Title: title,
-				Time:  matches[2],
-				UUID:  matches[3],
-			})
+	data, err := os.ReadFile(cachePath)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
 		}
+		return nil, err
 	}
 
-	sort.Slice(sessions, func(i, j int) bool {
-		return getTimeWeight(sessions[i].Time) < getTimeWeight(sessions[j].Time)
+	var raw map[string]string
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("invalid cache JSON: %w", err)
+	}
+
+	entries := make([]ConversationEntry, 0, len(raw))
+	for ws, id := range raw {
+		entries = append(entries, ConversationEntry{Workspace: ws, ID: id})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Workspace < entries[j].Workspace
 	})
-
-	return sessions
+	return entries, nil
 }
 
-func getTimeWeight(t string) int {
-	t = strings.ToLower(t)
-	if strings.Contains(t, "just now") {
-		return 0
-	}
-
-	fields := strings.Fields(t)
-	if len(fields) < 2 {
-		return 9999999
-	}
-
-	val, _ := strconv.Atoi(fields[0])
-	unit := fields[1]
-
-	multiplier := 1
-	if strings.Contains(unit, "sec") {
-		multiplier = 1
-	} else if strings.Contains(unit, "min") {
-		multiplier = 60
-	} else if strings.Contains(unit, "hour") {
-		multiplier = 3600
-	} else if strings.Contains(unit, "day") {
-		multiplier = 86400
-	} else if strings.Contains(unit, "week") {
-		multiplier = 604800
-	} else if strings.Contains(unit, "month") {
-		multiplier = 2592000
-	} else if strings.Contains(unit, "year") {
-		multiplier = 31536000
-	}
-
-	return val * multiplier
-}
-
-func createNewSession() error {
-	fmt.Println("⏳ Generating a new Gemini session...")
+func createNewConversation() (string, error) {
+	fmt.Println("⏳ Generating a new Antigravity conversation...")
 
 	prompt := "Telegram Connector is you. Reply Only with 'Telegram Connector Ready.'"
-	cmd := exec.Command("gemini", "-p", prompt)
+	cmd := exec.Command("agy", "--output-format", "json", "--dangerously-skip-permissions", "--print-timeout", "5m")
+	cmd.Stdin = strings.NewReader(prompt)
 	cmd.Dir = findProjectRoot()
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
 
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to run gemini-cli: %v", err)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to run agy CLI: %w", err)
 	}
 
-	fmt.Println("✅ Session creation command finished.")
-	return nil
+	var result struct {
+		ConversationID string `json:"conversation_id"`
+		Status         string `json:"status"`
+	}
+	if err := json.Unmarshal(out, &result); err != nil {
+		return "", fmt.Errorf("failed to parse agy response: %w (raw: %s)", err, string(out))
+	}
+	if result.ConversationID == "" {
+		return "", fmt.Errorf("agy did not return a conversation_id (status: %s)", result.Status)
+	}
+
+	fmt.Println("✅ Conversation creation command finished.")
+	return result.ConversationID, nil
 }

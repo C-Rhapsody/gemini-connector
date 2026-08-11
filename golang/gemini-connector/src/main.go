@@ -29,7 +29,7 @@ type Config struct {
 	TeamsAppID        string
 	TeamsAppSecret    string
 	TeamsChatID       string
-	GeminiSessionUUID string
+	AgyConversationID string
 }
 
 type Messages struct {
@@ -53,7 +53,7 @@ var defaultMessages = Messages{
 	CommandUnknown:         "알 수 없는 명령어입니다.",
 	ErrorMediaNotSupported: "⚠️ 현재 시스템은 동영상, 음성 및 일반 문서 파일 분석을 지원하지 않습니다. 텍스트 및 이미지 파일만 전송해 주십시오.",
 	ErrorMediaDownloadFail: "미디어 다운로드에 실패했습니다.",
-	ErrorMissingUUID:       "❌ 봇 설정 오류: .env 파일에 GEMINI_SESSION_UUID가 설정되지 않았습니다.",
+	ErrorMissingUUID:       "❌ 봇 설정 오류: .env 파일에 AGY_CONVERSATION_ID가 설정되지 않았습니다.",
 	ErrorCLIFailure:        "❌ 시스템 실행 오류 발생.\n\nError: %v\n\nLog: ...%s",
 	ErrorNoValidJSON:       "❌ 시스템 응답에서 유효한 데이터를 찾지 못했습니다.",
 	ErrorJSONParseFail:     "❌ 시스템 응답을 해석하는 데 실패했습니다.",
@@ -129,10 +129,10 @@ func loadConfig() (*Config, error) {
 	teamsAppSecret := os.Getenv("TEAMS_APP_SECRET")
 	teamsChatID := os.Getenv("TEAMS_CHAT_ID")
 
-	// Gemini
-	sessionUUID := strings.TrimSpace(os.Getenv("GEMINI_SESSION_UUID"))
-	if sessionUUID == "" {
-		log.Println("Warning: GEMINI_SESSION_UUID is not set. Bot will not be able to trigger AI.")
+	// Antigravity (agy) conversation
+	convID := strings.TrimSpace(os.Getenv("AGY_CONVERSATION_ID"))
+	if convID == "" {
+		log.Println("Warning: AGY_CONVERSATION_ID is not set. Bot will not be able to trigger AI.")
 	}
 
 	return &Config{
@@ -143,21 +143,21 @@ func loadConfig() (*Config, error) {
 		TeamsAppID:        teamsAppID,
 		TeamsAppSecret:    teamsAppSecret,
 		TeamsChatID:       teamsChatID,
-		GeminiSessionUUID: sessionUUID,
+		AgyConversationID: convID,
 	}, nil
 }
 
 func ensureEnvVars(envPath string) error {
 	// Collect all env vars (existing values as defaults)
 	vars := map[string]string{
-		"ACTIVE_MESSENGERS":    os.Getenv("ACTIVE_MESSENGERS"),
-		"TELEGRAM_BOT_TOKEN":   os.Getenv("TELEGRAM_BOT_TOKEN"),
-		"TELEGRAM_CHAT_ID":     os.Getenv("TELEGRAM_CHAT_ID"),
-		"TEAMS_TENANT_ID":      os.Getenv("TEAMS_TENANT_ID"),
-		"TEAMS_APP_ID":         os.Getenv("TEAMS_APP_ID"),
-		"TEAMS_APP_SECRET":     os.Getenv("TEAMS_APP_SECRET"),
-		"TEAMS_CHAT_ID":        os.Getenv("TEAMS_CHAT_ID"),
-		"GEMINI_SESSION_UUID":  os.Getenv("GEMINI_SESSION_UUID"),
+		"ACTIVE_MESSENGERS":   os.Getenv("ACTIVE_MESSENGERS"),
+		"TELEGRAM_BOT_TOKEN":  os.Getenv("TELEGRAM_BOT_TOKEN"),
+		"TELEGRAM_CHAT_ID":    os.Getenv("TELEGRAM_CHAT_ID"),
+		"TEAMS_TENANT_ID":     os.Getenv("TEAMS_TENANT_ID"),
+		"TEAMS_APP_ID":        os.Getenv("TEAMS_APP_ID"),
+		"TEAMS_APP_SECRET":    os.Getenv("TEAMS_APP_SECRET"),
+		"TEAMS_CHAT_ID":       os.Getenv("TEAMS_CHAT_ID"),
+		"AGY_CONVERSATION_ID": os.Getenv("AGY_CONVERSATION_ID"),
 	}
 
 	updated := false
@@ -267,14 +267,14 @@ func ensureEnvVars(envPath string) error {
 		}
 	}
 
-	// 4. Gemini session UUID
-	if vars["GEMINI_SESSION_UUID"] == "" {
-		newUUID, err := interactiveSessionSelect(reader)
+	// 4. Antigravity conversation ID
+	if vars["AGY_CONVERSATION_ID"] == "" {
+		newConvID, err := interactiveConversationSelect(reader)
 		if err != nil {
-			fmt.Printf("⚠️ Session selection error: %v\n", err)
-			promptOptional("GEMINI_SESSION_UUID", "Gemini Session UUID")
-		} else if newUUID != "" {
-			vars["GEMINI_SESSION_UUID"] = newUUID
+			fmt.Printf("⚠️ Conversation selection error: %v\n", err)
+			promptOptional("AGY_CONVERSATION_ID", "Antigravity Conversation ID")
+		} else if newConvID != "" {
+			vars["AGY_CONVERSATION_ID"] = newConvID
 			updated = true
 		}
 	}
@@ -302,8 +302,8 @@ func ensureEnvVars(envPath string) error {
 		}
 
 		envLines = append(envLines, "")
-		envLines = append(envLines, "# Gemini")
-		envLines = append(envLines, fmt.Sprintf("GEMINI_SESSION_UUID=%s", vars["GEMINI_SESSION_UUID"]))
+		envLines = append(envLines, "# Antigravity (agy)")
+		envLines = append(envLines, fmt.Sprintf("AGY_CONVERSATION_ID=%s", vars["AGY_CONVERSATION_ID"]))
 		envLines = append(envLines, "")
 
 		envContent := strings.Join(envLines, "\n")
@@ -407,14 +407,14 @@ func main() {
 		log.Fatalf("Config Error: %v", err)
 	}
 
-	if cfg.GeminiSessionUUID == "" {
+	if cfg.AgyConversationID == "" {
 		log.Println("=========================================================")
-		log.Println("WARNING: GEMINI_SESSION_UUID is missing in .env")
+		log.Println("WARNING: AGY_CONVERSATION_ID is missing in .env")
 		log.Println("The bot will run, but it will NOT be able to trigger AI.")
-		log.Println("Please run 'gemini --list-sessions' and add the UUID.")
+		log.Println("Run 'agy' interactively once to authenticate, then restart the bot.")
 		log.Println("=========================================================")
 	} else {
-		log.Printf("Target Gemini Session UUID: %s", cfg.GeminiSessionUUID)
+		log.Printf("Target Antigravity Conversation ID: %s", cfg.AgyConversationID)
 	}
 
 	// Build adapters based on ACTIVE_MESSENGERS
@@ -470,7 +470,7 @@ func main() {
 				return
 			}
 
-			if cfg.GeminiSessionUUID == "" {
+			if cfg.AgyConversationID == "" {
 				adapter.Send(m.ChatID, msgs.ErrorMissingUUID)
 				return
 			}
@@ -478,18 +478,18 @@ func main() {
 			stop := adapter.StartTyping(m.ChatID)
 			defer stop()
 
-			response, err := executeGemini(m.Content, cfg.GeminiSessionUUID)
+			response, err := executeAgy(m.Content, cfg.AgyConversationID)
 			if err != nil {
-				if ge, ok := err.(*GeminiError); ok {
-					switch ge.Type {
+				if ae, ok := err.(*AgyError); ok {
+					switch ae.Type {
 					case "cli_failure":
-						adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorCLIFailure, ge.Err, ge.Detail))
-					case "no_valid_json":
-						adapter.Send(m.ChatID, msgs.ErrorNoValidJSON)
+						adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorCLIFailure, ae.Err, ae.Detail))
 					case "json_parse_fail":
 						adapter.Send(m.ChatID, msgs.ErrorJSONParseFail)
-					case "system_error":
-						adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorSystemResponse, ge.Detail))
+					case "error_status":
+						adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorSystemResponse, ae.Detail))
+					case "authentication_required":
+						adapter.Send(m.ChatID, "⚠️ agy 인증이 필요합니다. 터미널에서 'agy'를 한 번 실행해 인증을 완료한 뒤 봇을 재시작하세요.")
 					}
 				}
 				return
