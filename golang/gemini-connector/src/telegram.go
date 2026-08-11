@@ -78,22 +78,50 @@ func (t *TelegramAdapter) Send(chatID string, text string) error {
 		return fmt.Errorf("invalid chat ID: %s", chatID)
 	}
 
-	runes := []rune(text)
-	chunkSize := 4000
+	htmlBody := convertMarkdownToTelegramHTML(text)
 
-	for i := 0; i < len(runes); i += chunkSize {
-		end := i + chunkSize
-		if end > len(runes) {
-			end = len(runes)
-		}
-		chunkText := string(runes[i:end])
-		msg := tgbotapi.NewMessage(id, chunkText)
-		if _, sendErr := t.bot.Send(msg); sendErr != nil {
-			log.Printf("Failed to send message chunk to %d: %v", id, sendErr)
-			return sendErr
+	for _, chunk := range splitTelegramChunks(htmlBody, 4000) {
+		if err := t.sendOne(id, chunk, tgbotapi.ModeHTML); err != nil {
+			log.Printf("Telegram HTML send failed (%v), retrying chunk as plain text", err)
+			if err2 := t.sendOne(id, chunk, ""); err2 != nil {
+				log.Printf("Telegram plain-text fallback also failed: %v", err2)
+				return err2
+			}
 		}
 	}
 	return nil
+}
+
+func (t *TelegramAdapter) sendOne(chatID int64, text string, parseMode string) error {
+	msg := tgbotapi.NewMessage(chatID, text)
+	if parseMode != "" {
+		msg.ParseMode = parseMode
+	}
+	_, err := t.bot.Send(msg)
+	return err
+}
+
+// splitTelegramChunks splits a string into chunks no longer than limit bytes,
+// preferring to break at newline boundaries when possible so that we don't
+// split in the middle of a line of code or a paragraph.
+func splitTelegramChunks(s string, limit int) []string {
+	if len(s) <= limit {
+		return []string{s}
+	}
+	var chunks []string
+	for len(s) > limit {
+		cut := limit
+		nl := strings.LastIndex(s[:limit], "\n")
+		if nl > limit/2 {
+			cut = nl + 1
+		}
+		chunks = append(chunks, s[:cut])
+		s = s[cut:]
+	}
+	if len(s) > 0 {
+		chunks = append(chunks, s)
+	}
+	return chunks
 }
 
 func (t *TelegramAdapter) StartTyping(chatID string) (stop func()) {
