@@ -1,4 +1,4 @@
-﻿# Binaries
+# Binaries
 *.exe
 *.dll
 *.so
@@ -39,7 +39,7 @@ bot.log
 *.log
 
 # Codex Configuration
-.agent/
+.agents/
 
 # Custom Skills to exclude
 
