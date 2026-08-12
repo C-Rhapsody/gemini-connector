@@ -14,21 +14,21 @@ Go 언어의 인터페이스를 활용하여 메신저별 고유 로직을 추�
 - `GetFile(fileID string) (localPath string, err error)`: 미디어 파일 다운로드
 
 ### 2.2 통합 메시지 버스 (Internal Message Bus)
-메신저 종류에 상관없이 내부적으로는 동일한 데이터 구조(`InternalMessage`)로 변환하여 Gemini CLI에게 전달한다.
+메신저 종류에 상관없이 내부적으로는 동일한 데이터 구조(`InternalMessage`)로 변환하여 agy(Antigravity CLI)에게 전달한다.
 - `Platform`: (Telegram | Slack | Discord | Teams)
 - `UserID`: 각 플랫폼의 고유 사용자 식별자
 - `ChatID`: 각 플랫폼의 채팅방 식별자
 - `Content`: 텍스트 또는 파일 경로
 
-모든 `InternalMessage`는 최종적으로 하나의 공용 `GEMINI_SESSION_UUID`로 수렴하며, 메신저는 입력 채널만 다를 뿐 AI 대화 맥락은 단일 세션으로 공유한다.
+모든 `InternalMessage`는 최종적으로 하나의 공용 `AGY_CONVERSATION_ID`로 수렴하며, 메신저는 입력 채널만 다를 뿐 AI 대화 맥락은 단일 세션으로 공유한다.
 
 ## 3. 메신저별 연동 세부 계획 (Implementation Details)
 
-### 3.1 Telegram (Completed / Existing)
+### 3.1 Telegram (Completed)
 - **연동 방식**: **Long Polling**
-  - 현재 구현 완료된 방식으로, `GetUpdates` API를 주기적으로 호출하여 실시간 메시지를 수신함.
+  - `GetUpdates` API를 주기적으로 호출하여 실시간 메시지를 수신함.
 - **주요 라이브러리**: `github.com/go-telegram-bot-api/telegram-bot-api/v5`
-- **현재 상태**: 단일 플랫폼 모드로 운영 중이며, 향후 공통 인터페이스(Phase 1)로 리팩토링 대상임.
+- **현재 상태**: 공통 어댑터 인터페이스(Phase 1) 적용 완료. agy의 마크다운 응답을 텔레그램 HTML로 변환(`telegram_html.go`, goldmark)하여 전송하며, 실패 시 plain text 폴백을 수행함.
 
 ### 3.2 Slack (Enterprise Standard)
 - **연동 방식**: **Socket Mode** (추천) 또는 Webhook
@@ -40,7 +40,7 @@ Go 언어의 인터페이스를 활용하여 메신저별 고유 로직을 추�
 - **연동 방식**: **WebSocket Gateway**
   - 실시간 이벤트 스트리밍 방식인 Gateway API를 사용하여 고속 응답 구현.
 - **주요 라이브러리**: `github.com/bwmarrin/discordgo`
-- **특이사항**: 풍부한 Embed 메시지 기능을 활용하여 `gemini-cli`의 분석 결과를 더 미려하게 출력 가능.
+- **특이사항**: 풍부한 Embed 메시지 기능을 활용하여 `agy`의 분석 결과를 더 미려하게 출력 가능.
 
 ### 3.4 Microsoft Teams (Collaboration Standard)
 - **연동 방식**: **Bot Framework SDK** (또는 Outgoing Webhook)
@@ -70,15 +70,15 @@ TEAMS_APP_PASSWORD=...
 ```
 
 ## 5. 세션 관리 전략 (Unified Cross-Platform Session)
-- 본 프로젝트는 모든 메신저 플랫폼과 사용자 입력을 하나의 Gemini CLI 세션(UUID)으로 통합하여 처리한다.
-- Telegram, Teams 등 서로 다른 플랫폼에서 들어온 메시지라도 모두 동일한 `GEMINI_SESSION_UUID`로 `--resume <UUID>`를 수행한다.
+- 본 프로젝트는 모든 메신저 플랫폼과 사용자 입력을 하나의 agy 대화(Conversation ID)로 통합하여 처리한다.
+- Telegram, Teams 등 서로 다른 플랫폼에서 들어온 메시지라도 모두 동일한 `AGY_CONVERSATION_ID`로 `--conversation <ID>`를 수행한다.
 - 이 구조의 목적은 플랫폼이 달라도 하나의 지속적인 AI 맥락(Context)을 유지하는 데 있다.
-- 따라서 사용자별 세션 분리, 플랫폼별 세션 격리, 다중 UUID 매핑은 현재 범위에 포함하지 않는다.
+- 따라서 사용자별 세션 분리, 플랫폼별 세션 격리, 다중 ID 매핑은 현재 범위에 포함하지 않는다.
 - 향후 필요 시에만 선택적 확장 기능으로 검토한다.
 
 ## 6. 향후 추진 단계 (Roadmap)
-1. **[Phase 1] Core Refactoring**: `main.go`에서 텔레그램 로직을 별도 패키지로 분리하고 인터페이스 정의.
-2. **[Phase 2] Adapter Implementation**: Slack(Socket Mode) -> Discord -> Teams 순으로 어댑터 구현.
+1. **[Phase 1] Core Refactoring**: 공통 메신저 인터페이스(`Init`/`Listen`/`Send`/`GetFile`)와 `InternalMessage` 버스 구조 구현 — **완료** (Telegram, Teams 어댑터 적용)
+2. **[Phase 2] Adapter Implementation**: Slack(Socket Mode) -> Discord 순으로 어댑터 구현. Teams 어댑터는 Graph API 폴링 방식으로 구현 완료.
 3. **[Phase 3] Shared Resource Management**: 미디어 다운로드 폴더 및 로그 시스템 통합 관리.
 
 ---
