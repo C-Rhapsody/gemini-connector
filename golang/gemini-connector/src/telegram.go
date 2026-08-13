@@ -78,11 +78,10 @@ func (t *TelegramAdapter) Send(chatID string, text string) error {
 		return fmt.Errorf("invalid chat ID: %s", chatID)
 	}
 
-	htmlBody := convertMarkdownToTelegramHTML(text)
-
-	for _, chunk := range splitTelegramChunks(htmlBody, 4000) {
-		if err := t.sendOne(id, chunk, tgbotapi.ModeHTML); err != nil {
-			log.Printf("Telegram HTML send failed (%v), retrying chunk as plain text", err)
+	for _, chunk := range splitTelegramChunks(text, 4000) {
+		htmlBody := convertMarkdownToTelegramHTML(chunk)
+		if err := t.sendOne(id, htmlBody, tgbotapi.ModeHTML); err != nil {
+			log.Printf("Telegram HTML send failed (%v), retrying as plain text", err)
 			if err2 := t.sendOne(id, chunk, ""); err2 != nil {
 				log.Printf("Telegram plain-text fallback also failed: %v", err2)
 				return err2
