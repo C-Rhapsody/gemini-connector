@@ -57,7 +57,9 @@
     -   텔레그램에서 `@BotFather`와 대화하여 새 봇을 생성하고 `TELEGRAM_BOT_TOKEN`을 발급받습니다.
 
 2.  **agy 설치 및 인증:**
-    -   공식 설치 스크립트로 agy를 설치합니다. (Windows: `irm https://antigravity.google/cli/install.ps1 | iex`)
+    -   공식 설치 스크립트로 agy를 설치합니다.
+        -   Windows: `irm https://antigravity.google/cli/install.ps1 | iex`
+        -   Linux/macOS: `curl -fsSL https://antigravity.google/cli/install.sh | bash`
     -   터미널에서 `agy`를 한 번 실행하여 로그인 인증을 완료합니다.
 
 3.  **대화 세션 설정 (Conversation ID):**

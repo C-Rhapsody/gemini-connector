@@ -57,7 +57,9 @@ Source code, executables, and data are clearly separated.
     -   Talk to `@BotFather` on Telegram to create a new bot and obtain the `TELEGRAM_BOT_TOKEN`.
 
 2.  **Install & Authenticate agy:**
-    -   Install agy via the official install script. (Windows: `irm https://antigravity.google/cli/install.ps1 | iex`)
+    -   Install agy via the official install script.
+        -   Windows: `irm https://antigravity.google/cli/install.ps1 | iex`
+        -   Linux/macOS: `curl -fsSL https://antigravity.google/cli/install.sh | bash`
     -   Run `agy` once in a terminal to complete login authentication.
 
 3.  **Conversation Setup (Conversation ID):**
