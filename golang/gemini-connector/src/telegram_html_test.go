@@ -186,3 +186,69 @@ func TestConvertMarkdownToTelegramHTML_RealAgyResponse(t *testing.T) {
 		}
 	}
 }
+
+func TestConvertMarkdownToTelegramHTML_Table(t *testing.T) {
+	input := "| 구분 | AUTOMATIC1111 (WebUI) | ComfyUI |\n" +
+		"| :--- | :--- | :--- |\n" +
+		"| 인터페이스 | 슬라이더와 버튼 중심의 슬롯형 메뉴 | 노드를 선으로 연결하는 흐름도 방식 |\n" +
+		"| 난이도 | 직관적이고 입문자에게 쉬움 | 노드 구조 이해가 필요하여 초기 학습 곡선 있음 |"
+
+	got := convertMarkdownToTelegramHTML(input)
+	if !strings.HasPrefix(strings.TrimPrefix(got, "\n"), preOpen) || !strings.HasSuffix(got, preClose+"\n") {
+		t.Fatalf("table should be rendered as preformatted text, got: %q", got)
+	}
+	if strings.Contains(got, "<table>") || strings.Contains(got, "<td>") {
+		t.Fatalf("Telegram-incompatible table tags should not be emitted: %q", got)
+	}
+	for _, value := range []string{"구분", "AUTOMATIC1111 (WebUI)", "ComfyUI", "슬라이더와 버튼 중심의", "슬롯형 메뉴", "노드 구조 이해가 필요하여 초기 학습", "곡선 있음"} {
+		if !strings.Contains(got, value) {
+			t.Errorf("table output should contain %q: %q", value, got)
+		}
+	}
+	if !strings.Contains(got, " | ") {
+		t.Errorf("table columns should remain visibly separated: %q", got)
+	}
+}
+
+func TestConvertMarkdownToTelegramHTML_TablePlainCellsAndEmptyCells(t *testing.T) {
+	input := "| Name | Details | Empty |\n" +
+		"| --- | --- | --- |\n" +
+		"| **bold** | `code` and [link](https://example.com) | |"
+
+	got := convertMarkdownToTelegramHTML(input)
+	if strings.Contains(got, bOpen) || strings.Contains(got, codeOpen) || strings.Contains(got, aOpenHref) {
+		t.Fatalf("table cell markup should be flattened to plain text: %q", got)
+	}
+	for _, value := range []string{"bold", "code", "link", "Empty"} {
+		if !strings.Contains(got, value) {
+			t.Errorf("table output should contain %q: %q", value, got)
+		}
+	}
+}
+
+func TestConvertMarkdownToTelegramHTML_TableWrapsLongCells(t *testing.T) {
+	input := "| Key | Description |\n" +
+		"| --- | --- |\n" +
+		"| long | " + strings.Repeat("word ", 30) + "|"
+
+	got := convertMarkdownToTelegramHTML(input)
+	body := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(got, "\n"), preOpen), preClose+"\n")
+	for _, line := range strings.Split(body, "\n") {
+		if displayWidth(line) > tableMaxWidth {
+			t.Errorf("table line exceeds configured width: %d > %d: %q", displayWidth(line), tableMaxWidth, line)
+		}
+	}
+}
+
+func TestConvertMarkdownToTelegramHTML_TableWithoutHeaderRemainsText(t *testing.T) {
+	input := "| value one | value two |\n| value three | value four |"
+	got := convertMarkdownToTelegramHTML(input)
+	if strings.Contains(got, preOpen) {
+		t.Fatalf("a headerless table should not be synthesized as a formatted table: %q", got)
+	}
+	for _, value := range []string{"| value one | value two |", "| value three | value four |"} {
+		if !strings.Contains(got, value) {
+			t.Errorf("headerless table text should remain visible, missing %q in %q", value, got)
+		}
+	}
+}
