@@ -31,9 +31,7 @@
 ```text
 [Project Root]/
 ├── .gemini/             # Gemini/agy 공용 설정 폴더
-│   ├── settings.json    # agy 설정 파일
-│   ├── gemini.md        # AI의 핵심 시스템 프롬프트 및 가동 원칙 정의 파일
-│   └── personality.md   # AI의 페르소나(정체성 및 말투) 설정 파일
+│   └── settings.json    # agy 설정 파일
 └── golang/gemini-connector/
     ├── src/
     │   ├── main.go            # 커넥터의 핵심 소스 코드
@@ -42,6 +40,7 @@
     │   ├── telegram.go        # 텔레그램 어댑터 (롱폴링, 미디어, 청크 분할)
     │   ├── telegram_html.go   # 마크다운 → 텔레그램 HTML 변환 (goldmark)
     │   ├── teams.go           # Teams 어댑터 (선택)
+    │   ├── messenger.go       # 메신저 공통 인터페이스 및 어댑터 라우팅
     │   ├── go.mod             # Go 패키지 의존성 파일
     │   ├── .env               # 환경 변수 (토큰, Chat ID, 대화 ID) - 실행 시 참조
     │   └── messages.json      # 외부화된 안내/에러 문구 템플릿 - 실행 시 참조
@@ -75,10 +74,6 @@
     AGY_CONVERSATION_ID=자동_또는_수동_입력_ID
     ```
 
-5.  **AI 성격 및 가동 원칙 설정 (선택):**
-    -   `.gemini/` 폴더 내에 제공된 `gemini.md_sample`과 `personality.md_sample` 파일을 참고하십시오.
-    -   해당 파일들의 내용을 본인의 목적에 맞게 수정한 뒤, 파일명에서 `_sample`을 제거(`gemini.md`, `personality.md`로 이름 변경)하여 저장하시면 AI가 해당 규칙을 최우선으로 따르게 됩니다.
-
 ## 다운로드 및 실행 (Installation & Run)
 
 본 커넥터는 직접 소스 코드를 빌드하여 사용하거나, 이미 빌드된 실행 파일을 다운로드하여 곧바로 사용할 수 있습니다.
@@ -92,7 +87,7 @@ Go 언어가 설치되어 있다면 프로젝트 구조에 맞춰 `src` 폴더�
 
 ```bash
 cd golang/gemini-connector/src
-go build -o ../bin/gemini-connector_windows_x64.exe
+go build -ldflags="-s -w" -o ../bin/gemini-connector_windows_x64.exe
 ```
 
 ### 실행 (Run)

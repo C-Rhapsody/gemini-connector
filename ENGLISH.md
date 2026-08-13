@@ -31,9 +31,7 @@ Source code, executables, and data are clearly separated.
 ```text
 [Project Root]/
 ├── .gemini/             # Shared Gemini/agy configuration folder
-│   ├── settings.json    # agy configuration file
-│   ├── gemini.md        # Core system prompt and operational guidelines for the AI
-│   └── personality.md   # AI persona (identity and tone) configuration file
+│   └── settings.json    # agy configuration file
 └── golang/gemini-connector/
     ├── src/
     │   ├── main.go            # Core connector source code
@@ -42,6 +40,7 @@ Source code, executables, and data are clearly separated.
     │   ├── telegram.go        # Telegram adapter (long-polling, media, chunking)
     │   ├── telegram_html.go   # Markdown → Telegram HTML conversion (goldmark)
     │   ├── teams.go           # Teams adapter (optional)
+    │   ├── messenger.go       # Messenger common interface and adapter routing
     │   ├── go.mod             # Go module dependencies
     │   ├── .env               # Environment variables (Token, Chat ID, Conversation ID) - Referenced at runtime
     │   └── messages.json      # Externalized UI/error messages - Referenced at runtime
@@ -75,10 +74,6 @@ Source code, executables, and data are clearly separated.
     AGY_CONVERSATION_ID=auto_or_manually_entered_id
     ```
 
-5.  **Configure AI Personality & Guidelines (Optional):**
-    -   Refer to the `gemini.md_sample` and `personality.md_sample` files provided in the `.gemini/` folder.
-    -   Modify the contents to fit your needs, and rename them by removing the `_sample` extension (i.e., save as `gemini.md` and `personality.md`). The AI will strictly adhere to these customized rules.
-
 ## Installation & Run
 
 You can either compile the source code yourself or download a pre-built executable to get started immediately.
@@ -92,7 +87,7 @@ If you have Go installed, you can compile the source code directly.
 
 ```bash
 cd golang/gemini-connector/src
-go build -o ../bin/gemini-connector_windows_x64.exe
+go build -ldflags="-s -w" -o ../bin/gemini-connector_windows_x64.exe
 ```
 
 ### Run
