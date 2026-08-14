@@ -548,6 +548,8 @@ func main() {
 			}
 
 			if response != "" {
+				appendTranscript(cfg.ConversationID(), "user", m.Content)
+				appendTranscript(cfg.ConversationID(), "assistant", response)
 				adapter.Send(m.ChatID, response)
 			} else {
 				adapter.Send(m.ChatID, msgs.ErrorEmptyResponse)
@@ -556,14 +558,22 @@ func main() {
 	}
 }
 
-// resetConversation creates a fresh agy conversation, persists the new ID to
-// .env, and optionally replays the given prompt on the new session.
+// resetConversation summarizes the old conversation into a fresh agy
+// conversation, persists the new ID to .env, replays the given prompt on the
+// new session, and deletes the old session artifacts.
 func resetConversation(cfg *Config, adapter Messenger, chatID string, replayPrompt string, msgs *Messages) {
-	log.Println("Creating a new Antigravity conversation...")
-	newID, err := createNewConversationRuntime()
+	oldID := cfg.ConversationID()
+	log.Printf("Resetting conversation. Old conversation ID: %s", oldID)
+
+	summaryPrompt := buildSummaryPrompt(oldID)
+	if strings.TrimSpace(summaryPrompt) == "" {
+		summaryPrompt = "Telegram Connector is you. Reply Only with 'Telegram Connector Ready.'"
+	}
+
+	newID, _, err := createNewConversationRuntimeWithPrompt(summaryPrompt)
 	if err != nil {
 		log.Printf("Failed to create new conversation: %v", err)
-		cfg.applyNewConversation(cfg.ConversationID())
+		cfg.applyNewConversation(oldID)
 		adapter.Send(chatID, fmt.Sprintf("⚠️ 새 대화 세션 생성에 실패했습니다: %v", err))
 		return
 	}
@@ -574,11 +584,16 @@ func resetConversation(cfg *Config, adapter Messenger, chatID string, replayProm
 	cfg.applyNewConversation(newID)
 	log.Printf("Conversation reset complete. New conversation ID: %s", newID)
 
-	notice := fmt.Sprintf("⚠️ 이전 세션이 URL 접근 오류로 응답 불가 상태가 되어 새 대화 세션으로 전환했습니다. (새 세션 ID: %s)", truncateString(newID, 8))
+	deleteConversationArtifacts(oldID)
+	deleteTranscript(oldID)
+
+	notice := fmt.Sprintf("⚠️ 이전 대화를 요약해 새 세션으로 전환했습니다. (새 세션 ID: %s)", truncateString(newID, 8))
 
 	if replayPrompt != "" {
 		response, rerr := executeAgy(replayPrompt, newID)
 		if rerr == nil && response != "" {
+			appendTranscript(newID, "user", replayPrompt)
+			appendTranscript(newID, "assistant", response)
 			adapter.Send(chatID, notice+"\n\n"+response)
 			return
 		}
@@ -586,4 +601,26 @@ func resetConversation(cfg *Config, adapter Messenger, chatID string, replayProm
 	}
 
 	adapter.Send(chatID, notice)
+}
+
+// deleteConversationArtifacts removes the old conversation's on-disk state
+// (SQLite files and brain folder) in a best-effort manner.
+func deleteConversationArtifacts(convID string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	base := filepath.Join(home, ".gemini", "antigravity-cli")
+
+	for _, suffix := range []string{"", "-shm", "-wal"} {
+		p := filepath.Join(base, "conversations", convID+".db"+suffix)
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			log.Printf("Failed to delete old conversation file %s: %v", p, err)
+		}
+	}
+
+	brainDir := filepath.Join(base, "brain", convID)
+	if err := os.RemoveAll(brainDir); err != nil && !os.IsNotExist(err) {
+		log.Printf("Failed to delete old conversation brain dir %s: %v", brainDir, err)
+	}
 }

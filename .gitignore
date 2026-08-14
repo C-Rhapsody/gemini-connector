@@ -28,6 +28,10 @@ script/*
 golang/gemini-connector/downloads/*
 !golang/gemini-connector/downloads/.gitkeep
 
+# Conversation transcripts
+golang/gemini-connector/context/*
+!golang/gemini-connector/context/.gitkeep
+
 # AI Configuration
 .gemini/gemini.md
 .gemini/personality.md
