@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -93,6 +94,16 @@ func executeAgy(prompt string, conversationID string) (string, error) {
 	}
 
 	return result.Response, nil
+}
+
+var urlFetchFailurePattern = regexp.MustCompile(`Failed to fetch document content at (\S+)`)
+
+func extractUrlFetchFailure(detail string) string {
+	match := urlFetchFailurePattern.FindStringSubmatch(detail)
+	if len(match) < 2 {
+		return ""
+	}
+	return match[1]
 }
 
 func findProjectRoot() string {

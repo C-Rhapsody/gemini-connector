@@ -172,6 +172,13 @@ func (t *TelegramAdapter) handleIncomingMessage(msg *tgbotapi.Message) {
 		switch msg.Command() {
 		case "start", "help":
 			t.Send(chatID, t.msgs.CommandStartHelp)
+		case "reset", "new":
+			t.msgChan <- InternalMessage{
+				Platform: "telegram",
+				UserID:   "",
+				ChatID:   chatID,
+				Command:  "/reset",
+			}
 		default:
 			t.Send(chatID, t.msgs.CommandUnknown)
 		}

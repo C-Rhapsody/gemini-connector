@@ -30,6 +30,46 @@ type Config struct {
 	TeamsAppSecret    string
 	TeamsChatID       string
 	AgyConversationID string
+
+	mu             sync.Mutex
+	envPath        string
+	lastErrDetail  string
+	consecErrCount int
+	resetting      bool
+}
+
+func (c *Config) ConversationID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.AgyConversationID
+}
+
+// recordUrlFetchError tracks consecutive identical URL fetch failures.
+// It returns true when the same failure repeats twice and a reset is not
+// already in progress.
+func (c *Config) recordUrlFetchError(detail string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if detail != "" && detail == c.lastErrDetail {
+		c.consecErrCount++
+	} else {
+		c.lastErrDetail = detail
+		c.consecErrCount = 1
+	}
+	if c.consecErrCount >= 2 && !c.resetting {
+		c.resetting = true
+		return true
+	}
+	return false
+}
+
+func (c *Config) applyNewConversation(id string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.AgyConversationID = id
+	c.lastErrDetail = ""
+	c.consecErrCount = 0
+	c.resetting = false
 }
 
 type Messages struct {
@@ -144,6 +184,7 @@ func loadConfig() (*Config, error) {
 		TeamsAppSecret:    teamsAppSecret,
 		TeamsChatID:       teamsChatID,
 		AgyConversationID: convID,
+		envPath:           envPath,
 	}, nil
 }
 
@@ -470,7 +511,12 @@ func main() {
 				return
 			}
 
-			if cfg.AgyConversationID == "" {
+			if m.Command == "/reset" {
+				resetConversation(cfg, adapter, m.ChatID, "", msgs)
+				return
+			}
+
+			if cfg.ConversationID() == "" {
 				adapter.Send(m.ChatID, msgs.ErrorMissingUUID)
 				return
 			}
@@ -478,7 +524,7 @@ func main() {
 			stop := adapter.StartTyping(m.ChatID)
 			defer stop()
 
-			response, err := executeAgy(m.Content, cfg.AgyConversationID)
+			response, err := executeAgy(m.Content, cfg.ConversationID())
 			if err != nil {
 				if ae, ok := err.(*AgyError); ok {
 					switch ae.Type {
@@ -487,7 +533,13 @@ func main() {
 					case "json_parse_fail":
 						adapter.Send(m.ChatID, msgs.ErrorJSONParseFail)
 					case "error_status":
-						adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorSystemResponse, ae.Detail))
+						detail := ae.Detail
+						if extractUrlFetchFailure(detail) != "" && cfg.recordUrlFetchError(detail) {
+							log.Printf("Stuck conversation detected (repeated URL fetch failure), resetting session")
+							resetConversation(cfg, adapter, m.ChatID, m.Content, msgs)
+							return
+						}
+						adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorSystemResponse, detail))
 					case "authentication_required":
 						adapter.Send(m.ChatID, "⚠️ agy 인증이 필요합니다. 터미널에서 'agy'를 한 번 실행해 인증을 완료한 뒤 봇을 재시작하세요.")
 					}
@@ -502,4 +554,36 @@ func main() {
 			}
 		}(msg)
 	}
+}
+
+// resetConversation creates a fresh agy conversation, persists the new ID to
+// .env, and optionally replays the given prompt on the new session.
+func resetConversation(cfg *Config, adapter Messenger, chatID string, replayPrompt string, msgs *Messages) {
+	log.Println("Creating a new Antigravity conversation...")
+	newID, err := createNewConversationRuntime()
+	if err != nil {
+		log.Printf("Failed to create new conversation: %v", err)
+		cfg.applyNewConversation(cfg.ConversationID())
+		adapter.Send(chatID, fmt.Sprintf("⚠️ 새 대화 세션 생성에 실패했습니다: %v", err))
+		return
+	}
+
+	if err := updateEnvKey(cfg.envPath, "AGY_CONVERSATION_ID", newID); err != nil {
+		log.Printf("Failed to update .env with new conversation ID: %v", err)
+	}
+	cfg.applyNewConversation(newID)
+	log.Printf("Conversation reset complete. New conversation ID: %s", newID)
+
+	notice := fmt.Sprintf("⚠️ 이전 세션이 URL 접근 오류로 응답 불가 상태가 되어 새 대화 세션으로 전환했습니다. (새 세션 ID: %s)", truncateString(newID, 8))
+
+	if replayPrompt != "" {
+		response, rerr := executeAgy(replayPrompt, newID)
+		if rerr == nil && response != "" {
+			adapter.Send(chatID, notice+"\n\n"+response)
+			return
+		}
+		log.Printf("Replay on new conversation failed: %v", rerr)
+	}
+
+	adapter.Send(chatID, notice)
 }

@@ -195,3 +195,56 @@ func createNewConversation() (string, error) {
 	fmt.Println("✅ Conversation creation command finished.")
 	return result.ConversationID, nil
 }
+
+// createNewConversationRuntime creates a fresh agy conversation during bot
+// runtime. Unlike createNewConversation, it logs instead of printing to stdout.
+func createNewConversationRuntime() (string, error) {
+	prompt := "Telegram Connector is you. Reply Only with 'Telegram Connector Ready.'"
+	cmd := exec.Command("agy", "--output-format", "json", "--dangerously-skip-permissions", "--print-timeout", "5m")
+	cmd.Stdin = strings.NewReader(prompt)
+	cmd.Dir = findProjectRoot()
+
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to run agy CLI: %w", err)
+	}
+
+	var result struct {
+		ConversationID string `json:"conversation_id"`
+		Status         string `json:"status"`
+	}
+	if err := json.Unmarshal(out, &result); err != nil {
+		return "", fmt.Errorf("failed to parse agy response: %w (raw: %s)", err, string(out))
+	}
+	if result.ConversationID == "" {
+		return "", fmt.Errorf("agy did not return a conversation_id (status: %s)", result.Status)
+	}
+
+	return result.ConversationID, nil
+}
+
+// updateEnvKey updates a single KEY=value line in the .env file, preserving
+// all other lines and comments.
+func updateEnvKey(envPath string, key string, value string) error {
+	data, err := os.ReadFile(envPath)
+	if err != nil {
+		return err
+	}
+
+	lines := strings.Split(string(data), "\n")
+	keyPrefix := key + "="
+	updated := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, keyPrefix) {
+			lines[i] = keyPrefix + value
+			updated = true
+			break
+		}
+	}
+	if !updated {
+		lines = append(lines, keyPrefix+value)
+	}
+
+	return os.WriteFile(envPath, []byte(strings.Join(lines, "\n")), 0600)
+}
