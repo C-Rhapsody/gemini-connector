@@ -45,6 +45,21 @@ func (t *TelegramAdapter) Init() error {
 	}
 	t.bot = bot
 	log.Printf("Bot Authorized as: %s", bot.Self.UserName)
+
+	commands := []tgbotapi.BotCommand{
+		{Command: "start", Description: "커넥터 시작"},
+		{Command: "help", Description: "도움말 및 명령어 목록"},
+		{Command: "new", Description: "새 agy 대화 세션 시작"},
+		{Command: "reset", Description: "/new 의 별칭"},
+		{Command: "status", Description: "현재 대화 정보"},
+		{Command: "summary", Description: "최근 대화 미리보기"},
+		{Command: "list", Description: "캐시된 대화 목록"},
+		{Command: "switch", Description: "대화 전환 (ID 필요)"},
+		{Command: "version", Description: "버전 정보"},
+	}
+	if _, err := t.bot.Request(tgbotapi.NewSetMyCommands(commands...)); err != nil {
+		log.Printf("Failed to register bot commands: %v", err)
+	}
 	return nil
 }
 
@@ -179,6 +194,16 @@ func (t *TelegramAdapter) handleIncomingMessage(msg *tgbotapi.Message) {
 				ChatID:   chatID,
 				Command:  "/reset",
 			}
+		case "status":
+			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/status"}
+		case "summary":
+			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/summary"}
+		case "version":
+			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/version"}
+		case "list":
+			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/list"}
+		case "switch":
+			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/switch", Args: msg.CommandArguments()}
 		default:
 			t.Send(chatID, t.msgs.CommandUnknown)
 		}

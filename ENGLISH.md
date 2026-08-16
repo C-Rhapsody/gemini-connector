@@ -1,9 +1,9 @@
-# Gemini Telegram Connector (Event-Driven Controller)
+# agy Telegram Connector
 
 > "Openclaw for the Poor"
 
-This project is a standalone Telegram connector program written in Go, acting as an **Event-Driven Controller** bridging Telegram and **agy (Antigravity CLI)**. 
-It uses a lightweight, highly stable event-driven model where the AI is only woken up (triggered) when a Telegram message is received.
+This project is a standalone Telegram connector program written in Go, acting as an **Event-Driven Connector** bridging Telegram and **agy (Antigravity CLI)**.
+It uses a lightweight, highly stable event-driven model where agy is only woken up (triggered) when a Telegram message is received.
 
 ## Prerequisites
 
@@ -23,6 +23,24 @@ To build and run this connector, the following software must be installed on you
 -   **Intelligent Retry & Resilience:** Detects `429 Too Many Requests` (Rate Limit) errors from the Telegram API, parses the `Retry-After` headers, and safely waits before retrying.
 -   **Externalized Messaging:** All welcome messages and error text are managed externally in a `messages.json` file, allowing easy customization without recompiling the source code.
 -   **Interactive Conversation Helper (TUI):** If `AGY_CONVERSATION_ID` is missing in `.env`, the connector automatically reads agy's local conversation cache (`~/.gemini/antigravity-cli/cache/last_conversations.json`) and displays workspace-based conversations in a paginated list (10 per page). Users can pick a number to link a conversation, press `[c]` to create a new one, or `[m]` to enter an ID manually.
+
+## Commands
+
+The following `/` commands are available on the Telegram channel and are automatically registered in the Telegram client's '/' menu when the connector starts.
+
+| Command | Description |
+|---|---|
+| `/start`, `/help` | Help and list of available commands |
+| `/new` (or `/reset`) | Summarize the previous conversation and switch to a fresh agy session |
+| `/status` | Show the current conversation ID and recorded turn count |
+| `/summary` | Preview recent conversation turns (no agy invocation) |
+| `/list` | List agy conversations found in the local cache |
+| `/switch <ID>` | Switch to the given conversation ID (persisted to `.env`, applied bot-wide) |
+| `/version` | Show connector and agy version |
+
+> ⚠️ `AGY_CONVERSATION_ID` is global bot state shared across all channels. A `/switch` applies to every channel.
+
+> ℹ️ If repeated URL fetch failures are detected, the connector automatically summarizes the previous conversation and switches to a new session.
 
 ## Directory Structure
 

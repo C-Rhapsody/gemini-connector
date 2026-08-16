@@ -1,9 +1,9 @@
-# Gemini Telegram Connector (Event-Driven Controller)
+# agy Telegram Connector
 
 > "가난한 자를 위한 openclaw"
 
-이 프로젝트는 Go 언어로 작성된 독립적인 텔레그램 커넥터 프로그램으로, 텔레그램과 **agy (Antigravity CLI)**를 연결하는 **이벤트 주도형 컨트롤러(Event-Driven Controller)**입니다. 
-텔레그램 메시지가 인입될 때만 단발성으로 AI를 깨우는 극도로 가볍고 안정적인 구조를 가집니다.
+이 프로젝트는 Go 언어로 작성된 독립적인 텔레그램 커넥터 프로그램으로, 텔레그램과 **agy (Antigravity CLI)**를 연결하는 **이벤트 주도형 커넥터(Event-Driven Connector)**입니다.
+텔레그램 메시지가 인입될 때만 단발성으로 agy를 깨우는 극도로 가볍고 안정적인 구조를 가집니다.
 
 ## 필수 요구 사항 (Prerequisites)
 
@@ -23,6 +23,24 @@
 -   **지능형 재시도 및 방어 로직:** 텔레그램 API의 `429 Too Many Requests` (Rate Limit) 에러를 감지하고 `Retry-After` 헤더를 분석하여 안전하게 재시도합니다.
 -   **메시지 외부화 (Externalization):** 커넥터가 출력하는 모든 환영 메시지 및 에러 문구는 `messages.json` 파일에서 관리되므로 소스 코드 수정 없이 문구 변경이 가능합니다.
 -   **대화형 세션 선택 (TUI Helper):** `.env` 파일에 `AGY_CONVERSATION_ID`가 없을 경우, agy의 로컬 세션 캐시(`~/.gemini/antigravity-cli/cache/last_conversations.json`)를 읽어 워크스페이스별 대화 목록을 페이지 단위(10개씩)로 보여줍니다. 사용자는 번호 입력만으로 간편하게 세션을 등록할 수 있으며, `[c]`로 새 대화를 만들거나 `[m]`으로 ID를 직접 입력할 수도 있습니다.
+
+## 사용 가능 명령어 (Commands)
+
+텔레그램 채널에서 `/` 명령어를 사용할 수 있으며, 커넥터 기동 시 Telegram 클라이언트의 '/' 메뉴에도 자동 등록됩니다.
+
+| 명령어 | 설명 |
+|---|---|
+| `/start`, `/help` | 도움말 및 사용 가능 명령어 목록 |
+| `/new` (또는 `/reset`) | 이전 대화를 요약해 새 agy 대화 세션으로 전환 |
+| `/status` | 현재 대화 ID와 기록된 턴 수 표시 |
+| `/summary` | 최근 대화 내용 미리보기 (agy 호출 없음) |
+| `/list` | 로컬 캐시에 있는 agy 대화 목록 표시 |
+| `/switch <ID>` | 지정한 ID로 대화 전환 (`.env`에 저장되어 봇 전역에 적용) |
+| `/version` | 커넥터 및 agy 버전 표시 |
+
+> ⚠️ `AGY_CONVERSATION_ID`는 봇 전체에서 공유되는 전역 상태입니다. `/switch`로 전환한 대화는 모든 채널에 동일하게 적용됩니다.
+
+> ℹ️ URL 접속 실패가 반복 감지되면 커넥터가 이전 대화를 요약해 새 세션으로 **자동 전환**합니다.
 
 ## 프로젝트 구조 (Directory Structure)
 

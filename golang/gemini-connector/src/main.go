@@ -80,7 +80,6 @@ type Messages struct {
 	ErrorMediaDownloadFail string `json:"ErrorMediaDownloadFail"`
 	ErrorMissingUUID       string `json:"ErrorMissingUUID"`
 	ErrorCLIFailure        string `json:"ErrorCLIFailure"`
-	ErrorNoValidJSON       string `json:"ErrorNoValidJSON"`
 	ErrorJSONParseFail     string `json:"ErrorJSONParseFail"`
 	ErrorSystemResponse    string `json:"ErrorSystemResponse"`
 	ErrorEmptyResponse     string `json:"ErrorEmptyResponse"`
@@ -88,14 +87,13 @@ type Messages struct {
 }
 
 var defaultMessages = Messages{
-	StartupWelcome:         "🔔 컨트롤러 모드 가동 완료. 명령을 기다립니다.\n\n━━━━━━━━━━━━━\ngemini-connector 가동 완료",
-	CommandStartHelp:       "컨트롤러 모드 가동 중. 메시지를 입력하시면 처리합니다.",
-	CommandUnknown:         "알 수 없는 명령어입니다.",
+	StartupWelcome:         "🔔 agy 텔레그램 커넥터 가동 완료. 메시지를 보내면 agy가 처리합니다.",
+	CommandStartHelp:       "agy 텔레그램 커넥터 가동 중. 메시지를 보내면 agy가 처리합니다.\n\n사용 가능 명령어:\n/help - 도움말 및 명령어 목록\n/new (또는 /reset) - 이전 대화를 요약해 새 agy 대화 세션으로 전환\n/status - 현재 대화 ID와 기록된 턴 수 표시\n/summary - 최근 대화 내용 미리보기\n/list - 캐시된 agy 대화 목록\n/switch <ID> - 지정한 대화로 전환\n/version - 커넥터 및 agy 버전",
+	CommandUnknown:         "알 수 없는 명령어입니다. /help 를 입력하면 사용 가능한 명령어를 확인할 수 있습니다.",
 	ErrorMediaNotSupported: "⚠️ 현재 시스템은 동영상, 음성 및 일반 문서 파일 분석을 지원하지 않습니다. 텍스트 및 이미지 파일만 전송해 주십시오.",
 	ErrorMediaDownloadFail: "미디어 다운로드에 실패했습니다.",
 	ErrorMissingUUID:       "❌ 봇 설정 오류: .env 파일에 AGY_CONVERSATION_ID가 설정되지 않았습니다.",
 	ErrorCLIFailure:        "❌ 시스템 실행 오류 발생.\n\nError: %v\n\nLog: ...%s",
-	ErrorNoValidJSON:       "❌ 시스템 응답에서 유효한 데이터를 찾지 못했습니다.",
 	ErrorJSONParseFail:     "❌ 시스템 응답을 해석하는 데 실패했습니다.",
 	ErrorSystemResponse:    "⚠️ 시스템 응답 오류: %s",
 	ErrorEmptyResponse:     "⚠️ 명령이 빈 응답을 반환했습니다.",
@@ -511,8 +509,24 @@ func main() {
 				return
 			}
 
-			if m.Command == "/reset" {
+			switch m.Command {
+			case "/reset":
 				resetConversation(cfg, adapter, m.ChatID, "", msgs)
+				return
+			case "/status":
+				statusConversation(cfg, adapter, m.ChatID, msgs)
+				return
+			case "/summary":
+				summaryConversation(cfg, adapter, m.ChatID, msgs)
+				return
+			case "/version":
+				versionInfo(adapter, m.ChatID, msgs)
+				return
+			case "/list":
+				listConversations(adapter, m.ChatID, msgs)
+				return
+			case "/switch":
+				switchConversation(cfg, adapter, m.ChatID, m.Args, msgs)
 				return
 			}
 
@@ -567,7 +581,7 @@ func resetConversation(cfg *Config, adapter Messenger, chatID string, replayProm
 
 	summaryPrompt := buildSummaryPrompt(oldID)
 	if strings.TrimSpace(summaryPrompt) == "" {
-		summaryPrompt = "Telegram Connector is you. Reply Only with 'Telegram Connector Ready.'"
+		summaryPrompt = "This connector bridges Telegram to agy. Reply only with 'agy Connector Ready.'"
 	}
 
 	newID, _, err := createNewConversationRuntimeWithPrompt(summaryPrompt)

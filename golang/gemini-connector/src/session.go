@@ -171,7 +171,7 @@ func loadConversationCache() ([]ConversationEntry, error) {
 func createNewConversation() (string, error) {
 	fmt.Println("⏳ Generating a new Antigravity conversation...")
 
-	prompt := "Telegram Connector is you. Reply Only with 'Telegram Connector Ready.'"
+	prompt := "This connector bridges Telegram to agy. Reply only with 'agy Connector Ready.'"
 	cmd := exec.Command("agy", "--output-format", "json", "--dangerously-skip-permissions", "--print-timeout", "5m")
 	cmd.Stdin = strings.NewReader(prompt)
 	cmd.Dir = findProjectRoot()
@@ -199,7 +199,7 @@ func createNewConversation() (string, error) {
 // createNewConversationRuntime creates a fresh agy conversation during bot
 // runtime. Unlike createNewConversation, it logs instead of printing to stdout.
 func createNewConversationRuntime() (string, error) {
-	id, _, err := createNewConversationRuntimeWithPrompt("Telegram Connector is you. Reply Only with 'Telegram Connector Ready.'")
+	id, _, err := createNewConversationRuntimeWithPrompt("This connector bridges Telegram to agy. Reply only with 'agy Connector Ready.'")
 	return id, err
 }
 

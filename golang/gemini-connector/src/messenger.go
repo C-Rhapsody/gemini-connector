@@ -7,6 +7,7 @@ type InternalMessage struct {
 	ChatID   string
 	Content  string
 	Command  string
+	Args     string
 }
 
 // Messenger defines the common interface for all messaging platform adapters.
