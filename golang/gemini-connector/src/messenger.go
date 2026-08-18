@@ -15,6 +15,7 @@ type Messenger interface {
 	Init() error
 	Listen() (<-chan InternalMessage, error)
 	Send(chatID string, text string) error
+	SendPlain(chatID string, text string) error
 	StartTyping(chatID string) (stop func())
 	GetFile(fileID string) (string, error)
 }

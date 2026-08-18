@@ -130,6 +130,12 @@ func (t *TeamsAdapter) Send(chatID string, text string) error {
 	return nil
 }
 
+func (t *TeamsAdapter) SendPlain(chatID string, text string) error {
+	// Teams Send already posts with contentType "text" (plain), so no
+	// markdown-to-HTML conversion to bypass.
+	return t.Send(chatID, text)
+}
+
 func (t *TeamsAdapter) StartTyping(chatID string) (stop func()) {
 	// Graph API with application permissions does not support typing indicators
 	return func() {}

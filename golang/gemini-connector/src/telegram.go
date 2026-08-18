@@ -106,6 +106,23 @@ func (t *TelegramAdapter) Send(chatID string, text string) error {
 	return nil
 }
 
+// SendPlain sends text as-is without markdown-to-HTML conversion, preserving
+// literal formatting (numbers, indentation, backslashes, angle brackets).
+func (t *TelegramAdapter) SendPlain(chatID string, text string) error {
+	id, err := strconv.ParseInt(chatID, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid chat ID: %s", chatID)
+	}
+
+	for _, chunk := range splitTelegramChunks(text, 4000) {
+		if err := t.sendOne(id, chunk, ""); err != nil {
+			log.Printf("Telegram plain send failed: %v", err)
+			return err
+		}
+	}
+	return nil
+}
+
 func (t *TelegramAdapter) sendOne(chatID int64, text string, parseMode string) error {
 	msg := tgbotapi.NewMessage(chatID, text)
 	if parseMode != "" {

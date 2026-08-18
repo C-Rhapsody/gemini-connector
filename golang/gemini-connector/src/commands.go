@@ -104,6 +104,13 @@ func listConversations(cfg *Config, adapter Messenger, chatID, pageStr string, m
 
 	// Active conversation first, then the rest by workspace (stable).
 	activeID := cfg.ConversationID()
+	activeInCache := false
+	for _, e := range entries {
+		if e.ID == activeID {
+			activeInCache = true
+			break
+		}
+	}
 	sort.SliceStable(entries, func(i, j int) bool {
 		iActive := entries[i].ID == activeID
 		jActive := entries[j].ID == activeID
@@ -128,6 +135,9 @@ func listConversations(cfg *Config, adapter Messenger, chatID, pageStr string, m
 	end := min(start+listMaxEntries, total)
 
 	var b strings.Builder
+	if activeID != "" && !activeInCache {
+		b.WriteString(fmt.Sprintf("📌 현재 대화: %s (캐시에 없음)\n\n", activeID))
+	}
 	if totalPages > 1 {
 		b.WriteString(fmt.Sprintf("📁 agy 대화 캐시 (총 %d개, %d/%d 페이지)\n\n", total, page, totalPages))
 	} else {
@@ -139,13 +149,13 @@ func listConversations(cfg *Config, adapter Messenger, chatID, pageStr string, m
 		if conv.ID == activeID {
 			marker = "  ★ 현재"
 		}
-		b.WriteString(fmt.Sprintf("%d. `%s`%s\n   📂 %s — `%s`\n\n", i+1, conv.ID, marker, filepath.Base(conv.Workspace), conv.Workspace))
+		b.WriteString(fmt.Sprintf("%d. %s%s\n   📂 %s — %s\n\n", i+1, conv.ID, marker, filepath.Base(conv.Workspace), conv.Workspace))
 	}
 	if page < totalPages {
-		b.WriteString(fmt.Sprintf("`/list %d` 로 다음 페이지 · ", page+1))
+		b.WriteString(fmt.Sprintf("/list %d 로 다음 페이지 · ", page+1))
 	}
 	b.WriteString("/switch <ID> 로 대화를 전환할 수 있습니다.")
-	adapter.Send(chatID, b.String())
+	adapter.SendPlain(chatID, b.String())
 }
 
 func switchConversation(cfg *Config, adapter Messenger, chatID string, args string, msgs *Messages) {
