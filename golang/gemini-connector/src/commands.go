@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -88,7 +91,7 @@ func versionInfo(adapter Messenger, chatID string, msgs *Messages) {
 	adapter.Send(chatID, fmt.Sprintf("ℹ️ 버전 정보\n\n커넥터: %s\nagy: %s", version, agyVersion))
 }
 
-func listConversations(adapter Messenger, chatID string, msgs *Messages) {
+func listConversations(cfg *Config, adapter Messenger, chatID, pageStr string, msgs *Messages) {
 	entries, err := loadConversationCache()
 	if err != nil {
 		adapter.Send(chatID, fmt.Sprintf("⚠️ 대화 캐시를 읽지 못했습니다: %v", err))
@@ -99,11 +102,47 @@ func listConversations(adapter Messenger, chatID string, msgs *Messages) {
 		return
 	}
 
+	// Active conversation first, then the rest by workspace (stable).
+	activeID := cfg.ConversationID()
+	sort.SliceStable(entries, func(i, j int) bool {
+		iActive := entries[i].ID == activeID
+		jActive := entries[j].ID == activeID
+		if iActive != jActive {
+			return iActive
+		}
+		return entries[i].Workspace < entries[j].Workspace
+	})
+
+	total := len(entries)
+	totalPages := (total + listMaxEntries - 1) / listMaxEntries
+	page := 1
+	if p, perr := strconv.Atoi(strings.TrimSpace(pageStr)); perr == nil && p > 1 {
+		page = p
+	}
+	if page > totalPages {
+		adapter.Send(chatID, fmt.Sprintf("⚠️ 페이지가 범위를 벗어났습니다. (1~%d 페이지)", totalPages))
+		return
+	}
+
+	start := (page - 1) * listMaxEntries
+	end := min(start+listMaxEntries, total)
+
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("📁 캐시된 agy 대화 목록 (총 %d개 중 상위 %d개)\n\n", len(entries), min(listMaxEntries, len(entries))))
-	for i := 0; i < listMaxEntries && i < len(entries); i++ {
+	if totalPages > 1 {
+		b.WriteString(fmt.Sprintf("📁 agy 대화 캐시 (총 %d개, %d/%d 페이지)\n\n", total, page, totalPages))
+	} else {
+		b.WriteString(fmt.Sprintf("📁 agy 대화 캐시 (총 %d개)\n\n", total))
+	}
+	for i := start; i < end; i++ {
 		conv := entries[i]
-		b.WriteString(fmt.Sprintf("[%d] %s\n    (%s)\n\n", i+1, truncateString(conv.ID, 36), truncateString(conv.Workspace, 40)))
+		marker := ""
+		if conv.ID == activeID {
+			marker = "  ★ 현재"
+		}
+		b.WriteString(fmt.Sprintf("%d. `%s`%s\n   📂 %s — `%s`\n\n", i+1, conv.ID, marker, filepath.Base(conv.Workspace), conv.Workspace))
+	}
+	if page < totalPages {
+		b.WriteString(fmt.Sprintf("`/list %d` 로 다음 페이지 · ", page+1))
 	}
 	b.WriteString("/switch <ID> 로 대화를 전환할 수 있습니다.")
 	adapter.Send(chatID, b.String())

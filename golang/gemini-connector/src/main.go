@@ -523,7 +523,7 @@ func main() {
 				versionInfo(adapter, m.ChatID, msgs)
 				return
 			case "/list":
-				listConversations(adapter, m.ChatID, msgs)
+				listConversations(cfg, adapter, m.ChatID, m.Args, msgs)
 				return
 			case "/switch":
 				switchConversation(cfg, adapter, m.ChatID, m.Args, msgs)

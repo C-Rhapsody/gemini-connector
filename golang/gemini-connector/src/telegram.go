@@ -201,7 +201,7 @@ func (t *TelegramAdapter) handleIncomingMessage(msg *tgbotapi.Message) {
 		case "version":
 			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/version"}
 		case "list":
-			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/list"}
+			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/list", Args: msg.CommandArguments()}
 		case "switch":
 			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/switch", Args: msg.CommandArguments()}
 		default:
