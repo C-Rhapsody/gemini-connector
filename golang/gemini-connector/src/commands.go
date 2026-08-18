@@ -21,25 +21,25 @@ const (
 	listMaxEntries      = 10
 )
 
-func statusConversation(cfg *Config, adapter Messenger, chatID string, msgs *Messages) {
+func statusConversation(cfg *Config, adapter Messenger, chatID string, replyTo int, msgs *Messages) {
 	convID := cfg.ConversationID()
 	if convID == "" {
-		adapter.Send(chatID, msgs.ErrorMissingUUID)
+		adapter.Send(chatID, msgs.ErrorMissingUUID, SendOptions{ReplyToMessageID: replyTo})
 		return
 	}
 	turns := loadTranscript(convID)
-	adapter.Send(chatID, fmt.Sprintf("📋 현재 agy 대화\n\n대화 ID: %s\n기록된 턴 수: %d", convID, len(turns)))
+	adapter.Send(chatID, fmt.Sprintf("📋 현재 agy 대화\n\n대화 ID: %s\n기록된 턴 수: %d", convID, len(turns)), SendOptions{ReplyToMessageID: replyTo})
 }
 
-func summaryConversation(cfg *Config, adapter Messenger, chatID string, msgs *Messages) {
+func summaryConversation(cfg *Config, adapter Messenger, chatID string, replyTo int, msgs *Messages) {
 	convID := cfg.ConversationID()
 	if convID == "" {
-		adapter.Send(chatID, msgs.ErrorMissingUUID)
+		adapter.Send(chatID, msgs.ErrorMissingUUID, SendOptions{ReplyToMessageID: replyTo})
 		return
 	}
 	turns := loadTranscript(convID)
 	if len(turns) == 0 {
-		adapter.Send(chatID, "📄 아직 기록된 대화가 없습니다.")
+		adapter.Send(chatID, "📄 아직 기록된 대화가 없습니다.", SendOptions{ReplyToMessageID: replyTo})
 		return
 	}
 
@@ -67,7 +67,7 @@ func summaryConversation(cfg *Config, adapter Messenger, chatID string, msgs *Me
 	if len([]rune(text)) > summaryPreviewChars {
 		text = truncateRunes(text, summaryPreviewChars) + "\n…(미리보기 일부 생략)…"
 	}
-	adapter.Send(chatID, text)
+	adapter.Send(chatID, text, SendOptions{ReplyToMessageID: replyTo})
 }
 
 // truncateRunes truncates a string to at most max runes, never splitting a
@@ -80,7 +80,7 @@ func truncateRunes(s string, max int) string {
 	return string(runes[:max])
 }
 
-func versionInfo(adapter Messenger, chatID string, msgs *Messages) {
+func versionInfo(adapter Messenger, chatID string, replyTo int, msgs *Messages) {
 	agyVersion := "확인 불가"
 	out, err := exec.Command("agy", "--version").Output()
 	if err != nil {
@@ -88,17 +88,17 @@ func versionInfo(adapter Messenger, chatID string, msgs *Messages) {
 	} else if v := strings.TrimSpace(string(out)); v != "" {
 		agyVersion = v
 	}
-	adapter.Send(chatID, fmt.Sprintf("ℹ️ 버전 정보\n\n커넥터: %s\nagy: %s", version, agyVersion))
+	adapter.Send(chatID, fmt.Sprintf("ℹ️ 버전 정보\n\n커넥터: %s\nagy: %s", version, agyVersion), SendOptions{ReplyToMessageID: replyTo})
 }
 
-func listConversations(cfg *Config, adapter Messenger, chatID, pageStr string, msgs *Messages) {
+func listConversations(cfg *Config, adapter Messenger, chatID, pageStr string, replyTo int, msgs *Messages) {
 	entries, err := loadConversationCache()
 	if err != nil {
-		adapter.Send(chatID, fmt.Sprintf("⚠️ 대화 캐시를 읽지 못했습니다: %v", err))
+		adapter.Send(chatID, fmt.Sprintf("⚠️ 대화 캐시를 읽지 못했습니다: %v", err), SendOptions{ReplyToMessageID: replyTo})
 		return
 	}
 	if len(entries) == 0 {
-		adapter.Send(chatID, "📭 캐시된 agy 대화가 없습니다.")
+		adapter.Send(chatID, "📭 캐시된 agy 대화가 없습니다.", SendOptions{ReplyToMessageID: replyTo})
 		return
 	}
 
@@ -127,7 +127,7 @@ func listConversations(cfg *Config, adapter Messenger, chatID, pageStr string, m
 		page = p
 	}
 	if page > totalPages {
-		adapter.Send(chatID, fmt.Sprintf("⚠️ 페이지가 범위를 벗어났습니다. (1~%d 페이지)", totalPages))
+		adapter.Send(chatID, fmt.Sprintf("⚠️ 페이지가 범위를 벗어났습니다. (1~%d 페이지)", totalPages), SendOptions{ReplyToMessageID: replyTo})
 		return
 	}
 
@@ -155,18 +155,18 @@ func listConversations(cfg *Config, adapter Messenger, chatID, pageStr string, m
 		b.WriteString(fmt.Sprintf("/list %d 로 다음 페이지 · ", page+1))
 	}
 	b.WriteString("/switch <ID> 로 대화를 전환할 수 있습니다.")
-	adapter.SendPlain(chatID, b.String())
+	adapter.Send(chatID, b.String(), SendOptions{Plain: true, ReplyToMessageID: replyTo})
 }
 
-func switchConversation(cfg *Config, adapter Messenger, chatID string, args string, msgs *Messages) {
+func switchConversation(cfg *Config, adapter Messenger, chatID, args string, replyTo int, msgs *Messages) {
 	newID := strings.TrimSpace(args)
 	if newID == "" {
-		adapter.Send(chatID, "ℹ️ 사용법: /switch <대화 ID>\n예: /switch 1234abcd-…")
+		adapter.Send(chatID, "ℹ️ 사용법: /switch <대화 ID>\n예: /switch 1234abcd-…", SendOptions{ReplyToMessageID: replyTo})
 		return
 	}
 	if err := updateEnvKey(cfg.envPath, "AGY_CONVERSATION_ID", newID); err != nil {
 		log.Printf("Failed to update .env with new conversation ID: %v", err)
 	}
 	cfg.applyNewConversation(newID)
-	adapter.Send(chatID, fmt.Sprintf("✅ 대화를 전환했습니다. (새 대화 ID: %s)", truncateString(newID, 8)))
+	adapter.Send(chatID, fmt.Sprintf("✅ 대화를 전환했습니다. (새 대화 ID: %s)", truncateString(newID, 8)), SendOptions{ReplyToMessageID: replyTo})
 }

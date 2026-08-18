@@ -87,17 +87,28 @@ func (t *TelegramAdapter) Listen() (<-chan InternalMessage, error) {
 	return t.msgChan, nil
 }
 
-func (t *TelegramAdapter) Send(chatID string, text string) error {
+func (t *TelegramAdapter) Send(chatID string, text string, opts ...SendOptions) error {
+	var opt SendOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
 	id, err := strconv.ParseInt(chatID, 10, 64)
 	if err != nil {
 		return fmt.Errorf("invalid chat ID: %s", chatID)
 	}
 
 	for _, chunk := range splitTelegramChunks(text, 4000) {
+		if opt.Plain {
+			if err := t.sendOne(id, chunk, "", opt.ReplyToMessageID); err != nil {
+				log.Printf("Telegram plain send failed: %v", err)
+				return err
+			}
+			continue
+		}
 		htmlBody := convertMarkdownToTelegramHTML(chunk)
-		if err := t.sendOne(id, htmlBody, tgbotapi.ModeHTML); err != nil {
+		if err := t.sendOne(id, htmlBody, tgbotapi.ModeHTML, opt.ReplyToMessageID); err != nil {
 			log.Printf("Telegram HTML send failed (%v), retrying as plain text", err)
-			if err2 := t.sendOne(id, chunk, ""); err2 != nil {
+			if err2 := t.sendOne(id, chunk, "", opt.ReplyToMessageID); err2 != nil {
 				log.Printf("Telegram plain-text fallback also failed: %v", err2)
 				return err2
 			}
@@ -106,27 +117,13 @@ func (t *TelegramAdapter) Send(chatID string, text string) error {
 	return nil
 }
 
-// SendPlain sends text as-is without markdown-to-HTML conversion, preserving
-// literal formatting (numbers, indentation, backslashes, angle brackets).
-func (t *TelegramAdapter) SendPlain(chatID string, text string) error {
-	id, err := strconv.ParseInt(chatID, 10, 64)
-	if err != nil {
-		return fmt.Errorf("invalid chat ID: %s", chatID)
-	}
-
-	for _, chunk := range splitTelegramChunks(text, 4000) {
-		if err := t.sendOne(id, chunk, ""); err != nil {
-			log.Printf("Telegram plain send failed: %v", err)
-			return err
-		}
-	}
-	return nil
-}
-
-func (t *TelegramAdapter) sendOne(chatID int64, text string, parseMode string) error {
+func (t *TelegramAdapter) sendOne(chatID int64, text string, parseMode string, replyToID int) error {
 	msg := tgbotapi.NewMessage(chatID, text)
 	if parseMode != "" {
 		msg.ParseMode = parseMode
+	}
+	if replyToID != 0 {
+		msg.ReplyToMessageID = replyToID
 	}
 	_, err := t.bot.Send(msg)
 	return err
@@ -203,32 +200,33 @@ func (t *TelegramAdapter) handleIncomingMessage(msg *tgbotapi.Message) {
 	if msg.IsCommand() {
 		switch msg.Command() {
 		case "start", "help":
-			t.Send(chatID, t.msgs.CommandStartHelp)
+			t.Send(chatID, t.msgs.CommandStartHelp, SendOptions{ReplyToMessageID: msg.MessageID})
 		case "reset", "new":
 			t.msgChan <- InternalMessage{
-				Platform: "telegram",
-				UserID:   "",
-				ChatID:   chatID,
-				Command:  "/reset",
+				Platform:  "telegram",
+				UserID:    "",
+				ChatID:    chatID,
+				Command:   "/reset",
+				MessageID: msg.MessageID,
 			}
 		case "status":
-			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/status"}
+			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/status", MessageID: msg.MessageID}
 		case "summary":
-			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/summary"}
+			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/summary", MessageID: msg.MessageID}
 		case "version":
-			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/version"}
+			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/version", MessageID: msg.MessageID}
 		case "list":
-			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/list", Args: msg.CommandArguments()}
+			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/list", Args: msg.CommandArguments(), MessageID: msg.MessageID}
 		case "switch":
-			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/switch", Args: msg.CommandArguments()}
+			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/switch", Args: msg.CommandArguments(), MessageID: msg.MessageID}
 		default:
-			t.Send(chatID, t.msgs.CommandUnknown)
+			t.Send(chatID, t.msgs.CommandUnknown, SendOptions{ReplyToMessageID: msg.MessageID})
 		}
 		return
 	}
 
 	if msg.Video != nil || msg.VideoNote != nil || msg.Document != nil || msg.Audio != nil || msg.Voice != nil {
-		t.Send(chatID, t.msgs.ErrorMediaNotSupported)
+		t.Send(chatID, t.msgs.ErrorMediaNotSupported, SendOptions{ReplyToMessageID: msg.MessageID})
 		return
 	}
 
@@ -265,7 +263,7 @@ func (t *TelegramAdapter) processSingleMessage(msg *tgbotapi.Message) {
 			}
 			prompt = fmt.Sprintf("[첨부파일: %s] %s", mediaPath, prompt)
 		} else {
-			t.Send(chatID, t.msgs.ErrorMediaDownloadFail)
+			t.Send(chatID, t.msgs.ErrorMediaDownloadFail, SendOptions{ReplyToMessageID: msg.MessageID})
 			return
 		}
 	}
@@ -279,12 +277,39 @@ func (t *TelegramAdapter) processSingleMessage(msg *tgbotapi.Message) {
 		userID = strconv.FormatInt(msg.From.ID, 10)
 	}
 
+	quote, quoteRole := t.extractQuote(msg)
+
 	t.msgChan <- InternalMessage{
-		Platform: "telegram",
-		UserID:   userID,
-		ChatID:   chatID,
-		Content:  prompt,
+		Platform:  "telegram",
+		UserID:    userID,
+		ChatID:    chatID,
+		Content:   prompt,
+		MessageID: msg.MessageID,
+		Quote:     quote,
+		QuoteRole: quoteRole,
 	}
+}
+
+// extractQuote returns the text of the message this message replies to, plus
+// the role of its author ("assistant" for the bot's own messages, otherwise
+// "user"). Telegram provides at most one level of reply-to message.
+func (t *TelegramAdapter) extractQuote(msg *tgbotapi.Message) (string, string) {
+	if msg.ReplyToMessage == nil {
+		return "", ""
+	}
+	rt := msg.ReplyToMessage
+	text := rt.Text
+	if text == "" {
+		text = rt.Caption
+	}
+	if text == "" {
+		return "", ""
+	}
+	role := "user"
+	if rt.From != nil && t.bot != nil && rt.From.ID == t.bot.Self.ID {
+		role = "assistant"
+	}
+	return text, role
 }
 
 func (t *TelegramAdapter) processAlbum(groupID string, chatID int64) {
@@ -309,7 +334,7 @@ func (t *TelegramAdapter) processAlbum(groupID string, chatID int64) {
 		if mediaPath != "" {
 			combinedPrompt.WriteString(fmt.Sprintf("[첨부파일: %s] ", mediaPath))
 		} else {
-			t.Send(chatIDStr, fmt.Sprintf("⚠️ %d번째 미디어 다운로드에 실패했습니다.", seqIndex))
+			t.Send(chatIDStr, fmt.Sprintf("⚠️ %d번째 미디어 다운로드에 실패했습니다.", seqIndex), SendOptions{ReplyToMessageID: messages[0].MessageID})
 		}
 
 		if msg.Caption != "" {
@@ -332,10 +357,11 @@ func (t *TelegramAdapter) processAlbum(groupID string, chatID int64) {
 	}
 
 	t.msgChan <- InternalMessage{
-		Platform: "telegram",
-		UserID:   userID,
-		ChatID:   chatIDStr,
-		Content:  combinedPrompt.String(),
+		Platform:  "telegram",
+		UserID:    userID,
+		ChatID:    chatIDStr,
+		Content:   combinedPrompt.String(),
+		MessageID: messages[0].MessageID,
 	}
 }
 

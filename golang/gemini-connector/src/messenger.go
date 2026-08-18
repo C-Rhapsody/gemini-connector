@@ -8,14 +8,30 @@ type InternalMessage struct {
 	Content  string
 	Command  string
 	Args     string
+	// MessageID is the platform message identifier, used to reply to the
+	// originating message. Zero means "not applicable".
+	MessageID int
+	// Quote is the text of the message this message replies to (if any).
+	Quote string
+	// QuoteRole indicates whether the quoted message came from the assistant
+	// or the user ("assistant"/"user"). Empty when Quote is empty.
+	QuoteRole string
+}
+
+// SendOptions carries optional sending behavior for Messenger.Send. The zero
+// value sends text with markdown-to-HTML conversion and no reply-to target.
+type SendOptions struct {
+	// ReplyToMessageID replies to the given platform message when non-zero.
+	ReplyToMessageID int
+	// Plain sends the text verbatim, skipping markdown-to-HTML conversion.
+	Plain bool
 }
 
 // Messenger defines the common interface for all messaging platform adapters.
 type Messenger interface {
 	Init() error
 	Listen() (<-chan InternalMessage, error)
-	Send(chatID string, text string) error
-	SendPlain(chatID string, text string) error
+	Send(chatID string, text string, opts ...SendOptions) error
 	StartTyping(chatID string) (stop func())
 	GetFile(fileID string) (string, error)
 }

@@ -92,7 +92,9 @@ func (t *TeamsAdapter) Listen() (<-chan InternalMessage, error) {
 	return t.msgChan, nil
 }
 
-func (t *TeamsAdapter) Send(chatID string, text string) error {
+func (t *TeamsAdapter) Send(chatID string, text string, opts ...SendOptions) error {
+	// Teams chat messages are plain text; reply-to threading and markdown
+	// conversion do not apply, so opts is intentionally ignored.
 	token, err := t.getToken()
 	if err != nil {
 		return fmt.Errorf("teams token error: %v", err)
@@ -128,12 +130,6 @@ func (t *TeamsAdapter) Send(chatID string, text string) error {
 	}
 
 	return nil
-}
-
-func (t *TeamsAdapter) SendPlain(chatID string, text string) error {
-	// Teams Send already posts with contentType "text" (plain), so no
-	// markdown-to-HTML conversion to bypass.
-	return t.Send(chatID, text)
 }
 
 func (t *TeamsAdapter) StartTyping(chatID string) (stop func()) {

@@ -509,64 +509,75 @@ func main() {
 				return
 			}
 
+			replyOpt := SendOptions{ReplyToMessageID: m.MessageID}
+
 			switch m.Command {
 			case "/reset":
-				resetConversation(cfg, adapter, m.ChatID, "", msgs)
+				resetConversation(cfg, adapter, m.ChatID, m.MessageID, "", msgs)
 				return
 			case "/status":
-				statusConversation(cfg, adapter, m.ChatID, msgs)
+				statusConversation(cfg, adapter, m.ChatID, m.MessageID, msgs)
 				return
 			case "/summary":
-				summaryConversation(cfg, adapter, m.ChatID, msgs)
+				summaryConversation(cfg, adapter, m.ChatID, m.MessageID, msgs)
 				return
 			case "/version":
-				versionInfo(adapter, m.ChatID, msgs)
+				versionInfo(adapter, m.ChatID, m.MessageID, msgs)
 				return
 			case "/list":
-				listConversations(cfg, adapter, m.ChatID, m.Args, msgs)
+				listConversations(cfg, adapter, m.ChatID, m.Args, m.MessageID, msgs)
 				return
 			case "/switch":
-				switchConversation(cfg, adapter, m.ChatID, m.Args, msgs)
+				switchConversation(cfg, adapter, m.ChatID, m.Args, m.MessageID, msgs)
 				return
 			}
 
 			if cfg.ConversationID() == "" {
-				adapter.Send(m.ChatID, msgs.ErrorMissingUUID)
+				adapter.Send(m.ChatID, msgs.ErrorMissingUUID, replyOpt)
 				return
 			}
 
 			stop := adapter.StartTyping(m.ChatID)
 			defer stop()
 
-			response, err := executeAgy(m.Content, cfg.ConversationID())
+			prompt := m.Content
+			if m.Quote != "" {
+				role := m.QuoteRole
+				if role == "" {
+					role = "user"
+				}
+				prompt = fmt.Sprintf("[인용된 이전 메시지 (%s)]\n%s\n\n---\n\n[새 메시지]\n%s", role, m.Quote, m.Content)
+			}
+
+			response, err := executeAgy(prompt, cfg.ConversationID())
 			if err != nil {
 				if ae, ok := err.(*AgyError); ok {
 					switch ae.Type {
 					case "cli_failure":
-						adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorCLIFailure, ae.Err, ae.Detail))
+						adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorCLIFailure, ae.Err, ae.Detail), replyOpt)
 					case "json_parse_fail":
-						adapter.Send(m.ChatID, msgs.ErrorJSONParseFail)
+						adapter.Send(m.ChatID, msgs.ErrorJSONParseFail, replyOpt)
 					case "error_status":
 						detail := ae.Detail
 						if extractUrlFetchFailure(detail) != "" && cfg.recordUrlFetchError(detail) {
 							log.Printf("Stuck conversation detected (repeated URL fetch failure), resetting session")
-							resetConversation(cfg, adapter, m.ChatID, m.Content, msgs)
+							resetConversation(cfg, adapter, m.ChatID, m.MessageID, m.Content, msgs)
 							return
 						}
-						adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorSystemResponse, detail))
+						adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorSystemResponse, detail), replyOpt)
 					case "authentication_required":
-						adapter.Send(m.ChatID, "⚠️ agy 인증이 필요합니다. 터미널에서 'agy'를 한 번 실행해 인증을 완료한 뒤 봇을 재시작하세요.")
+						adapter.Send(m.ChatID, "⚠️ agy 인증이 필요합니다. 터미널에서 'agy'를 한 번 실행해 인증을 완료한 뒤 봇을 재시작하세요.", replyOpt)
 					}
 				}
 				return
 			}
 
 			if response != "" {
-				appendTranscript(cfg.ConversationID(), "user", m.Content)
+				appendTranscript(cfg.ConversationID(), "user", prompt)
 				appendTranscript(cfg.ConversationID(), "assistant", response)
-				adapter.Send(m.ChatID, response)
+				adapter.Send(m.ChatID, response, replyOpt)
 			} else {
-				adapter.Send(m.ChatID, msgs.ErrorEmptyResponse)
+				adapter.Send(m.ChatID, msgs.ErrorEmptyResponse, replyOpt)
 			}
 		}(msg)
 	}
@@ -575,9 +586,11 @@ func main() {
 // resetConversation summarizes the old conversation into a fresh agy
 // conversation, persists the new ID to .env, replays the given prompt on the
 // new session, and deletes the old session artifacts.
-func resetConversation(cfg *Config, adapter Messenger, chatID string, replayPrompt string, msgs *Messages) {
+func resetConversation(cfg *Config, adapter Messenger, chatID string, replyTo int, replayPrompt string, msgs *Messages) {
 	oldID := cfg.ConversationID()
 	log.Printf("Resetting conversation. Old conversation ID: %s", oldID)
+
+	replyOpt := SendOptions{ReplyToMessageID: replyTo}
 
 	summaryPrompt := buildSummaryPrompt(oldID)
 	if strings.TrimSpace(summaryPrompt) == "" {
@@ -588,7 +601,7 @@ func resetConversation(cfg *Config, adapter Messenger, chatID string, replayProm
 	if err != nil {
 		log.Printf("Failed to create new conversation: %v", err)
 		cfg.applyNewConversation(oldID)
-		adapter.Send(chatID, fmt.Sprintf("⚠️ 새 대화 세션 생성에 실패했습니다: %v", err))
+		adapter.Send(chatID, fmt.Sprintf("⚠️ 새 대화 세션 생성에 실패했습니다: %v", err), replyOpt)
 		return
 	}
 
@@ -608,13 +621,13 @@ func resetConversation(cfg *Config, adapter Messenger, chatID string, replayProm
 		if rerr == nil && response != "" {
 			appendTranscript(newID, "user", replayPrompt)
 			appendTranscript(newID, "assistant", response)
-			adapter.Send(chatID, notice+"\n\n"+response)
+			adapter.Send(chatID, notice+"\n\n"+response, replyOpt)
 			return
 		}
 		log.Printf("Replay on new conversation failed: %v", rerr)
 	}
 
-	adapter.Send(chatID, notice)
+	adapter.Send(chatID, notice, replyOpt)
 }
 
 // deleteConversationArtifacts removes the old conversation's on-disk state
