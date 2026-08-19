@@ -277,16 +277,21 @@ func (t *TelegramAdapter) processSingleMessage(msg *tgbotapi.Message) {
 		userID = strconv.FormatInt(msg.From.ID, 10)
 	}
 
-	quote, quoteRole := t.extractQuote(msg)
+	content := prompt
+	if quote, quoteRole := t.extractQuote(msg); quote != "" {
+		role := quoteRole
+		if role == "" {
+			role = "user"
+		}
+		content = fmt.Sprintf("[인용된 이전 메시지 (%s)]\n%s\n\n---\n\n[새 메시지]\n%s", role, quote, prompt)
+	}
 
 	t.msgChan <- InternalMessage{
 		Platform:  "telegram",
 		UserID:    userID,
 		ChatID:    chatID,
-		Content:   prompt,
+		Content:   content,
 		MessageID: msg.MessageID,
-		Quote:     quote,
-		QuoteRole: quoteRole,
 	}
 }
 

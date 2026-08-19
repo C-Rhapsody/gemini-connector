@@ -11,11 +11,6 @@ type InternalMessage struct {
 	// MessageID is the platform message identifier, used to reply to the
 	// originating message. Zero means "not applicable".
 	MessageID int
-	// Quote is the text of the message this message replies to (if any).
-	Quote string
-	// QuoteRole indicates whether the quoted message came from the assistant
-	// or the user ("assistant"/"user"). Empty when Quote is empty.
-	QuoteRole string
 }
 
 // SendOptions carries optional sending behavior for Messenger.Send. The zero

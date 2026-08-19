@@ -540,16 +540,7 @@ func main() {
 			stop := adapter.StartTyping(m.ChatID)
 			defer stop()
 
-			prompt := m.Content
-			if m.Quote != "" {
-				role := m.QuoteRole
-				if role == "" {
-					role = "user"
-				}
-				prompt = fmt.Sprintf("[인용된 이전 메시지 (%s)]\n%s\n\n---\n\n[새 메시지]\n%s", role, m.Quote, m.Content)
-			}
-
-			response, err := executeAgy(prompt, cfg.ConversationID())
+			response, err := executeAgy(m.Content, cfg.ConversationID())
 			if err != nil {
 				if ae, ok := err.(*AgyError); ok {
 					switch ae.Type {
@@ -573,7 +564,7 @@ func main() {
 			}
 
 			if response != "" {
-				appendTranscript(cfg.ConversationID(), "user", prompt)
+				appendTranscript(cfg.ConversationID(), "user", m.Content)
 				appendTranscript(cfg.ConversationID(), "assistant", response)
 				adapter.Send(m.ChatID, response, replyOpt)
 			} else {
