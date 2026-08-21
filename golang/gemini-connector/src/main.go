@@ -566,7 +566,7 @@ func main() {
 			if response != "" {
 				appendTranscript(cfg.ConversationID(), "user", m.Content)
 				appendTranscript(cfg.ConversationID(), "assistant", response)
-				adapter.Send(m.ChatID, response, replyOpt)
+				adapter.Send(m.ChatID, response, SendOptions{ReplyToMessageID: m.MessageID, AttachFiles: true})
 			} else {
 				adapter.Send(m.ChatID, msgs.ErrorEmptyResponse, replyOpt)
 			}

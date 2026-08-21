@@ -87,6 +87,8 @@ func (t *TelegramAdapter) Listen() (<-chan InternalMessage, error) {
 	return t.msgChan, nil
 }
 
+const maxAttachmentsPerMessage = 10
+
 func (t *TelegramAdapter) Send(chatID string, text string, opts ...SendOptions) error {
 	var opt SendOptions
 	if len(opts) > 0 {
@@ -97,21 +99,46 @@ func (t *TelegramAdapter) Send(chatID string, text string, opts ...SendOptions) 
 		return fmt.Errorf("invalid chat ID: %s", chatID)
 	}
 
-	for _, chunk := range splitTelegramChunks(text, 4000) {
-		if opt.Plain {
-			if err := t.sendOne(id, chunk, "", opt.ReplyToMessageID); err != nil {
-				log.Printf("Telegram plain send failed: %v", err)
-				return err
-			}
-			continue
+	// When the payload may carry deliverables, scan for files produced by
+	// the AI, strip their paths from the reply text, and send them as
+	// channel attachments afterwards.
+	var attachments []string
+	if opt.AttachFiles {
+		attachments = extractDeliverableFiles(text)
+		for _, m := range filePathPattern.FindAllString(text, -1) {
+			text = strings.ReplaceAll(text, m, "")
 		}
-		htmlBody := convertMarkdownToTelegramHTML(chunk)
-		if err := t.sendOne(id, htmlBody, tgbotapi.ModeHTML, opt.ReplyToMessageID); err != nil {
-			log.Printf("Telegram HTML send failed (%v), retrying as plain text", err)
-			if err2 := t.sendOne(id, chunk, "", opt.ReplyToMessageID); err2 != nil {
-				log.Printf("Telegram plain-text fallback also failed: %v", err2)
-				return err2
+		text = strings.TrimSpace(text)
+	}
+
+	if text != "" {
+		for _, chunk := range splitTelegramChunks(text, 4000) {
+			if opt.Plain {
+				if err := t.sendOne(id, chunk, "", opt.ReplyToMessageID); err != nil {
+					log.Printf("Telegram plain send failed: %v", err)
+					return err
+				}
+				continue
 			}
+			htmlBody := convertMarkdownToTelegramHTML(chunk)
+			if err := t.sendOne(id, htmlBody, tgbotapi.ModeHTML, opt.ReplyToMessageID); err != nil {
+				log.Printf("Telegram HTML send failed (%v), retrying as plain text", err)
+				if err2 := t.sendOne(id, chunk, "", opt.ReplyToMessageID); err2 != nil {
+					log.Printf("Telegram plain-text fallback also failed: %v", err2)
+					return err2
+				}
+			}
+		}
+	}
+
+	for _, f := range attachments {
+		if err := t.sendAttachment(id, f, opt.ReplyToMessageID); err != nil {
+			log.Printf("Attachment send failed (%s): %v", f, err)
+			return err
+		}
+		// Delivered — remove the local copy (best-effort).
+		if rmErr := os.Remove(f); rmErr != nil {
+			log.Printf("Failed to remove delivered attachment %s: %v", f, rmErr)
 		}
 	}
 	return nil
@@ -127,6 +154,78 @@ func (t *TelegramAdapter) sendOne(chatID int64, text string, parseMode string, r
 	}
 	_, err := t.bot.Send(msg)
 	return err
+}
+
+// extractDeliverableFiles scans AI response text for file path candidates
+// and returns the ones that actually exist as deliverable files. Only files
+// inside the project root may be delivered, since delivery implies the local
+// copy is deleted afterwards.
+func extractDeliverableFiles(text string) []string {
+	matches := filePathPattern.FindAllString(text, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	root := findProjectRoot()
+	if root == "" {
+		return nil
+	}
+	rootWithSep := strings.ToLower(root + string(filepath.Separator))
+
+	seen := make(map[string]bool)
+	var files []string
+	for _, m := range matches {
+		p := m
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(root, filepath.FromSlash(p))
+		}
+		info, err := os.Stat(p)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		if !strings.HasPrefix(strings.ToLower(p), rootWithSep) {
+			continue // deletion guard: project tree only
+		}
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		files = append(files, p)
+		if len(files) >= maxAttachmentsPerMessage {
+			break
+		}
+	}
+	return files
+}
+
+// sendAttachment uploads a single local file, choosing the Telegram message
+// type by extension (photo / video / document).
+func (t *TelegramAdapter) sendAttachment(chatID int64, path string, replyToID int) error {
+	var cfg tgbotapi.Chattable
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp":
+		pc := tgbotapi.NewPhoto(chatID, tgbotapi.FilePath(path))
+		if replyToID != 0 {
+			pc.ReplyToMessageID = replyToID
+		}
+		cfg = pc
+	case ".mp4", ".webm", ".mov", ".avi", ".mkv":
+		vc := tgbotapi.NewVideo(chatID, tgbotapi.FilePath(path))
+		if replyToID != 0 {
+			vc.ReplyToMessageID = replyToID
+		}
+		cfg = vc
+	default:
+		dc := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(path))
+		if replyToID != 0 {
+			dc.ReplyToMessageID = replyToID
+		}
+		cfg = dc
+	}
+	if _, err := t.bot.Send(cfg); err != nil {
+		return err
+	}
+	log.Printf("Attachment sent: %s", path)
+	return nil
 }
 
 // splitTelegramChunks splits a string into chunks no longer than limit bytes,
@@ -253,6 +352,18 @@ func (t *TelegramAdapter) processSingleMessage(msg *tgbotapi.Message) {
 	prompt := msg.Text
 	if msg.Caption != "" {
 		prompt = msg.Caption
+	}
+
+	// Live locations keep arriving as edit updates of the same message;
+	// process only the initial share and ignore subsequent updates.
+	if msg.Location != nil && msg.Location.LivePeriod > 0 && msg.EditDate != 0 {
+		return
+	}
+
+	// A standalone location message carries no text. Bake a self-describing
+	// coordinate tag so agy can interpret it without extra rules.
+	if prompt == "" && msg.Location != nil {
+		prompt = fmt.Sprintf("[위치: 위도 %.6f, 경도 %.6f]", msg.Location.Latitude, msg.Location.Longitude)
 	}
 
 	if msg.Photo != nil {

@@ -98,6 +98,11 @@ func executeAgy(prompt string, conversationID string) (string, error) {
 
 var urlFetchFailurePattern = regexp.MustCompile(`Failed to fetch document content at (\S+)`)
 
+// filePathPattern matches file path candidates in AI response text. Every
+// match must end in a deliverable media/document extension so that source
+// files or code filenames merely mentioned in answers are never picked up.
+var filePathPattern = regexp.MustCompile(`(?:[A-Za-z]:[\\/][^\s"'<>()\[\]]*?|[~/][^\s"'<>()\[\]]*?|[~/.]?[\w./\\-]*)\.(?i:png|jpe?g|gif|webp|bmp|mp4|webm|mov|avi|mkv|pdf|zip|csv|xlsx|docx|pptx)\b`)
+
 func extractUrlFetchFailure(detail string) string {
 	match := urlFetchFailurePattern.FindStringSubmatch(detail)
 	if len(match) < 2 {
