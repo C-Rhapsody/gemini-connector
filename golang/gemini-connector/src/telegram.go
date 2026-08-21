@@ -136,8 +136,11 @@ func (t *TelegramAdapter) Send(chatID string, text string, opts ...SendOptions) 
 			}
 			htmlBody := convertMarkdownToTelegramHTML(chunk)
 			if err := t.sendOne(id, htmlBody, tgbotapi.ModeHTML, opt.ReplyToMessageID); err != nil {
-				log.Printf("Telegram HTML send failed (%v), retrying as plain text", err)
-				if err2 := t.sendOne(id, chunk, "", opt.ReplyToMessageID); err2 != nil {
+				log.Printf("Telegram HTML send failed (%v), retrying as stripped plain text", err)
+				// Send formatting-stripped text so raw Markdown markers
+				// (**, `, links) are not exposed to the user.
+				plain := stripMarkdownFormatting(chunk)
+				if err2 := t.sendOne(id, plain, "", opt.ReplyToMessageID); err2 != nil {
 					log.Printf("Telegram plain-text fallback also failed: %v", err2)
 					return err2
 				}

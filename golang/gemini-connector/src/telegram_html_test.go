@@ -82,7 +82,7 @@ func TestConvertMarkdownToTelegramHTML(t *testing.T) {
 		{
 			name:  "fenced code block with language",
 			input: "```go\nfmt.Println(\"hi\")\n```",
-			want:  preOpen + codeOpen + " class=\"language-go\">fmt.Println(\"hi\")\n" + codeClose + preClose + "\n",
+			want:  preOpen + lt + "code" + " " + "class=\"language-go\"" + gt + "fmt.Println(" + quotE + "hi" + quotE + ")\n" + codeClose + preClose + "\n",
 		},
 		{
 			name:  "fenced code block without language",
@@ -144,6 +144,66 @@ func TestConvertMarkdownToTelegramHTML(t *testing.T) {
 			input: "![alt text](http://x.com/i.png)",
 			want:  "[image]",
 		},
+		{
+			name:  "korean bold closed by particle after quote",
+			input: "속성은 **\"정적 문자열\"**만 기록합니다.",
+			want:  "속성은 " + bOpen + quotE + "정적 문자열" + quotE + bClose + "만 기록합니다.",
+		},
+		{
+			name:  "korean bold closed by particle after parenthesis",
+			input: "**pwsh.exe (PID: 43956)**가 멈춰 있습니다.",
+			want:  bOpen + "pwsh.exe (PID: 43956)" + bClose + "가 멈춰 있습니다.",
+		},
+		{
+			name:  "spaced bold",
+			input: "이것은 ** 강조 ** 표시입니다.",
+			want:  "이것은 " + bOpen + " 강조 " + bClose + " 표시입니다.",
+		},
+		{
+			name:  "bold inside inline code is untouched",
+			input: "`code ** not bold`",
+			want:  codeOpen + "code ** not bold" + codeClose,
+		},
+		{
+			name:  "unmatched double asterisks stay visible",
+			input: "a ** b",
+			want:  "a ** b",
+		},
+		{
+			name:  "fenced code block escapes raw html",
+			input: "```xml\n<activity android:name=\".Main\">\n```",
+			want:  preOpen + lt + "code" + " " + "class=\"language-xml\"" + gt + ltE + "activity" + " android:name=" + quotE + ".Main" + quotE + gtE + "\n" + codeClose + preClose + "\n",
+		},
+		{
+			name:  "paragraphs are separated by newline",
+			input: "A\n\nB",
+			want:  "A\nB",
+		},
+		{
+			name:  "paragraph followed by list is separated",
+			input: "요약:\n\n- 하나\n- 둘\n",
+			want:  "요약:\n• 하나\n• 둘\n",
+		},
+		{
+			name:  "nested unordered list uses hierarchical bullets",
+			input: "- 부모 항목:\n  - 자식 하나\n  - 자식 둘\n- 다음 항목\n",
+			want:  "• 부모 항목:\n  ◦ 자식 하나\n  ◦ 자식 둘\n• 다음 항목\n",
+		},
+		{
+			name:  "ordered list keeps numbers",
+			input: "1. 첫째\n2. 둘째\n",
+			want:  "1. 첫째\n2. 둘째\n",
+		},
+		{
+			name:  "ordered list honors start number",
+			input: "3. 셋\n4. 넷\n",
+			want:  "3. 셋\n4. 넷\n",
+		},
+		{
+			name:  "nested ordered list indents and numbers",
+			input: "1. 첫째\n   1. 중첩\n2. 둘째\n",
+			want:  "1. 첫째\n  1. 중첩\n2. 둘째\n",
+		},
 	}
 
 	for _, tt := range tests {
@@ -176,7 +236,7 @@ func TestConvertMarkdownToTelegramHTML_RealAgyResponse(t *testing.T) {
 		iOpen + "italic" + iClose,
 		codeOpen + "inline code" + codeClose,
 		aOpenHref + "https://example.com/docs?q=test" + ampE + "v=2" + aMid + "the docs" + aClose,
-		preOpen + codeOpen + " class=\"language-python\">",
+		preOpen + lt + "code" + " " + "class=\"language-python\"" + gt,
 		blockquoteOpen,
 		"\u2022 item one",
 		"\u2022 item two",
@@ -250,5 +310,51 @@ func TestConvertMarkdownToTelegramHTML_TableWithoutHeaderRemainsText(t *testing.
 		if !strings.Contains(got, value) {
 			t.Errorf("headerless table text should remain visible, missing %q in %q", value, got)
 		}
+	}
+}
+
+func TestStripMarkdownFormatting(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "bold markers removed",
+			input: "**중요**한 내용",
+			want:  "중요한 내용",
+		},
+		{
+			name:  "inline code markers removed",
+			input: "run `npm test` now",
+			want:  "run npm test now",
+		},
+		{
+			name:  "link keeps text only",
+			input: "see [the docs](https://example.com) here",
+			want:  "see the docs here",
+		},
+		{
+			name:  "fenced block keeps content drops fences",
+			input: "```go\nfmt.Println()\n```",
+			want:  "fmt.Println()\n",
+		},
+		{
+			name:  "heading marker removed",
+			input: "# 제목\n본문",
+			want:  "제목\n본문",
+		},
+		{
+			name:  "snake_case identifiers preserved",
+			input: "use my_file_path_v2 here",
+			want:  "use my_file_path_v2 here",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := stripMarkdownFormatting(tt.input); got != tt.want {
+				t.Errorf("stripMarkdownFormatting(%q)\n  got:  %q\n  want: %q", tt.input, got, tt.want)
+			}
+		})
 	}
 }

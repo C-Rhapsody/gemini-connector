@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"fmt"
 	"html"
+	"io"
+	"regexp"
 	"strings"
 	"unicode"
 
@@ -10,7 +14,9 @@ import (
 	"github.com/yuin/goldmark/ast"
 	"github.com/yuin/goldmark/extension"
 	extast "github.com/yuin/goldmark/extension/ast"
+	"github.com/yuin/goldmark/parser"
 	"github.com/yuin/goldmark/renderer"
+	"github.com/yuin/goldmark/text"
 	"github.com/yuin/goldmark/util"
 )
 
@@ -21,35 +27,92 @@ import (
 //   - Bold (text or text)         -> <b>text</b>
 //   - Italic (text or text)       -> <i>text</i>
 //   - Inline code (text)          -> <code>text</code>
-//   - Fenced code block (text)    -> <pre><code class="language-lang">text</code</pre>
+//   - Fenced code block (text)    -> <pre><code class="language-lang">text</code></pre>
 //   - Link [text](url)            -> <a href="url">text</a>
 //   - Blockquote (> text)         -> <blockquote>text</blockquote>
 //   - Heading (# text)            -> <b>text</b>  (Telegram has no <h1>..<h6>)
-//   - List (- item / 1. item)     -> text\n     (plain bullet, no <ul>/<ol>)
-//   - Table                        -> aligned plain text inside <pre>
+//   - List (- item / 1. item)     -> hierarchical bullets with indentation
 //
-// Unsupported elements degrade to a plain-text representation rather than
-// emitting unsupported tags. All <, >, & characters inside text content are
-// escaped so AI-supplied content cannot inject HTML. On parse failure (or
-// empty input) the original string is returned so the caller can decide how
-// to fall back.
+// A custom bold parser relaxes CommonMark flanking rules so that Korean text
+// like **"제목"**뒤에조사 or ** 강조 ** still renders as bold.
 func convertMarkdownToTelegramHTML(s string) string {
 	if s == "" {
 		return ""
 	}
+	var buf bytes.Buffer
+	lw := newLineTrackingWriter(&buf)
+	r := &telegramHTMLRenderer{out: lw}
 	md := goldmark.New(
 		goldmark.WithExtensions(extension.Table),
+		goldmark.WithParserOptions(
+			parser.WithInlineParsers(
+				util.Prioritized(koreanBoldParser{}, 450), // before the default emphasis parser (500)
+			),
+			parser.WithASTTransformers(
+				util.Prioritized(delimiterTextTransformer{}, 100),
+			),
+		),
 		goldmark.WithRenderer(renderer.NewRenderer(
 			renderer.WithNodeRenderers(
-				util.Prioritized(&telegramHTMLRenderer{}, 100),
+				util.Prioritized(r, 100),
 			),
 		)),
 	)
-	var buf bytes.Buffer
-	if err := md.Convert([]byte(s), &buf); err != nil {
-		return s
+	if err := md.Convert([]byte(s), lw); err != nil {
+		return stripMarkdownFormatting(s)
 	}
 	return buf.String()
+}
+
+// lineTrackingWriter wraps a bufio.Writer and remembers the last byte written,
+// so renderers can tell whether the output currently sits at a line start.
+// It satisfies goldmark's util.BufWriter interface.
+type lineTrackingWriter struct {
+	*bufio.Writer
+	last byte
+	any  bool
+}
+
+func newLineTrackingWriter(w io.Writer) *lineTrackingWriter {
+	if bw, ok := w.(*bufio.Writer); ok {
+		return &lineTrackingWriter{Writer: bw}
+	}
+	return &lineTrackingWriter{Writer: bufio.NewWriter(w)}
+}
+
+func (w *lineTrackingWriter) Write(p []byte) (int, error) {
+	n, err := w.Writer.Write(p)
+	if n > 0 {
+		w.last = p[n-1]
+		w.any = true
+	}
+	return n, err
+}
+
+func (w *lineTrackingWriter) WriteString(s string) (int, error) {
+	n, err := w.Writer.WriteString(s)
+	if n > 0 {
+		w.last = s[n-1]
+		w.any = true
+	}
+	return n, err
+}
+
+func (w *lineTrackingWriter) WriteByte(c byte) error {
+	if err := w.Writer.WriteByte(c); err != nil {
+		return err
+	}
+	w.last = c
+	w.any = true
+	return nil
+}
+
+func (w *lineTrackingWriter) WriteRune(r rune) (int, error) {
+	return w.WriteString(string(r))
+}
+
+func (w *lineTrackingWriter) atLineStart() bool {
+	return !w.any || w.last == '\n'
 }
 
 func escapeHTML(s string) string {
@@ -60,26 +123,54 @@ func escapeHTML(s string) string {
 // so that the surrounding Go source remains free of literal '<', '>', '&'
 // sequences that confuse certain editors/toolchains.
 var (
-	tagBOpen      = []byte{0x3C, 0x62, 0x3E}                                                                                     // <b>
-	tagBClose     = []byte{0x3C, 0x2F, 0x62, 0x3E}                                                                               //</b>
-	tagIOpen      = []byte{0x3C, 0x69, 0x3E}                                                                                     // <i>
-	tagIClose     = []byte{0x3C, 0x2F, 0x69, 0x3E}                                                                               //</i>
-	tagCodeOpen   = []byte{0x3C, 0x63, 0x6F, 0x64, 0x65, 0x3E}                                                                   // <code>
-	tagCodeClose  = []byte{0x3C, 0x2F, 0x63, 0x6F, 0x64, 0x65, 0x3E}                                                             //</code>
-	tagPreOpen    = []byte{0x3C, 0x70, 0x72, 0x65, 0x3E}                                                                         // <pre>
-	tagPreClose   = []byte{0x3C, 0x2F, 0x70, 0x72, 0x65, 0x3E}                                                                   //</pre>
-	tagBlockOpen  = []byte{0x3C, 0x62, 0x6C, 0x6F, 0x63, 0x6B, 0x71, 0x75, 0x6F, 0x74, 0x65, 0x3E}                               // <blockquote>
-	tagBlockClose = []byte{0x3C, 0x2F, 0x62, 0x6C, 0x6F, 0x63, 0x6B, 0x71, 0x75, 0x6F, 0x74, 0x65, 0x3E}                         //</blockquote>
-	tagAOpen      = []byte{0x3C, 0x61, 0x20, 0x68, 0x72, 0x65, 0x66, 0x3D, 0x22}                                                 // <a href="
-	tagAClose     = []byte{0x22, 0x3E}                                                                                           // ">
-	tagAEnd       = []byte{0x3C, 0x2F, 0x61, 0x3E}                                                                               //</a>
-	tagAClassPfx  = []byte{0x20, 0x63, 0x6C, 0x61, 0x73, 0x73, 0x3D, 0x22, 0x6C, 0x61, 0x6E, 0x67, 0x75, 0x61, 0x67, 0x65, 0x2D} // " class=\"language-"
-	tagQuoteAttr  = []byte{0x22, 0x3E}                                                                                           // ">
-	bullet        = []byte{0xE2, 0x80, 0xA2, 0x20}                                                                               // U+2022 + space
+	tagBOpen      = []byte{0x3C, 0x62, 0x3E}                                                             // <b>
+	tagBClose     = []byte{0x3C, 0x2F, 0x62, 0x3E}                                                       //</b>
+	tagIOpen      = []byte{0x3C, 0x69, 0x3E}                                                             // <i>
+	tagIClose     = []byte{0x3C, 0x2F, 0x69, 0x3E}                                                       //</i>
+	tagCodeOpen   = []byte{0x3C, 0x63, 0x6F, 0x64, 0x65, 0x3E}                                           // <code>
+	tagCodeBare   = []byte{0x3C, 0x63, 0x6F, 0x64, 0x65}                                                 // <code (no closing bracket)
+	tagCodeClose  = []byte{0x3C, 0x2F, 0x63, 0x6F, 0x64, 0x65, 0x3E}                                     //</code>
+	tagPreOpen    = []byte{0x3C, 0x70, 0x72, 0x65, 0x3E}                                                 // <pre>
+	tagPreClose   = []byte{0x3C, 0x2F, 0x70, 0x72, 0x65, 0x3E}                                           //</pre>
+	tagBlockOpen  = []byte{0x3C, 0x62, 0x6C, 0x6F, 0x63, 0x6B, 0x71, 0x75, 0x6F, 0x74, 0x65, 0x3E}       // <blockquote>
+	tagBlockClose = []byte{0x3C, 0x2F, 0x62, 0x6C, 0x6F, 0x63, 0x6B, 0x71, 0x75, 0x6F, 0x74, 0x65, 0x3E} //</blockquote>
+	tagAOpen      = []byte{0x3C, 0x61, 0x20, 0x68, 0x72, 0x65, 0x66, 0x3D, 0x22}                         // <a href="
+	tagAClose     = []byte{0x22, 0x3E}                                                                   // ">
+	tagAEnd       = []byte{0x3C, 0x2F, 0x61, 0x3E}                                                       //</a>
+	tagQuoteAttr  = []byte{0x22, 0x3E}                                                                   // ">
+	tagGT         = []byte{0x3E}                                                                         // >
 	newline       = []byte{0x0A}
 )
 
-type telegramHTMLRenderer struct{}
+// Hierarchical bullet markers for nested unordered lists, by depth level.
+const (
+	bulletLevel0 = "• "
+	bulletLevel1 = "◦ "
+	bulletLevel2 = "▪ "
+	listIndent   = "  "
+)
+
+type telegramHTMLRenderer struct {
+	// out tracks the rendered output so renderers can avoid duplicated or
+	// missing line breaks around lists and paragraphs.
+	out *lineTrackingWriter
+	// listCounters tracks the next number to print for each ordered list.
+	listCounters map[ast.Node]int
+}
+
+// ensureLineStart writes a newline unless the output already sits at one.
+func (r *telegramHTMLRenderer) ensureLineStart(w util.BufWriter) {
+	if !r.out.atLineStart() {
+		_, _ = w.Write(newline)
+	}
+}
+
+// closeLine terminates the current line unless it is already closed.
+func (r *telegramHTMLRenderer) closeLine(w util.BufWriter) {
+	if !r.out.atLineStart() {
+		_, _ = w.Write(newline)
+	}
+}
 
 func (r *telegramHTMLRenderer) RegisterFuncs(reg renderer.NodeRendererFuncRegisterer) {
 	reg.Register(ast.KindDocument, r.renderDocument)
@@ -107,11 +198,40 @@ func (r *telegramHTMLRenderer) renderDocument(_ util.BufWriter, _ []byte, _ ast.
 	return ast.WalkContinue, nil
 }
 
-func (r *telegramHTMLRenderer) renderParagraph(_ util.BufWriter, _ []byte, _ ast.Node, _ bool) (ast.WalkStatus, error) {
+// needsSeparator reports whether a newline must be written after the node
+// that just finished, so the next sibling block does not merge into it.
+// ThematicBreak and Table already emit their own leading newline.
+func needsSeparator(n ast.Node) bool {
+	next := n.NextSibling()
+	if next == nil {
+		return false
+	}
+	switch next.Kind() {
+	case ast.KindThematicBreak, extast.KindTable:
+		return false
+	}
+	return true
+}
+
+// separateBlocks closes the current line when another block follows, so the
+// next sibling does not merge into the block that just finished.
+func (r *telegramHTMLRenderer) separateBlocks(w util.BufWriter, n ast.Node) {
+	if needsSeparator(n) {
+		r.closeLine(w)
+	}
+}
+
+func (r *telegramHTMLRenderer) renderParagraph(w util.BufWriter, _ []byte, n ast.Node, entering bool) (ast.WalkStatus, error) {
+	if !entering {
+		r.separateBlocks(w, n)
+	}
 	return ast.WalkContinue, nil
 }
 
-func (r *telegramHTMLRenderer) renderTextBlock(_ util.BufWriter, _ []byte, _ ast.Node, _ bool) (ast.WalkStatus, error) {
+func (r *telegramHTMLRenderer) renderTextBlock(w util.BufWriter, _ []byte, n ast.Node, entering bool) (ast.WalkStatus, error) {
+	if !entering {
+		r.separateBlocks(w, n)
+	}
 	return ast.WalkContinue, nil
 }
 
@@ -127,7 +247,7 @@ func (r *telegramHTMLRenderer) renderHeading(w util.BufWriter, _ []byte, _ ast.N
 
 func (r *telegramHTMLRenderer) renderThematicBreak(w util.BufWriter, _ []byte, _ ast.Node, entering bool) (ast.WalkStatus, error) {
 	if entering {
-		_, _ = w.Write(newline)
+		r.ensureLineStart(w)
 		_, _ = w.WriteString("---\n")
 	}
 	return ast.WalkContinue, nil
@@ -148,15 +268,19 @@ func (r *telegramHTMLRenderer) renderFencedCodeBlock(w util.BufWriter, source []
 	if entering {
 		lang := fcb.Language(source)
 		_, _ = w.Write(tagPreOpen)
-		_, _ = w.Write(tagCodeOpen)
+		_, _ = w.Write(tagCodeBare)
 		if len(lang) > 0 {
-			_, _ = w.Write(tagAClassPfx)
+			_, _ = w.WriteString(" class=\"language-")
 			_, _ = w.WriteString(escapeHTML(string(lang)))
-			_, _ = w.Write(tagQuoteAttr)
+			_, _ = w.WriteString("\"")
 		}
+		_, _ = w.Write(tagGT)
 		for i := 0; i < fcb.Lines().Len(); i++ {
 			seg := fcb.Lines().At(i)
-			_, _ = w.Write(seg.Value(source))
+			// Code content is escaped so raw <, >, & inside code (a common
+			// source of Telegram "unsupported start tag" failures) cannot
+			// break the HTML payload.
+			_, _ = w.WriteString(escapeHTML(string(seg.Value(source))))
 		}
 	} else {
 		_, _ = w.Write(tagCodeClose)
@@ -267,17 +391,123 @@ func (r *telegramHTMLRenderer) renderBlockquote(w util.BufWriter, _ []byte, _ as
 	return ast.WalkContinue, nil
 }
 
-func (r *telegramHTMLRenderer) renderList(_ util.BufWriter, _ []byte, _ ast.Node, _ bool) (ast.WalkStatus, error) {
+func (r *telegramHTMLRenderer) renderList(w util.BufWriter, _ []byte, n ast.Node, entering bool) (ast.WalkStatus, error) {
+	list := n.(*ast.List)
+	if entering {
+		if list.IsOrdered() {
+			if r.listCounters == nil {
+				r.listCounters = make(map[ast.Node]int)
+			}
+			start := list.Start
+			if start < 1 {
+				start = 1
+			}
+			r.listCounters[n] = start
+		}
+		return ast.WalkContinue, nil
+	}
+	r.separateBlocks(w, n)
 	return ast.WalkContinue, nil
 }
 
-func (r *telegramHTMLRenderer) renderListItem(w util.BufWriter, _ []byte, _ ast.Node, entering bool) (ast.WalkStatus, error) {
-	if entering {
-		_, _ = w.Write(bullet)
-	} else {
-		_, _ = w.Write(newline)
+func (r *telegramHTMLRenderer) renderListItem(w util.BufWriter, _ []byte, n ast.Node, entering bool) (ast.WalkStatus, error) {
+	if !entering {
+		r.closeLine(w)
+		return ast.WalkContinue, nil
+	}
+	r.ensureLineStart(w)
+
+	level := 0
+	for p := n.Parent(); p != nil; p = p.Parent() {
+		if p.Kind() == ast.KindList {
+			level++
+		}
+	}
+	for i := 1; i < level; i++ {
+		_, _ = w.WriteString(listIndent)
+	}
+	list := n.Parent().(*ast.List)
+	switch {
+	case list.IsOrdered():
+		num := r.listCounters[list]
+		r.listCounters[list] = num + 1
+		_, _ = w.WriteString(fmt.Sprintf("%d. ", num))
+	case level <= 1:
+		_, _ = w.WriteString(bulletLevel0)
+	case level == 2:
+		_, _ = w.WriteString(bulletLevel1)
+	default:
+		_, _ = w.WriteString(bulletLevel2)
 	}
 	return ast.WalkContinue, nil
+}
+
+// renderDelimiter emits leftover (unmatched) emphasis markers as literal text
+// instead of dropping them silently.
+
+// delimiterTextTransformer converts leftover (unmatched) emphasis delimiter
+// nodes into plain text nodes so their markers stay visible in the output.
+// goldmark's Delimiter node kind is unexported, so it cannot be given a
+// renderer function directly.
+type delimiterTextTransformer struct{}
+
+func (delimiterTextTransformer) Transform(node *ast.Document, _ text.Reader, _ parser.Context) {
+	replaceDelimitersWithText(node)
+}
+
+func replaceDelimitersWithText(n ast.Node) {
+	for c := n.FirstChild(); c != nil; {
+		next := c.NextSibling()
+		if d, ok := c.(*parser.Delimiter); ok {
+			n.InsertBefore(n, d, ast.NewTextSegment(d.Segment))
+			n.RemoveChild(n, d)
+		} else {
+			replaceDelimitersWithText(c)
+		}
+		c = next
+	}
+}
+
+// koreanBoldDelimiterProcessor matches '*' runs and produces level-2
+// (bold) Emphasis nodes.
+type koreanBoldDelimiterProcessor struct{}
+
+func (koreanBoldDelimiterProcessor) IsDelimiter(b byte) bool { return b == '*' }
+
+func (koreanBoldDelimiterProcessor) CanOpenCloser(opener, closer *parser.Delimiter) bool {
+	return opener.Char == closer.Char
+}
+
+func (koreanBoldDelimiterProcessor) OnMatch(consumes int) ast.Node {
+	return ast.NewEmphasis(consumes)
+}
+
+// koreanBoldParser handles exactly-two-asterisk (**bold**) runs with relaxed
+// flanking rules. CommonMark rejects closers that follow punctuation when a
+// letter comes next, which is common in Korean text:
+//
+//	**"정적 문자열"**만   **pwsh.exe (PID: 1)**가   ** 강조 **
+//
+// Single asterisks and triple asterisks fall through to goldmark's default
+// emphasis parser. Code spans and code blocks are parsed before this parser
+// runs, so '**' inside code is never touched.
+type koreanBoldParser struct{}
+
+func (koreanBoldParser) Trigger() []byte { return []byte{'*'} }
+
+func (koreanBoldParser) Parse(parent ast.Node, block text.Reader, pc parser.Context) ast.Node {
+	before := block.PrecendingCharacter()
+	line, segment := block.PeekLine()
+	d := parser.ScanDelimiter(line, before, 2, koreanBoldDelimiterProcessor{})
+	if d == nil || d.OriginalLength != 2 {
+		return nil
+	}
+	d.CanOpen = true
+	d.CanClose = true
+	d.Segment = segment.WithStop(segment.Start + d.OriginalLength)
+	block.Advance(d.OriginalLength)
+	pc.PushDelimiter(d)
+	return d
 }
 
 const tableMaxWidth = 80
@@ -286,7 +516,7 @@ func (r *telegramHTMLRenderer) renderTable(w util.BufWriter, source []byte, n as
 	if entering {
 		text := formatTelegramTable(n, source)
 		if text != "" {
-			_, _ = w.Write(newline)
+			r.ensureLineStart(w)
 			_, _ = w.Write(tagPreOpen)
 			_, _ = w.WriteString(escapeHTML(text))
 			_, _ = w.Write(tagPreClose)
@@ -294,6 +524,7 @@ func (r *telegramHTMLRenderer) renderTable(w util.BufWriter, source []byte, n as
 		}
 		return ast.WalkSkipChildren, nil
 	}
+	r.separateBlocks(w, n)
 	return ast.WalkContinue, nil
 }
 
@@ -562,4 +793,35 @@ func isWideTableRune(r rune) bool {
 		(r >= 0xFFE0 && r <= 0xFFE6) ||
 		(r >= 0x1F300 && r <= 0x1FAFF) ||
 		(r >= 0x20000 && r <= 0x3FFFD)
+}
+
+// Regular expressions used to strip Markdown formatting when a message has
+// to be delivered as plain text (e.g. the HTML fallback path).
+var (
+	fencedBlockRe    = regexp.MustCompile("(?s)```[a-zA-Z0-9_-]*\\n?(.*?)```")
+	imageRe          = regexp.MustCompile(`!\[[^\]]*\]\([^)]*\)`)
+	linkRe           = regexp.MustCompile(`\[([^\]]*)\]\([^)]*\)`)
+	headingRe        = regexp.MustCompile(`(?m)^#{1,6}\s+`)
+	blockquoteRe     = regexp.MustCompile(`(?m)^\s*>\s?`)
+	boldRe           = regexp.MustCompile(`\*\*([^*]+?)\*\*`)
+	boldUnderscoreRe = regexp.MustCompile(`__([^_]+?)__`)
+	italicStarRe     = regexp.MustCompile(`\*([^*\n]+)\*`)
+	inlineCodeRe     = regexp.MustCompile("`([^`]+)`")
+)
+
+// stripMarkdownFormatting removes common Markdown markers from s so that a
+// plain-text fallback does not show raw **, `, or link syntax to the user.
+// Underscore italics are intentionally left alone to protect snake_case
+// identifiers and file paths.
+func stripMarkdownFormatting(s string) string {
+	s = fencedBlockRe.ReplaceAllString(s, "$1")
+	s = imageRe.ReplaceAllString(s, "")
+	s = linkRe.ReplaceAllString(s, "$1")
+	s = headingRe.ReplaceAllString(s, "")
+	s = blockquoteRe.ReplaceAllString(s, "")
+	s = boldRe.ReplaceAllString(s, "$1")
+	s = boldUnderscoreRe.ReplaceAllString(s, "$1")
+	s = italicStarRe.ReplaceAllString(s, "$1")
+	s = inlineCodeRe.ReplaceAllString(s, "$1")
+	return s
 }
