@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -21,17 +22,19 @@ type TelegramAdapter struct {
 	token       string
 	chatID      int64
 	msgs        *Messages
+	convID      func() string
 	albumBuffer map[string][]*tgbotapi.Message
 	albumTimer  map[string]*time.Timer
 	albumMutex  sync.Mutex
 	msgChan     chan InternalMessage
 }
 
-func NewTelegramAdapter(token string, chatID int64, msgs *Messages) *TelegramAdapter {
+func NewTelegramAdapter(token string, chatID int64, msgs *Messages, convID func() string) *TelegramAdapter {
 	return &TelegramAdapter{
 		token:       token,
 		chatID:      chatID,
 		msgs:        msgs,
+		convID:      convID,
 		albumBuffer: make(map[string][]*tgbotapi.Message),
 		albumTimer:  make(map[string]*time.Timer),
 		msgChan:     make(chan InternalMessage, 100),
@@ -89,6 +92,17 @@ func (t *TelegramAdapter) Listen() (<-chan InternalMessage, error) {
 
 const maxAttachmentsPerMessage = 10
 
+const maxAttachmentBytes = 50 << 20 // Telegram bot upload limit
+
+// deliverableExtensions is the whitelist of file types eligible for channel
+// delivery. Source-code and plain-text extensions are deliberately excluded
+// so that filenames merely mentioned in AI answers are never picked up.
+var deliverableExtensions = map[string]bool{
+	".jpg": true, ".jpeg": true, ".png": true, ".gif": true, ".webp": true, ".bmp": true,
+	".mp4": true, ".webm": true, ".mov": true, ".avi": true, ".mkv": true,
+	".pdf": true, ".zip": true, ".csv": true, ".xlsx": true, ".docx": true, ".pptx": true,
+}
+
 func (t *TelegramAdapter) Send(chatID string, text string, opts ...SendOptions) error {
 	var opt SendOptions
 	if len(opts) > 0 {
@@ -100,11 +114,11 @@ func (t *TelegramAdapter) Send(chatID string, text string, opts ...SendOptions) 
 	}
 
 	// When the payload may carry deliverables, scan for files produced by
-	// the AI, strip their paths from the reply text, and send them as
-	// channel attachments afterwards.
-	var attachments []string
-	if opt.AttachFiles {
-		attachments = extractDeliverableFiles(text)
+	// the AI during this turn, strip their paths from the reply text, and
+	// send them as channel attachments afterwards.
+	var attachments []deliverable
+	if !opt.AttachAfter.IsZero() {
+		attachments = t.collectDeliverables(opt.AttachAfter)
 		for _, m := range filePathPattern.FindAllString(text, -1) {
 			text = strings.ReplaceAll(text, m, "")
 		}
@@ -131,14 +145,15 @@ func (t *TelegramAdapter) Send(chatID string, text string, opts ...SendOptions) 
 		}
 	}
 
-	for _, f := range attachments {
-		if err := t.sendAttachment(id, f, opt.ReplyToMessageID); err != nil {
-			log.Printf("Attachment send failed (%s): %v", f, err)
+	for _, a := range attachments {
+		if err := t.sendAttachment(id, a.path, opt.ReplyToMessageID); err != nil {
+			log.Printf("Attachment send failed (%s): %v", a.path, err)
 			return err
 		}
-		// Delivered — remove the local copy (best-effort).
-		if rmErr := os.Remove(f); rmErr != nil {
-			log.Printf("Failed to remove delivered attachment %s: %v", f, rmErr)
+		if a.deletable {
+			if rmErr := os.Remove(a.path); rmErr != nil {
+				log.Printf("Failed to remove delivered attachment %s: %v", a.path, rmErr)
+			}
 		}
 	}
 	return nil
@@ -156,45 +171,80 @@ func (t *TelegramAdapter) sendOne(chatID int64, text string, parseMode string, r
 	return err
 }
 
-// extractDeliverableFiles scans AI response text for file path candidates
-// and returns the ones that actually exist as deliverable files. Only files
-// inside the project root may be delivered, since delivery implies the local
-// copy is deleted afterwards.
-func extractDeliverableFiles(text string) []string {
-	matches := filePathPattern.FindAllString(text, -1)
-	if len(matches) == 0 {
-		return nil
+// deliverable is a candidate file found by the attachment scan.
+type deliverable struct {
+	path string
+	// deletable marks files inside the project tree, whose local copy may be
+	// removed after delivery. Files from the agy brain directory are
+	// preserved.
+	deletable bool
+}
+
+// brainDir returns the active conversation's agy brain directory, where tools
+// like generate_image store their output. Empty when unknown.
+func (t *TelegramAdapter) brainDir() string {
+	if t.convID == nil {
+		return ""
 	}
+	id := strings.TrimSpace(t.convID())
+	if id == "" {
+		return ""
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".gemini", "antigravity-cli", "brain", id)
+}
+
+// collectDeliverables finds files produced during the current turn: files
+// modified at or after `after` with whitelisted extensions, under the project
+// tree (deletable) or under the active agy brain directory (preserved).
+func (t *TelegramAdapter) collectDeliverables(after time.Time) []deliverable {
 	root := findProjectRoot()
 	if root == "" {
 		return nil
 	}
-	rootWithSep := strings.ToLower(root + string(filepath.Separator))
-
 	seen := make(map[string]bool)
-	var files []string
-	for _, m := range matches {
-		p := m
-		if !filepath.IsAbs(p) {
-			p = filepath.Join(root, filepath.FromSlash(p))
+	var out []deliverable
+
+	collect := func(dir string, deletable bool) {
+		if dir == "" {
+			return
 		}
-		info, err := os.Stat(p)
-		if err != nil || info.IsDir() {
-			continue
-		}
-		if !strings.HasPrefix(strings.ToLower(p), rootWithSep) {
-			continue // deletion guard: project tree only
-		}
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		files = append(files, p)
-		if len(files) >= maxAttachmentsPerMessage {
-			break
-		}
+		filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return nil // best-effort scan; skip unreadable entries
+			}
+			if d.IsDir() {
+				if d.Name() == ".git" || d.Name() == "node_modules" {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if seen[p] || !deliverableExtensions[strings.ToLower(filepath.Ext(d.Name()))] {
+				return nil
+			}
+			info, err := d.Info()
+			if err != nil || info.Size() > maxAttachmentBytes || info.ModTime().Before(after) {
+				return nil
+			}
+			seen[p] = true
+			out = append(out, deliverable{path: p, deletable: deletable})
+			return nil
+		})
 	}
-	return files
+
+	collect(root, true)
+	collect(t.brainDir(), false)
+
+	if len(out) > maxAttachmentsPerMessage {
+		out = out[:maxAttachmentsPerMessage]
+	}
+	for _, a := range out {
+		log.Printf("Attachment candidate: %s (deletable=%v)", a.path, a.deletable)
+	}
+	return out
 }
 
 // sendAttachment uploads a single local file, choosing the Telegram message

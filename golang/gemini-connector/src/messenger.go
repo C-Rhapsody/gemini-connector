@@ -1,5 +1,7 @@
 package main
 
+import "time"
+
 // InternalMessage is the platform-agnostic message structure.
 type InternalMessage struct {
 	Platform string
@@ -20,10 +22,10 @@ type SendOptions struct {
 	ReplyToMessageID int
 	// Plain sends the text verbatim, skipping markdown-to-HTML conversion.
 	Plain bool
-	// AttachFiles lets the adapter scan the text for file paths produced by
-	// the AI and deliver them as channel attachments (removing them from the
-	// reply text). Only set for AI response payloads.
-	AttachFiles bool
+	// AttachAfter enables attachment delivery for AI-produced files modified
+	// at or after this moment (the turn start). Zero disables delivery.
+	// Only set for AI response payloads.
+	AttachAfter time.Time
 }
 
 // Messenger defines the common interface for all messaging platform adapters.

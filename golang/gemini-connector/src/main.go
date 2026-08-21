@@ -463,7 +463,7 @@ func main() {
 	for _, name := range cfg.ActiveMessengers {
 		switch name {
 		case "telegram":
-			adapters["telegram"] = NewTelegramAdapter(cfg.TelegramBotToken, cfg.TelegramChatID, msgs)
+			adapters["telegram"] = NewTelegramAdapter(cfg.TelegramBotToken, cfg.TelegramChatID, msgs, cfg.ConversationID)
 		case "teams":
 			adapters["teams"] = NewTeamsAdapter(cfg.TeamsTenantID, cfg.TeamsAppID, cfg.TeamsAppSecret, cfg.TeamsChatID, msgs)
 		default:
@@ -540,6 +540,10 @@ func main() {
 			stop := adapter.StartTyping(m.ChatID)
 			defer stop()
 
+			// Turn start marker: files modified from this point on are
+			// considered AI-produced and eligible for attachment delivery.
+			turnStart := time.Now()
+
 			response, err := executeAgy(m.Content, cfg.ConversationID())
 			if err != nil {
 				if ae, ok := err.(*AgyError); ok {
@@ -566,7 +570,7 @@ func main() {
 			if response != "" {
 				appendTranscript(cfg.ConversationID(), "user", m.Content)
 				appendTranscript(cfg.ConversationID(), "assistant", response)
-				adapter.Send(m.ChatID, response, SendOptions{ReplyToMessageID: m.MessageID, AttachFiles: true})
+				adapter.Send(m.ChatID, response, SendOptions{ReplyToMessageID: m.MessageID, AttachAfter: turnStart})
 			} else {
 				adapter.Send(m.ChatID, msgs.ErrorEmptyResponse, replyOpt)
 			}
