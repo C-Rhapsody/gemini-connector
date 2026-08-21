@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const agyConversationCacheRelPath = ".gemini/antigravity-cli/cache/last_conversations.json"
@@ -198,16 +200,19 @@ func createNewConversation() (string, error) {
 
 // createNewConversationRuntime creates a fresh agy conversation during bot
 // runtime. Unlike createNewConversation, it logs instead of printing to stdout.
-func createNewConversationRuntime() (string, error) {
-	id, _, err := createNewConversationRuntimeWithPrompt("This connector bridges Telegram to agy. Reply only with 'agy Connector Ready.'")
+func createNewConversationRuntime(ctx context.Context) (string, error) {
+	id, _, err := createNewConversationRuntimeWithPrompt(ctx, "This connector bridges Telegram to agy. Reply only with 'agy Connector Ready.'")
 	return id, err
 }
 
 // createNewConversationRuntimeWithPrompt creates a fresh agy conversation and
 // sends the given prompt as its first turn, returning the new conversation ID
-// and the agy response text.
-func createNewConversationRuntimeWithPrompt(prompt string) (string, string, error) {
-	cmd := exec.Command("agy", "--output-format", "json", "--dangerously-skip-permissions", "--print-timeout", "5m")
+// and the agy response text. Cancelling ctx stops the underlying CLI.
+func createNewConversationRuntimeWithPrompt(ctx context.Context, prompt string) (string, string, error) {
+	cmd := exec.CommandContext(ctx, "agy", "--output-format", "json", "--dangerously-skip-permissions", "--print-timeout", "5m")
+	configureAgyProcess(cmd)
+	cmd.Cancel = func() error { return killAgyProcess(cmd.Process) }
+	cmd.WaitDelay = 10 * time.Second
 	cmd.Stdin = strings.NewReader(prompt)
 	cmd.Dir = findProjectRoot()
 

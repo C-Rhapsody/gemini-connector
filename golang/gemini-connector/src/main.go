@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -84,11 +85,15 @@ type Messages struct {
 	ErrorSystemResponse    string `json:"ErrorSystemResponse"`
 	ErrorEmptyResponse     string `json:"ErrorEmptyResponse"`
 	DefaultMediaPrompt     string `json:"DefaultMediaPrompt"`
+	StopDone               string `json:"StopDone"`
+	StopDoneWithQueued     string `json:"StopDoneWithQueued"`
+	StopNothing            string `json:"StopNothing"`
+	QueuedNotice           string `json:"QueuedNotice"`
 }
 
 var defaultMessages = Messages{
 	StartupWelcome:         "🔔 agy 텔레그램 커넥터 가동 완료. 메시지를 보내면 agy가 처리합니다.",
-	CommandStartHelp:       "agy 텔레그램 커넥터 가동 중. 메시지를 보내면 agy가 처리합니다.\n\n사용 가능 명령어:\n/help - 도움말 및 명령어 목록\n/new (또는 /reset) - 이전 대화를 요약해 새 agy 대화 세션으로 전환\n/status - 현재 대화 ID와 기록된 턴 수 표시\n/summary - 최근 대화 내용 미리보기\n/list - 캐시된 agy 대화 목록\n/switch <ID> - 지정한 대화로 전환\n/version - 커넥터 및 agy 버전",
+	CommandStartHelp:       "agy 텔레그램 커넥터 가동 중. 메시지를 보내면 agy가 처리합니다.\n\n사용 가능 명령어:\n/help - 도움말 및 명령어 목록\n/new (또는 /reset) - 이전 대화를 요약해 새 agy 대화 세션으로 전환\n/stop - 진행 중인 agy 작업과 대기열을 즉시 중지\n/status - 현재 대화 ID와 기록된 턴 수 표시\n/summary - 최근 대화 내용 미리보기\n/list - 캐시된 agy 대화 목록\n/switch <ID> - 지정한 대화로 전환\n/version - 커넥터 및 agy 버전",
 	CommandUnknown:         "알 수 없는 명령어입니다. /help 를 입력하면 사용 가능한 명령어를 확인할 수 있습니다.",
 	ErrorMediaNotSupported: "⚠️ 현재 시스템은 동영상, 음성 및 일반 문서 파일 분석을 지원하지 않습니다. 텍스트 및 이미지 파일만 전송해 주십시오.",
 	ErrorMediaDownloadFail: "미디어 다운로드에 실패했습니다.",
@@ -98,6 +103,61 @@ var defaultMessages = Messages{
 	ErrorSystemResponse:    "⚠️ 시스템 응답 오류: %s",
 	ErrorEmptyResponse:     "⚠️ 명령이 빈 응답을 반환했습니다.",
 	DefaultMediaPrompt:     "Analyze the attached media file(s) comprehensively. Describe the contents, text, and context in detail. Please provide the final response in Korean.",
+	StopDone:               "⛔ 진행 중인 agy 작업을 중지했습니다.\n새 메시지를 보내주세요.",
+	StopDoneWithQueued:     "⛔ 진행 중인 agy 작업을 중지하고 대기 중인 %d개 요청을 취소했습니다.\n새 메시지를 보내주세요.",
+	StopNothing:            "ℹ️ 현재 진행 중이거나 대기 중인 작업이 없습니다.",
+	QueuedNotice:           "⏳ 현재 작업이 진행 중입니다.\n요청을 대기열에 추가했습니다. (%d번째)",
+}
+
+// applyDefaults fills fields missing from an older messages.json so that new
+// features work without requiring users to regenerate the file.
+func (m *Messages) applyDefaults() {
+	d := &defaultMessages
+	if m.StartupWelcome == "" {
+		m.StartupWelcome = d.StartupWelcome
+	}
+	if m.CommandStartHelp == "" {
+		m.CommandStartHelp = d.CommandStartHelp
+	}
+	if m.CommandUnknown == "" {
+		m.CommandUnknown = d.CommandUnknown
+	}
+	if m.ErrorMediaNotSupported == "" {
+		m.ErrorMediaNotSupported = d.ErrorMediaNotSupported
+	}
+	if m.ErrorMediaDownloadFail == "" {
+		m.ErrorMediaDownloadFail = d.ErrorMediaDownloadFail
+	}
+	if m.ErrorMissingUUID == "" {
+		m.ErrorMissingUUID = d.ErrorMissingUUID
+	}
+	if m.ErrorCLIFailure == "" {
+		m.ErrorCLIFailure = d.ErrorCLIFailure
+	}
+	if m.ErrorJSONParseFail == "" {
+		m.ErrorJSONParseFail = d.ErrorJSONParseFail
+	}
+	if m.ErrorSystemResponse == "" {
+		m.ErrorSystemResponse = d.ErrorSystemResponse
+	}
+	if m.ErrorEmptyResponse == "" {
+		m.ErrorEmptyResponse = d.ErrorEmptyResponse
+	}
+	if m.DefaultMediaPrompt == "" {
+		m.DefaultMediaPrompt = d.DefaultMediaPrompt
+	}
+	if m.StopDone == "" {
+		m.StopDone = d.StopDone
+	}
+	if m.StopDoneWithQueued == "" {
+		m.StopDoneWithQueued = d.StopDoneWithQueued
+	}
+	if m.StopNothing == "" {
+		m.StopNothing = d.StopNothing
+	}
+	if m.QueuedNotice == "" {
+		m.QueuedNotice = d.QueuedNotice
+	}
 }
 
 func loadMessages(exeDir string) (*Messages, error) {
@@ -121,6 +181,7 @@ func loadMessages(exeDir string) (*Messages, error) {
 		log.Printf("Warning: Failed to parse messages.json (%v). Using defaults.", err)
 		return &defaultMessages, nil
 	}
+	msgs.applyDefaults()
 	return &msgs, nil
 }
 
@@ -499,6 +560,9 @@ func main() {
 	// Merge all adapter channels
 	msgChan := fanIn(listenChannels...)
 
+	// Serializes agy work; /stop cancels the running job and drops queued ones.
+	turnQ := newAgyTurnQueue()
+
 	log.Println("Waiting for messages...")
 
 	for msg := range msgChan {
@@ -512,8 +576,21 @@ func main() {
 			replyOpt := SendOptions{ReplyToMessageID: m.MessageID}
 
 			switch m.Command {
+			case "/stop":
+				active, dropped := turnQ.StopActive()
+				switch {
+				case active && dropped > 0:
+					adapter.Send(m.ChatID, fmt.Sprintf(msgs.StopDoneWithQueued, dropped), replyOpt)
+				case active:
+					adapter.Send(m.ChatID, msgs.StopDone, replyOpt)
+				default:
+					adapter.Send(m.ChatID, msgs.StopNothing, replyOpt)
+				}
+				return
 			case "/reset":
-				resetConversation(cfg, adapter, m.ChatID, m.MessageID, "", msgs)
+				enqueueTurn(turnQ, adapter, m.ChatID, m.MessageID, msgs, func(ctx context.Context) {
+					resetConversation(ctx, cfg, adapter, m.ChatID, m.MessageID, "", msgs)
+				})
 				return
 			case "/status":
 				statusConversation(cfg, adapter, m.ChatID, m.MessageID, msgs)
@@ -528,7 +605,9 @@ func main() {
 				listConversations(cfg, adapter, m.ChatID, m.Args, m.MessageID, msgs)
 				return
 			case "/switch":
-				switchConversation(cfg, adapter, m.ChatID, m.Args, m.MessageID, msgs)
+				enqueueTurn(turnQ, adapter, m.ChatID, m.MessageID, msgs, func(ctx context.Context) {
+					switchConversation(cfg, adapter, m.ChatID, m.Args, m.MessageID, msgs)
+				})
 				return
 			}
 
@@ -537,51 +616,76 @@ func main() {
 				return
 			}
 
-			stop := adapter.StartTyping(m.ChatID)
-			defer stop()
+			ahead := turnQ.Enqueue(func(ctx context.Context) {
+				stop := adapter.StartTyping(m.ChatID)
+				defer stop()
 
-			// Turn start marker: files modified from this point on are
-			// considered AI-produced and eligible for attachment delivery.
-			turnStart := time.Now()
+				// Turn start marker: files modified from this point on are
+				// considered AI-produced and eligible for attachment delivery.
+				turnStart := time.Now()
 
-			response, err := executeAgy(m.Content, cfg.ConversationID())
-			if err != nil {
-				if ae, ok := err.(*AgyError); ok {
-					switch ae.Type {
-					case "cli_failure":
-						adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorCLIFailure, ae.Err, ae.Detail), replyOpt)
-					case "json_parse_fail":
-						adapter.Send(m.ChatID, msgs.ErrorJSONParseFail, replyOpt)
-					case "error_status":
-						detail := ae.Detail
-						if extractUrlFetchFailure(detail) != "" && cfg.recordUrlFetchError(detail) {
-							log.Printf("Stuck conversation detected (repeated URL fetch failure), resetting session")
-							resetConversation(cfg, adapter, m.ChatID, m.MessageID, m.Content, msgs)
-							return
-						}
-						adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorSystemResponse, detail), replyOpt)
-					case "authentication_required":
-						adapter.Send(m.ChatID, "⚠️ agy 인증이 필요합니다. 터미널에서 'agy'를 한 번 실행해 인증을 완료한 뒤 봇을 재시작하세요.", replyOpt)
+				response, err := executeAgy(ctx, m.Content, cfg.ConversationID())
+				if err != nil {
+					if ctx.Err() != nil {
+						// Cancelled via /stop: stay silent, the stop notice
+						// already went out.
+						log.Printf("agy turn cancelled by /stop: %s", truncateString(m.Content, 50))
+						return
 					}
+					if ae, ok := err.(*AgyError); ok {
+						switch ae.Type {
+						case "cli_failure":
+							adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorCLIFailure, ae.Err, ae.Detail), replyOpt)
+						case "json_parse_fail":
+							adapter.Send(m.ChatID, msgs.ErrorJSONParseFail, replyOpt)
+						case "error_status":
+							detail := ae.Detail
+							if extractUrlFetchFailure(detail) != "" && cfg.recordUrlFetchError(detail) {
+								log.Printf("Stuck conversation detected (repeated URL fetch failure), resetting session")
+								resetConversation(ctx, cfg, adapter, m.ChatID, m.MessageID, m.Content, msgs)
+								return
+							}
+							adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorSystemResponse, detail), replyOpt)
+						case "authentication_required":
+							adapter.Send(m.ChatID, "⚠️ agy 인증이 필요합니다. 터미널에서 'agy'를 한 번 실행해 인증을 완료한 뒤 봇을 재시작하세요.", replyOpt)
+						}
+					}
+					return
 				}
-				return
-			}
 
-			if response != "" {
-				appendTranscript(cfg.ConversationID(), "user", m.Content)
-				appendTranscript(cfg.ConversationID(), "assistant", response)
-				adapter.Send(m.ChatID, response, SendOptions{ReplyToMessageID: m.MessageID, AttachAfter: turnStart})
-			} else {
-				adapter.Send(m.ChatID, msgs.ErrorEmptyResponse, replyOpt)
+				if ctx.Err() != nil {
+					log.Printf("agy turn cancelled by /stop (after completion): %s", truncateString(m.Content, 50))
+					return
+				}
+				if response != "" {
+					appendTranscript(cfg.ConversationID(), "user", m.Content)
+					appendTranscript(cfg.ConversationID(), "assistant", response)
+					adapter.Send(m.ChatID, response, SendOptions{ReplyToMessageID: m.MessageID, AttachAfter: turnStart})
+				} else {
+					adapter.Send(m.ChatID, msgs.ErrorEmptyResponse, replyOpt)
+				}
+			})
+			if ahead > 0 {
+				adapter.Send(m.ChatID, fmt.Sprintf(msgs.QueuedNotice, ahead), replyOpt)
 			}
 		}(msg)
 	}
 }
 
+// enqueueTurn queues a state-changing command (/reset, /switch) on the agy
+// turn queue and notifies the user when it has to wait.
+func enqueueTurn(q *agyTurnQueue, adapter Messenger, chatID string, replyTo int, msgs *Messages, run func(ctx context.Context)) {
+	ahead := q.Enqueue(run)
+	if ahead > 0 {
+		adapter.Send(chatID, fmt.Sprintf(msgs.QueuedNotice, ahead), SendOptions{ReplyToMessageID: replyTo})
+	}
+}
+
 // resetConversation summarizes the old conversation into a fresh agy
 // conversation, persists the new ID to .env, replays the given prompt on the
-// new session, and deletes the old session artifacts.
-func resetConversation(cfg *Config, adapter Messenger, chatID string, replyTo int, replayPrompt string, msgs *Messages) {
+// new session, and deletes the old session artifacts. Cancelling ctx aborts
+// the underlying agy calls silently.
+func resetConversation(ctx context.Context, cfg *Config, adapter Messenger, chatID string, replyTo int, replayPrompt string, msgs *Messages) {
 	oldID := cfg.ConversationID()
 	log.Printf("Resetting conversation. Old conversation ID: %s", oldID)
 
@@ -592,8 +696,12 @@ func resetConversation(cfg *Config, adapter Messenger, chatID string, replyTo in
 		summaryPrompt = "This connector bridges Telegram to agy. Reply only with 'agy Connector Ready.'"
 	}
 
-	newID, _, err := createNewConversationRuntimeWithPrompt(summaryPrompt)
+	newID, _, err := createNewConversationRuntimeWithPrompt(ctx, summaryPrompt)
 	if err != nil {
+		if ctx.Err() != nil {
+			log.Printf("Conversation reset cancelled by /stop")
+			return
+		}
 		log.Printf("Failed to create new conversation: %v", err)
 		cfg.applyNewConversation(oldID)
 		adapter.Send(chatID, fmt.Sprintf("⚠️ 새 대화 세션 생성에 실패했습니다: %v", err), replyOpt)
@@ -612,14 +720,20 @@ func resetConversation(cfg *Config, adapter Messenger, chatID string, replyTo in
 	notice := fmt.Sprintf("⚠️ 이전 대화를 요약해 새 세션으로 전환했습니다. (새 세션 ID: %s)", truncateString(newID, 8))
 
 	if replayPrompt != "" {
-		response, rerr := executeAgy(replayPrompt, newID)
-		if rerr == nil && response != "" {
+		response, rerr := executeAgy(ctx, replayPrompt, newID)
+		if rerr == nil && response != "" && ctx.Err() == nil {
 			appendTranscript(newID, "user", replayPrompt)
 			appendTranscript(newID, "assistant", response)
 			adapter.Send(chatID, notice+"\n\n"+response, replyOpt)
 			return
 		}
-		log.Printf("Replay on new conversation failed: %v", rerr)
+		if ctx.Err() != nil {
+			log.Printf("Replay on new conversation cancelled by /stop")
+			return
+		}
+		if rerr != nil {
+			log.Printf("Replay on new conversation failed: %v", rerr)
+		}
 	}
 
 	adapter.Send(chatID, notice, replyOpt)

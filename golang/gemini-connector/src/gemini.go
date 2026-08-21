@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 type AgyResponse struct {
@@ -39,7 +41,7 @@ func (e *AgyError) Error() string {
 	return fmt.Sprintf("%s: %s", e.Type, e.Detail)
 }
 
-func executeAgy(prompt string, conversationID string) (string, error) {
+func executeAgy(ctx context.Context, prompt string, conversationID string) (string, error) {
 	log.Printf("Triggering agy CLI for message (via Stdin): %s", truncateString(prompt, 50))
 
 	args := []string{
@@ -51,7 +53,13 @@ func executeAgy(prompt string, conversationID string) (string, error) {
 		args = append(args, "--conversation", conversationID)
 	}
 
-	cmd := exec.Command("agy", args...)
+	cmd := exec.CommandContext(ctx, "agy", args...)
+	configureAgyProcess(cmd)
+	// /stop must take down the whole agy process tree, not just the root.
+	cmd.Cancel = func() error { return killAgyProcess(cmd.Process) }
+	// If the tree kill fails or the process ignores it, WaitDelay force-stops
+	// the wait so the caller does not hang forever.
+	cmd.WaitDelay = 10 * time.Second
 	cmd.Stdin = strings.NewReader(prompt)
 
 	var stdout, stderr bytes.Buffer
