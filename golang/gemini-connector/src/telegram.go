@@ -52,6 +52,7 @@ func (t *TelegramAdapter) Init() error {
 	commands := []tgbotapi.BotCommand{
 		{Command: "start", Description: "커넥터 시작"},
 		{Command: "help", Description: "도움말 및 명령어 목록"},
+		{Command: "image", Description: "NIM으로 이미지 생성"},
 		{Command: "new", Description: "새 agy 대화 세션 시작"},
 		{Command: "reset", Description: "/new 의 별칭"},
 		{Command: "clear", Description: "대화 기록을 지우고 새 세션 시작"},
@@ -365,6 +366,8 @@ func (t *TelegramAdapter) handleIncomingMessage(msg *tgbotapi.Message) {
 			}
 		case "clear":
 			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/clear", MessageID: msg.MessageID}
+		case "image":
+			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/image", Args: msg.CommandArguments(), MessageID: msg.MessageID}
 		case "stop":
 			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/stop", MessageID: msg.MessageID}
 		case "status":

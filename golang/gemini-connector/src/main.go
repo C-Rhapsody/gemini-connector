@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -129,11 +130,16 @@ type Messages struct {
 	StopDoneWithQueued     string `json:"StopDoneWithQueued"`
 	StopNothing            string `json:"StopNothing"`
 	QueuedNotice           string `json:"QueuedNotice"`
+	ImageUsage             string `json:"ImageUsage"`
+	ImageKeyMissing        string `json:"ImageKeyMissing"`
+	ImageGenerating        string `json:"ImageGenerating"`
+	ImageTimeout           string `json:"ImageTimeout"`
+	ImageFail              string `json:"ImageFail"`
 }
 
 var defaultMessages = Messages{
 	StartupWelcome:         "🔔 agy 텔레그램 커넥터 가동 완료. 메시지를 보내면 agy가 처리합니다.",
-	CommandStartHelp:       "agy 텔레그램 커넥터 가동 중. 메시지를 보내면 agy가 처리합니다.\n\n사용 가능 명령어:\n/help - 도움말 및 명령어 목록\n/new (또는 /reset) - 이전 대화를 요약해 새 agy 대화 세션으로 전환\n/clear - 대화 기록을 모두 지우고 완전히 새 세션 시작 (요약 이월 없음)\n/stop - 진행 중인 agy 작업과 대기열을 즉시 중지\n/status - 현재 대화 ID와 기록된 턴 수 표시\n/summary - 최근 대화 내용 미리보기\n/list - 캐시된 agy 대화 목록\n/switch <ID> - 지정한 대화로 전환\n/version - 커넥터 및 agy 버전",
+	CommandStartHelp:       "agy 텔레그램 커넥터 가동 중. 메시지를 보내면 agy가 처리합니다.\n\n사용 가능 명령어:\n/help - 도움말 및 명령어 목록\n/image <묘사> - 묘사를 영어 프롬프트로 번역해 NVIDIA NIM으로 이미지 생성\n/new (또는 /reset) - 이전 대화를 요약해 새 agy 대화 세션으로 전환\n/clear - 대화 기록을 모두 지우고 완전히 새 세션 시작 (요약 이월 없음)\n/stop - 진행 중인 agy 작업과 대기열을 즉시 중지\n/status - 현재 대화 ID와 기록된 턴 수 표시\n/summary - 최근 대화 내용 미리보기\n/list - 캐시된 agy 대화 목록\n/switch <ID> - 지정한 대화로 전환\n/version - 커넥터 및 agy 버전",
 	CommandUnknown:         "알 수 없는 명령어입니다. /help 를 입력하면 사용 가능한 명령어를 확인할 수 있습니다.",
 	ErrorMediaNotSupported: "⚠️ 현재 시스템은 동영상, 음성 및 일반 문서 파일 분석을 지원하지 않습니다. 텍스트 및 이미지 파일만 전송해 주십시오.",
 	ErrorMediaDownloadFail: "미디어 다운로드에 실패했습니다.",
@@ -147,6 +153,11 @@ var defaultMessages = Messages{
 	StopDoneWithQueued:     "⛔ 진행 중인 agy 작업을 중지하고 대기 중인 %d개 요청을 취소했습니다.\n새 메시지를 보내주세요.",
 	StopNothing:            "ℹ️ 현재 진행 중이거나 대기 중인 작업이 없습니다.",
 	QueuedNotice:           "⏳ 현재 작업이 진행 중입니다.\n요청을 대기열에 추가했습니다. (%d번째)",
+	ImageUsage:             "ℹ️ 사용법: /image <묘사>\n예: /image 창가에서 햇볕을 쬐는 고양이, 따뜻한 수채화 느낌",
+	ImageKeyMissing:        "❌ 설정 오류: .env 파일에 NVIDIA_API_KEY가 설정되지 않았습니다.",
+	ImageGenerating:        "⏳ 이미지를 생성하고 있습니다…",
+	ImageTimeout:           "⏱️ NVIDIA 응답이 지연되어 시간 초과되었습니다. 잠시 후 다시 시도해 주세요.",
+	ImageFail:              "❌ 이미지 생성 실패: %v",
 }
 
 // applyDefaults fills fields missing from an older messages.json so that new
@@ -197,6 +208,21 @@ func (m *Messages) applyDefaults() {
 	}
 	if m.QueuedNotice == "" {
 		m.QueuedNotice = d.QueuedNotice
+	}
+	if m.ImageUsage == "" {
+		m.ImageUsage = d.ImageUsage
+	}
+	if m.ImageKeyMissing == "" {
+		m.ImageKeyMissing = d.ImageKeyMissing
+	}
+	if m.ImageGenerating == "" {
+		m.ImageGenerating = d.ImageGenerating
+	}
+	if m.ImageTimeout == "" {
+		m.ImageTimeout = d.ImageTimeout
+	}
+	if m.ImageFail == "" {
+		m.ImageFail = d.ImageFail
 	}
 }
 
@@ -642,6 +668,11 @@ func main() {
 					clearConversation(ctx, cfg, adapter, m.ChatID, m.MessageID, msgs)
 				})
 				return
+			case "/image":
+				enqueueTurn(turnQ, adapter, m.ChatID, m.MessageID, msgs, func(ctx context.Context) {
+					imageCommand(ctx, cfg, adapter, m.ChatID, m.MessageID, m.Args, msgs)
+				})
+				return
 			case "/status":
 				statusConversation(cfg, adapter, m.ChatID, m.MessageID, msgs)
 				return
@@ -877,6 +908,116 @@ func clearConversation(ctx context.Context, cfg *Config, adapter Messenger, chat
 	// cooldown so regular chat turns are not blocked unnecessarily.
 	QuotaClear()
 	adapter.Send(chatID, fmt.Sprintf("🗑️ 대화 기록을 모두 지우고 새 세션을 시작했습니다. (새 세션 ID: %s)", truncateString(newID, 8)), replyOpt)
+}
+
+// imageCommand turns a Korean description into an image: agy translates the
+// prompt into English, NVIDIA NIM generates the picture, and the result is
+// delivered as a Telegram photo. The local copy is removed only after a
+// successful send.
+func imageCommand(ctx context.Context, cfg *Config, adapter Messenger, chatID string, replyTo int, args string, msgs *Messages) {
+	replyOpt := SendOptions{ReplyToMessageID: replyTo}
+
+	prompt := strings.TrimSpace(args)
+	if prompt == "" {
+		adapter.Send(chatID, msgs.ImageUsage, replyOpt)
+		return
+	}
+	apiKey := os.Getenv("NVIDIA_API_KEY")
+	if apiKey == "" {
+		adapter.Send(chatID, msgs.ImageKeyMissing, replyOpt)
+		return
+	}
+
+	stop := adapter.StartTyping(chatID)
+	defer stop()
+
+	translatePrompt := "Translate the following request into a detailed English prompt for a text-to-image model. " +
+		"Keep all visual details, style and composition. Reply with ONLY the English prompt text - no quotes, no explanations.\n\n" + prompt
+	translated, err := executeAgy(ctx, translatePrompt, cfg.ConversationID(), AgyCallOptions{BypassQuotaGate: true})
+	if err != nil {
+		if ctx.Err() != nil {
+			log.Printf("/image cancelled by /stop during translation")
+			return
+		}
+		if ae, ok := err.(*AgyError); ok && ae.Type == "quota_cooldown" {
+			adapter.Send(chatID, fmt.Sprintf(msgs.ErrorSystemResponse, ae.Detail), replyOpt)
+			return
+		}
+		adapter.Send(chatID, fmt.Sprintf(msgs.ImageFail, err), replyOpt)
+		return
+	}
+
+	adapter.Send(chatID, msgs.ImageGenerating, replyOpt)
+
+	img, err := generateNimImage(ctx, apiKey, cleanTranslatedPrompt(translated))
+	if err != nil {
+		if ctx.Err() != nil {
+			log.Printf("/image cancelled by /stop during generation")
+			return
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			adapter.Send(chatID, msgs.ImageTimeout, replyOpt)
+			return
+		}
+		adapter.Send(chatID, fmt.Sprintf(msgs.ImageFail, err), replyOpt)
+		return
+	}
+
+	path, err := saveGeneratedImage(img)
+	if err != nil {
+		adapter.Send(chatID, fmt.Sprintf(msgs.ImageFail, err), replyOpt)
+		return
+	}
+
+	tg, ok := adapter.(*TelegramAdapter)
+	if !ok {
+		os.Remove(path)
+		adapter.Send(chatID, msgs.ErrorMediaNotSupported, replyOpt)
+		return
+	}
+	id, perr := strconv.ParseInt(chatID, 10, 64)
+	if perr != nil {
+		os.Remove(path)
+		adapter.Send(chatID, fmt.Sprintf(msgs.ImageFail, perr), replyOpt)
+		return
+	}
+	if err := tg.sendAttachment(id, path, replyTo); err != nil {
+		// Keep the local file for troubleshooting; delivery can be retried.
+		log.Printf("Failed to deliver generated image %s: %v", path, err)
+		adapter.Send(chatID, fmt.Sprintf(msgs.ImageFail, err), replyOpt)
+		return
+	}
+	if rmErr := os.Remove(path); rmErr != nil {
+		log.Printf("Failed to remove delivered image %s: %v", path, rmErr)
+	} else {
+		log.Printf("Image delivered and local copy removed: %s", path)
+	}
+}
+
+// cleanTranslatedPrompt strips whitespace and wrapping quotes that agy may
+// add around the translated prompt.
+func cleanTranslatedPrompt(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.Trim(s, "\"“”'`")
+	return strings.TrimSpace(s)
+}
+
+// saveGeneratedImage writes the decoded image into the shared downloads
+// directory with an extension derived from its magic bytes.
+func saveGeneratedImage(img []byte) (string, error) {
+	exePath, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(filepath.Dir(exePath), "..", "downloads")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, fmt.Sprintf("image_%d%s", time.Now().UnixMilli(), imageFileExt(img)))
+	if err := os.WriteFile(path, img, 0644); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 // deleteConversationArtifacts removes the old conversation's on-disk state
