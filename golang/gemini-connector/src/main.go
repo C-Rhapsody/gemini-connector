@@ -154,7 +154,7 @@ var defaultMessages = Messages{
 	StopNothing:            "ℹ️ 현재 진행 중이거나 대기 중인 작업이 없습니다.",
 	QueuedNotice:           "⏳ 현재 작업이 진행 중입니다.\n요청을 대기열에 추가했습니다. (%d번째)",
 	ImageUsage:             "ℹ️ 사용법: /image <묘사>\n예: /image 창가에서 햇볕을 쬐는 고양이, 따뜻한 수채화 느낌",
-	ImageKeyMissing:        "❌ 설정 오류: .env 파일에 NVIDIA_API_KEY가 설정되지 않았습니다.",
+	ImageKeyMissing:        "❌ 설정 오류: .env 파일에 NVIDIA_API_KEY가 설정되지 않았습니다.\n추가 후 gemini-connector를 재시작해야 적용됩니다.",
 	ImageGenerating:        "⏳ 이미지를 생성하고 있습니다…",
 	ImageTimeout:           "⏱️ NVIDIA 응답이 지연되어 시간 초과되었습니다. 잠시 후 다시 시도해 주세요.",
 	ImageFail:              "❌ 이미지 생성 실패: %v",
