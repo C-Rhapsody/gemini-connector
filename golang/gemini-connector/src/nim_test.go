@@ -75,6 +75,44 @@ func TestImageFileExt(t *testing.T) {
 	}
 }
 
+func TestGenerateNimImage_ContentFiltered(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"artifacts": []any{map[string]any{"base64": "", "finishReason": "CONTENT_FILTERED"}},
+		})
+	}))
+	defer srv.Close()
+
+	old := nimInvokeURL
+	nimInvokeURL = srv.URL
+	defer func() { nimInvokeURL = old }()
+
+	_, err := generateNimImage(context.Background(), "test-key", "p")
+	if !errors.Is(err, errNimContentFiltered) {
+		t.Fatalf("expected content-filter classification, got %v", err)
+	}
+}
+
+func TestBuildImageTranslatePrompt(t *testing.T) {
+	tpl := "Translate into an SFW English prompt:\n\n%s"
+	got := buildImageTranslatePrompt(tpl, "고양이")
+	if got != "Translate into an SFW English prompt:\n\n고양이" {
+		t.Fatalf("placeholder substitution failed: %q", got)
+	}
+
+	// Template edited without a placeholder: request must still be included.
+	got = buildImageTranslatePrompt("Translate this:", "고양이")
+	if !strings.Contains(got, "Translate this:") || !strings.Contains(got, "고양이") {
+		t.Fatalf("missing-placeholder fallback failed: %q", got)
+	}
+
+	// Percent characters in the template must not break injection.
+	got = buildImageTranslatePrompt("100% safe. Prompt: %s", "고양이")
+	if !strings.Contains(got, "100% safe") || !strings.Contains(got, "고양이") {
+		t.Fatalf("percent handling failed: %q", got)
+	}
+}
+
 func TestRandomSeed(t *testing.T) {
 	s1, err := randomSeed()
 	if err != nil {

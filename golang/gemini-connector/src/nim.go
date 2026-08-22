@@ -27,7 +27,11 @@ const (
 	nimSteps          = 4
 )
 
-var nimClient = &http.Client{}
+// errNimContentFiltered marks responses rejected by NVIDIA's safety
+// guardrail (Cosmos-1.0). Callers classify it via errors.Is.
+var errNimContentFiltered = errors.New("nvidia safety filter blocked the request")
+
+var nimHTTPClient = &http.Client{}
 
 type nimImageRequest struct {
 	Prompt string `json:"prompt"`
@@ -86,7 +90,7 @@ func generateNimImage(ctx context.Context, apiKey string, prompt string) ([]byte
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := nimClient.Do(req)
+	resp, err := nimHTTPClient.Do(req)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			// Keep the chain (%w) so callers can classify timeouts via
@@ -120,6 +124,10 @@ func generateNimImage(ctx context.Context, apiKey string, prompt string) ([]byte
 		log.Printf("NIM response is not valid JSON: %v", err)
 		return nil, errors.New("NVIDIA 응답을 해석하지 못했습니다")
 	}
+	if nimContentFiltered(parsed) {
+		log.Printf("NIM generation blocked by NVIDIA safety guardrail (CONTENT_FILTERED)")
+		return nil, fmt.Errorf("%w (CONTENT_FILTERED)", errNimContentFiltered)
+	}
 	img := extractNimImageBytes(parsed)
 	if img == nil {
 		log.Printf("NIM response carried no image data: %.500s", readBodySnippet(strings.NewReader(mustJSON(parsed)), 1000))
@@ -134,6 +142,28 @@ func mustJSON(v any) string {
 		return "{}"
 	}
 	return string(b)
+}
+
+// nimContentFiltered reports whether the response indicates that NVIDIA's
+// safety guardrail blocked generation. The flag appears as finishReason /
+// finish_reason on artifacts or at the top level.
+func nimContentFiltered(body map[string]any) bool {
+	check := func(v any) bool {
+		s, ok := v.(string)
+		return ok && strings.Contains(strings.ToUpper(s), "CONTENT_FILTERED")
+	}
+	if arts, ok := body["artifacts"].([]any); ok {
+		for _, a := range arts {
+			m, ok := a.(map[string]any)
+			if !ok {
+				continue
+			}
+			if check(m["finishReason"]) || check(m["finish_reason"]) {
+				return true
+			}
+		}
+	}
+	return check(body["finishReason"]) || check(body["finish_reason"])
 }
 
 // extractNimImageBytes pulls the first base64-encoded asset out of a NIM

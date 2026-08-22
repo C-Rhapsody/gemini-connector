@@ -135,6 +135,8 @@ type Messages struct {
 	ImageGenerating        string `json:"ImageGenerating"`
 	ImageTimeout           string `json:"ImageTimeout"`
 	ImageFail              string `json:"ImageFail"`
+	ImageTranslateTemplate string `json:"ImageTranslateTemplate"`
+	ImageFiltered          string `json:"ImageFiltered"`
 }
 
 var defaultMessages = Messages{
@@ -158,6 +160,8 @@ var defaultMessages = Messages{
 	ImageGenerating:        "⏳ 이미지를 생성하고 있습니다…",
 	ImageTimeout:           "⏱️ NVIDIA 응답이 지연되어 시간 초과되었습니다. 잠시 후 다시 시도해 주세요.",
 	ImageFail:              "❌ 이미지 생성 실패: %v",
+	ImageTranslateTemplate: "Translate the following request into a detailed English prompt for a text-to-image model. Keep all visual details, style and composition. Ensure the result is safe-for-work: avoid explicit, sexual or graphic content, and phrase body descriptions tastefully. Reply with ONLY the English prompt text - no quotes, no explanations:\n\n%s",
+	ImageFiltered:          "🚫 NVIDIA 안전 필터가 이 요청을 차단했습니다. 프롬프트 표현을 바꿔 다시 시도해 주세요.",
 }
 
 // applyDefaults fills fields missing from an older messages.json so that new
@@ -223,6 +227,12 @@ func (m *Messages) applyDefaults() {
 	}
 	if m.ImageFail == "" {
 		m.ImageFail = d.ImageFail
+	}
+	if m.ImageTranslateTemplate == "" {
+		m.ImageTranslateTemplate = d.ImageTranslateTemplate
+	}
+	if m.ImageFiltered == "" {
+		m.ImageFiltered = d.ImageFiltered
 	}
 }
 
@@ -931,9 +941,7 @@ func imageCommand(ctx context.Context, cfg *Config, adapter Messenger, chatID st
 	stop := adapter.StartTyping(chatID)
 	defer stop()
 
-	translatePrompt := "Translate the following request into a detailed English prompt for a text-to-image model. " +
-		"Keep all visual details, style and composition. Reply with ONLY the English prompt text - no quotes, no explanations.\n\n" + prompt
-	translated, err := executeAgy(ctx, translatePrompt, cfg.ConversationID(), AgyCallOptions{BypassQuotaGate: true})
+	translated, err := executeAgy(ctx, buildImageTranslatePrompt(msgs.ImageTranslateTemplate, prompt), cfg.ConversationID(), AgyCallOptions{BypassQuotaGate: true})
 	if err != nil {
 		if ctx.Err() != nil {
 			log.Printf("/image cancelled by /stop during translation")
@@ -953,6 +961,10 @@ func imageCommand(ctx context.Context, cfg *Config, adapter Messenger, chatID st
 	if err != nil {
 		if ctx.Err() != nil {
 			log.Printf("/image cancelled by /stop during generation")
+			return
+		}
+		if errors.Is(err, errNimContentFiltered) {
+			adapter.Send(chatID, msgs.ImageFiltered, replyOpt)
 			return
 		}
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -992,6 +1004,16 @@ func imageCommand(ctx context.Context, cfg *Config, adapter Messenger, chatID st
 	} else {
 		log.Printf("Image delivered and local copy removed: %s", path)
 	}
+}
+
+// buildImageTranslatePrompt injects the user request into the configurable
+// translation template. Templates missing the %s placeholder get the request
+// appended, so an edited template can never silently drop it.
+func buildImageTranslatePrompt(template string, request string) string {
+	if !strings.Contains(template, "%s") {
+		template += "\n\n%s"
+	}
+	return strings.ReplaceAll(template, "%s", request)
 }
 
 // cleanTranslatedPrompt strips whitespace and wrapping quotes that agy may
