@@ -38,6 +38,9 @@ type Config struct {
 	consecUrlFetch    int
 	lastInvalidArgs   string
 	consecInvalidArgs int
+	lastGenericErr    string
+	consecGenericErr  int
+	lastGenericReset  time.Time
 	resetting         bool
 }
 
@@ -47,19 +50,30 @@ func (c *Config) ConversationID() string {
 	return c.AgyConversationID
 }
 
+// genericResetMinInterval limits how often repeated unknown errors may trigger
+// an automatic session reset, preventing reset cascades when many messages
+// fail for the same environmental reason.
+const genericResetMinInterval = 10 * time.Minute
+
 // recordStuckError tracks consecutive identical errors per category and
 // reports when the threshold for automatic conversation recovery is reached.
-// Categories: "url_fetch" (repeated URL fetch failures) and "invalid_args"
-// (repeated conversation-state validation failures).
+// Categories: "url_fetch" (repeated URL fetch failures), "invalid_args"
+// (repeated conversation-state validation failures) and "generic" (any other
+// repeating error_status). Generic resets are additionally rate-limited by
+// genericResetMinInterval because the failing prompt is not replayed and the
+// underlying cause is often environmental rather than session state.
 func (c *Config) recordStuckError(category string, detail string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	var last *string
 	var count *int
-	if category == "url_fetch" {
+	switch category {
+	case "url_fetch":
 		last, count = &c.lastUrlFetch, &c.consecUrlFetch
-	} else {
+	case "generic":
+		last, count = &c.lastGenericErr, &c.consecGenericErr
+	default:
 		last, count = &c.lastInvalidArgs, &c.consecInvalidArgs
 	}
 	if detail != "" && detail == *last {
@@ -69,6 +83,13 @@ func (c *Config) recordStuckError(category string, detail string) bool {
 		*count = 1
 	}
 	if *count >= 2 && !c.resetting {
+		if category == "generic" {
+			if time.Since(c.lastGenericReset) < genericResetMinInterval {
+				*count = 1 // rate-limited: start counting over instead of firing
+				return false
+			}
+			c.lastGenericReset = time.Now()
+		}
 		c.resetting = true
 		return true
 	}
@@ -83,6 +104,8 @@ func (c *Config) applyNewConversation(id string) {
 	c.consecUrlFetch = 0
 	c.lastInvalidArgs = ""
 	c.consecInvalidArgs = 0
+	c.lastGenericErr = ""
+	c.consecGenericErr = 0
 	c.resetting = false
 }
 
@@ -697,6 +720,15 @@ func main() {
 									return
 								}
 								adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorSystemResponse, detail+invalidArgsHint), replyOpt)
+								return
+							}
+							// Any other repeating error_status: fall back to a fresh
+							// session WITHOUT replaying the failing prompt — such
+							// errors are often environmental or model-behavioural,
+							// so replaying would just burn quota in a loop.
+							if cfg.recordStuckError("generic", detail) {
+								log.Printf("Repeated error detected, auto-resetting session without replay")
+								resetConversation(ctx, cfg, adapter, m.ChatID, m.MessageID, "", msgs)
 								return
 							}
 							adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorSystemResponse, detail), replyOpt)

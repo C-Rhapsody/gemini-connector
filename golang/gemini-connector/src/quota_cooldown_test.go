@@ -218,6 +218,34 @@ func TestQuotaBlockErr(t *testing.T) {
 	}
 }
 
+func TestRecordStuckError_GenericTriggersAndRateLimits(t *testing.T) {
+	cfg := &Config{}
+	if cfg.recordStuckError("generic", "boom") {
+		t.Fatal("first occurrence must not trigger")
+	}
+	if !cfg.recordStuckError("generic", "boom") {
+		t.Fatal("second identical generic error should trigger")
+	}
+
+	// Simulate the auto-reset completing: counters clear but the reset
+	// timestamp persists, so an immediate repeat is rate-limited.
+	cfg.applyNewConversation("new-id")
+	if cfg.recordStuckError("generic", "boom") || cfg.recordStuckError("generic", "boom") {
+		t.Fatalf("generic reset within %s must be rate-limited", genericResetMinInterval)
+	}
+	if cfg.consecGenericErr != 1 {
+		t.Fatalf("rate-limited counter should restart at 1, got %d", cfg.consecGenericErr)
+	}
+
+	// After the interval passes, the next pair triggers again.
+	cfg.mu.Lock()
+	cfg.lastGenericReset = time.Now().Add(-2 * genericResetMinInterval)
+	cfg.mu.Unlock()
+	if !cfg.recordStuckError("generic", "boom") {
+		t.Fatal("trigger expected once the rate-limit interval has passed")
+	}
+}
+
 func TestRecordStuckError_CategoriesAreIndependent(t *testing.T) {
 	cfg := &Config{}
 	if cfg.recordStuckError("invalid_args", "boom") {
@@ -231,7 +259,8 @@ func TestRecordStuckError_CategoriesAreIndependent(t *testing.T) {
 	}
 	cfg.applyNewConversation("new-id")
 	if cfg.lastInvalidArgs != "" || cfg.consecInvalidArgs != 0 ||
-		cfg.lastUrlFetch != "" || cfg.consecUrlFetch != 0 {
+		cfg.lastUrlFetch != "" || cfg.consecUrlFetch != 0 ||
+		cfg.lastGenericErr != "" || cfg.consecGenericErr != 0 {
 		t.Fatal("applyNewConversation must clear stuck counters")
 	}
 	if cfg.recordStuckError("url_fetch", "fetch failed") {
