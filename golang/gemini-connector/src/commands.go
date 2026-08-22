@@ -28,7 +28,11 @@ func statusConversation(cfg *Config, adapter Messenger, chatID string, replyTo i
 		return
 	}
 	turns := loadTranscript(convID)
-	adapter.Send(chatID, fmt.Sprintf("📋 현재 agy 대화\n\n대화 ID: %s\n기록된 턴 수: %d", convID, len(turns)), SendOptions{ReplyToMessageID: replyTo})
+	text := fmt.Sprintf("📋 현재 agy 대화\n\n대화 ID: %s\n기록된 턴 수: %d", convID, len(turns))
+	if QuotaActive() {
+		text += fmt.Sprintf("\n⏳ quota 제한: %s 후 해제", formatQuotaDuration(QuotaRemaining()))
+	}
+	adapter.Send(chatID, text, SendOptions{ReplyToMessageID: replyTo})
 }
 
 func summaryConversation(cfg *Config, adapter Messenger, chatID string, replyTo int, msgs *Messages) {

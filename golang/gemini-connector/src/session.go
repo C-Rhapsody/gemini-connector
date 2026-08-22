@@ -209,6 +209,11 @@ func createNewConversationRuntime(ctx context.Context) (string, error) {
 // sends the given prompt as its first turn, returning the new conversation ID
 // and the agy response text. Cancelling ctx stops the underlying CLI.
 func createNewConversationRuntimeWithPrompt(ctx context.Context, prompt string) (string, string, error) {
+	// Respect the quota cooldown: creating a conversation also calls agy.
+	if QuotaActive() {
+		return "", "", &AgyError{Type: "quota_cooldown", Detail: QuotaRefreshedDetail()}
+	}
+
 	cmd := exec.CommandContext(ctx, "agy", "--output-format", "json", "--dangerously-skip-permissions", "--print-timeout", "5m")
 	configureAgyProcess(cmd)
 	cmd.Cancel = func() error { return killAgyProcess(cmd.Process) }

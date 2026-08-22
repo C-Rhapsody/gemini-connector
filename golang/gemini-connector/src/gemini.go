@@ -42,6 +42,13 @@ func (e *AgyError) Error() string {
 }
 
 func executeAgy(ctx context.Context, prompt string, conversationID string) (string, error) {
+	// While quota cooldown is active, do not spawn agy at all; reply with
+	// the stored error text whose time fields show the remaining time.
+	if QuotaActive() {
+		log.Printf("agy call blocked by quota cooldown (%s remaining)", formatQuotaDuration(QuotaRemaining()))
+		return "", &AgyError{Type: "quota_cooldown", Detail: QuotaRefreshedDetail()}
+	}
+
 	log.Printf("Triggering agy CLI for message (via Stdin): %s", truncateString(prompt, 50))
 
 	args := []string{

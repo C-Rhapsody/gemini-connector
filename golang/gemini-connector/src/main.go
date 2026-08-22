@@ -32,11 +32,13 @@ type Config struct {
 	TeamsChatID       string
 	AgyConversationID string
 
-	mu             sync.Mutex
-	envPath        string
-	lastErrDetail  string
-	consecErrCount int
-	resetting      bool
+	mu                sync.Mutex
+	envPath           string
+	lastUrlFetch      string
+	consecUrlFetch    int
+	lastInvalidArgs   string
+	consecInvalidArgs int
+	resetting         bool
 }
 
 func (c *Config) ConversationID() string {
@@ -45,19 +47,28 @@ func (c *Config) ConversationID() string {
 	return c.AgyConversationID
 }
 
-// recordUrlFetchError tracks consecutive identical URL fetch failures.
-// It returns true when the same failure repeats twice and a reset is not
-// already in progress.
-func (c *Config) recordUrlFetchError(detail string) bool {
+// recordStuckError tracks consecutive identical errors per category and
+// reports when the threshold for automatic conversation recovery is reached.
+// Categories: "url_fetch" (repeated URL fetch failures) and "invalid_args"
+// (repeated conversation-state validation failures).
+func (c *Config) recordStuckError(category string, detail string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if detail != "" && detail == c.lastErrDetail {
-		c.consecErrCount++
+
+	var last *string
+	var count *int
+	if category == "url_fetch" {
+		last, count = &c.lastUrlFetch, &c.consecUrlFetch
 	} else {
-		c.lastErrDetail = detail
-		c.consecErrCount = 1
+		last, count = &c.lastInvalidArgs, &c.consecInvalidArgs
 	}
-	if c.consecErrCount >= 2 && !c.resetting {
+	if detail != "" && detail == *last {
+		*count++
+	} else {
+		*last = detail
+		*count = 1
+	}
+	if *count >= 2 && !c.resetting {
 		c.resetting = true
 		return true
 	}
@@ -68,10 +79,16 @@ func (c *Config) applyNewConversation(id string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.AgyConversationID = id
-	c.lastErrDetail = ""
-	c.consecErrCount = 0
+	c.lastUrlFetch = ""
+	c.consecUrlFetch = 0
+	c.lastInvalidArgs = ""
+	c.consecInvalidArgs = 0
 	c.resetting = false
 }
+
+// invalidArgsHint is appended to the first invalid-arguments error so the
+// user knows the connector will self-heal on a repeat.
+const invalidArgsHint = "\n\n(동일 오류가 반복되면 새 대화로 자동 전환됩니다. 즉시 전환하려면 /new)"
 
 type Messages struct {
 	StartupWelcome         string `json:"StartupWelcome"`
@@ -507,6 +524,11 @@ func main() {
 		log.Fatalf("Config Error: %v", err)
 	}
 
+	// Restore a persisted quota cooldown across restarts.
+	if rem := RestoreQuotaCooldown(); rem > 0 {
+		log.Printf("Quota cooldown restored from disk: %s remaining", formatQuotaDuration(rem))
+	}
+
 	if cfg.AgyConversationID == "" {
 		log.Println("=========================================================")
 		log.Println("WARNING: AGY_CONVERSATION_ID is missing in .env")
@@ -616,6 +638,14 @@ func main() {
 				return
 			}
 
+			// Fast path during quota cooldown: reply immediately without
+			// touching the turn queue. Jobs that are already queued get the
+			// same treatment inside executeAgy.
+			if QuotaActive() {
+				adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorSystemResponse, QuotaRefreshedDetail()), replyOpt)
+				return
+			}
+
 			ahead := turnQ.Enqueue(func(ctx context.Context) {
 				stop := adapter.StartTyping(m.ChatID)
 				defer stop()
@@ -638,11 +668,30 @@ func main() {
 							adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorCLIFailure, ae.Err, ae.Detail), replyOpt)
 						case "json_parse_fail":
 							adapter.Send(m.ChatID, msgs.ErrorJSONParseFail, replyOpt)
+						case "quota_cooldown":
+							adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorSystemResponse, ae.Detail), replyOpt)
 						case "error_status":
 							detail := ae.Detail
-							if extractUrlFetchFailure(detail) != "" && cfg.recordUrlFetchError(detail) {
+							// 429 quota exhaustion: start/refresh cooldown and
+							// answer with the decremented error text.
+							if QuotaCapture(detail) {
+								adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorSystemResponse, QuotaRefreshedDetail()), replyOpt)
+								return
+							}
+							if extractUrlFetchFailure(detail) != "" && cfg.recordStuckError("url_fetch", detail) {
 								log.Printf("Stuck conversation detected (repeated URL fetch failure), resetting session")
 								resetConversation(ctx, cfg, adapter, m.ChatID, m.MessageID, m.Content, msgs)
+								return
+							}
+							// Conversation-state validation failures poison every
+							// subsequent turn; auto-reset after a repeat.
+							if strings.Contains(detail, "invalid arguments") {
+								if cfg.recordStuckError("invalid_args", detail) {
+									log.Printf("Repeated invalid-arguments errors, auto-resetting session")
+									resetConversation(ctx, cfg, adapter, m.ChatID, m.MessageID, m.Content, msgs)
+									return
+								}
+								adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorSystemResponse, detail+invalidArgsHint), replyOpt)
 								return
 							}
 							adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorSystemResponse, detail), replyOpt)
@@ -652,6 +701,8 @@ func main() {
 					}
 					return
 				}
+
+				QuotaClear()
 
 				if ctx.Err() != nil {
 					log.Printf("agy turn cancelled by /stop (after completion): %s", truncateString(m.Content, 50))
@@ -700,6 +751,11 @@ func resetConversation(ctx context.Context, cfg *Config, adapter Messenger, chat
 	if err != nil {
 		if ctx.Err() != nil {
 			log.Printf("Conversation reset cancelled by /stop")
+			return
+		}
+		if ae, ok := err.(*AgyError); ok && ae.Type == "quota_cooldown" {
+			// Creating a conversation is an agy call too; respect cooldown.
+			adapter.Send(chatID, fmt.Sprintf(msgs.ErrorSystemResponse, QuotaRefreshedDetail()), replyOpt)
 			return
 		}
 		log.Printf("Failed to create new conversation: %v", err)
