@@ -54,6 +54,7 @@ func (t *TelegramAdapter) Init() error {
 		{Command: "help", Description: "도움말 및 명령어 목록"},
 		{Command: "new", Description: "새 agy 대화 세션 시작"},
 		{Command: "reset", Description: "/new 의 별칭"},
+		{Command: "clear", Description: "대화 기록을 지우고 새 세션 시작"},
 		{Command: "stop", Description: "진행 중인 agy 작업 즉시 중지"},
 		{Command: "status", Description: "현재 대화 정보"},
 		{Command: "summary", Description: "최근 대화 미리보기"},
@@ -362,6 +363,8 @@ func (t *TelegramAdapter) handleIncomingMessage(msg *tgbotapi.Message) {
 				Command:   "/reset",
 				MessageID: msg.MessageID,
 			}
+		case "clear":
+			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/clear", MessageID: msg.MessageID}
 		case "stop":
 			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/stop", MessageID: msg.MessageID}
 		case "status":

@@ -110,7 +110,7 @@ type Messages struct {
 
 var defaultMessages = Messages{
 	StartupWelcome:         "🔔 agy 텔레그램 커넥터 가동 완료. 메시지를 보내면 agy가 처리합니다.",
-	CommandStartHelp:       "agy 텔레그램 커넥터 가동 중. 메시지를 보내면 agy가 처리합니다.\n\n사용 가능 명령어:\n/help - 도움말 및 명령어 목록\n/new (또는 /reset) - 이전 대화를 요약해 새 agy 대화 세션으로 전환\n/stop - 진행 중인 agy 작업과 대기열을 즉시 중지\n/status - 현재 대화 ID와 기록된 턴 수 표시\n/summary - 최근 대화 내용 미리보기\n/list - 캐시된 agy 대화 목록\n/switch <ID> - 지정한 대화로 전환\n/version - 커넥터 및 agy 버전",
+	CommandStartHelp:       "agy 텔레그램 커넥터 가동 중. 메시지를 보내면 agy가 처리합니다.\n\n사용 가능 명령어:\n/help - 도움말 및 명령어 목록\n/new (또는 /reset) - 이전 대화를 요약해 새 agy 대화 세션으로 전환\n/clear - 대화 기록을 모두 지우고 완전히 새 세션 시작 (요약 이월 없음)\n/stop - 진행 중인 agy 작업과 대기열을 즉시 중지\n/status - 현재 대화 ID와 기록된 턴 수 표시\n/summary - 최근 대화 내용 미리보기\n/list - 캐시된 agy 대화 목록\n/switch <ID> - 지정한 대화로 전환\n/version - 커넥터 및 agy 버전",
 	CommandUnknown:         "알 수 없는 명령어입니다. /help 를 입력하면 사용 가능한 명령어를 확인할 수 있습니다.",
 	ErrorMediaNotSupported: "⚠️ 현재 시스템은 동영상, 음성 및 일반 문서 파일 분석을 지원하지 않습니다. 텍스트 및 이미지 파일만 전송해 주십시오.",
 	ErrorMediaDownloadFail: "미디어 다운로드에 실패했습니다.",
@@ -614,6 +614,11 @@ func main() {
 					resetConversation(ctx, cfg, adapter, m.ChatID, m.MessageID, "", msgs)
 				})
 				return
+			case "/clear":
+				enqueueTurn(turnQ, adapter, m.ChatID, m.MessageID, msgs, func(ctx context.Context) {
+					clearConversation(ctx, cfg, adapter, m.ChatID, m.MessageID, msgs)
+				})
+				return
 			case "/status":
 				statusConversation(cfg, adapter, m.ChatID, m.MessageID, msgs)
 				return
@@ -793,6 +798,46 @@ func resetConversation(ctx context.Context, cfg *Config, adapter Messenger, chat
 	}
 
 	adapter.Send(chatID, notice, replyOpt)
+}
+
+// clearConversation deletes the current session's artifacts (DB, brain
+// folder, transcript) and starts a completely fresh conversation without any
+// summary carry-over. The new session is created first; the old artifacts are
+// only removed after success, so a failure (or /stop cancellation) leaves the
+// existing session intact.
+func clearConversation(ctx context.Context, cfg *Config, adapter Messenger, chatID string, replyTo int, msgs *Messages) {
+	oldID := cfg.ConversationID()
+	log.Printf("Clearing conversation %s (no summary carry-over)", truncateString(oldID, 8))
+
+	replyOpt := SendOptions{ReplyToMessageID: replyTo}
+
+	bootstrap := "This connector bridges Telegram to agy. Reply only with 'agy Connector Ready.'"
+	newID, _, err := createNewConversationRuntimeWithPrompt(ctx, bootstrap)
+	if err != nil {
+		if ctx.Err() != nil {
+			log.Printf("Conversation clear cancelled by /stop")
+			return
+		}
+		if ae, ok := err.(*AgyError); ok && ae.Type == "quota_cooldown" {
+			adapter.Send(chatID, fmt.Sprintf(msgs.ErrorSystemResponse, QuotaRefreshedDetail()), replyOpt)
+			return
+		}
+		log.Printf("Failed to create replacement conversation: %v", err)
+		adapter.Send(chatID, fmt.Sprintf("⚠️ 새 세션 생성에 실패했습니다. 기존 세션이 유지됩니다: %v", err), replyOpt)
+		return
+	}
+
+	if err := updateEnvKey(cfg.envPath, "AGY_CONVERSATION_ID", newID); err != nil {
+		log.Printf("Failed to update .env with new conversation ID: %v", err)
+	}
+	cfg.applyNewConversation(newID)
+
+	if oldID != "" {
+		deleteConversationArtifacts(oldID)
+		deleteTranscript(oldID)
+	}
+	log.Printf("Conversation cleared. New conversation ID: %s", newID)
+	adapter.Send(chatID, fmt.Sprintf("🗑️ 대화 기록을 모두 지우고 새 세션을 시작했습니다. (새 세션 ID: %s)", truncateString(newID, 8)), replyOpt)
 }
 
 // deleteConversationArtifacts removes the old conversation's on-disk state

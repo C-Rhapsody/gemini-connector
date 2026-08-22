@@ -32,6 +32,8 @@ The following `/` commands are available on the Telegram channel and are automat
 |---|---|
 | `/start`, `/help` | Help and list of available commands |
 | `/new` (or `/reset`) | Summarize the previous conversation and switch to a fresh agy session |
+| `/clear` | Delete all conversation artifacts (DB, brain, transcript) and start a completely fresh session without summary carry-over |
+| `/stop` | Immediately cancel the running agy job and clear the queue |
 | `/status` | Show the current conversation ID and recorded turn count |
 | `/summary` | Preview recent conversation turns (no agy invocation) |
 | `/list` | List agy conversations found in the local cache |
