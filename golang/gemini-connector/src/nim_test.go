@@ -84,8 +84,9 @@ func TestRandomSeed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s1 <= 0 || s2 <= 0 {
-		t.Fatalf("seeds must be positive: %d %d", s1, s2)
+	const maxSeed = int64(4294967295) // NIM validates seed < 2^32
+	if s1 < 0 || s1 > maxSeed || s2 < 0 || s2 > maxSeed {
+		t.Fatalf("seeds must be in [0, %d]: %d %d", maxSeed, s1, s2)
 	}
 }
 

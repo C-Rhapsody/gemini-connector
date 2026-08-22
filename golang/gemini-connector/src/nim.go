@@ -37,14 +37,15 @@ type nimImageRequest struct {
 	Steps  int    `json:"steps"`
 }
 
-// randomSeed returns a fresh non-negative seed so identical prompts yield
-// different images on every call.
+// randomSeed returns a fresh seed so identical prompts yield different
+// images on every call. NIM validates seed < 2^32, so only a uint32 range is
+// produced.
 func randomSeed() (int64, error) {
-	var b [8]byte
+	var b [4]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return 0, err
 	}
-	return int64(binary.BigEndian.Uint64(b[:]) & 0x7FFFFFFFFFFFFFFF), nil
+	return int64(binary.BigEndian.Uint32(b[:])), nil
 }
 
 // readBodySnippet drains up to max bytes of r for logging / short reports.
