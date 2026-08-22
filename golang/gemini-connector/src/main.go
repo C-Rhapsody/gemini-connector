@@ -752,7 +752,8 @@ func resetConversation(ctx context.Context, cfg *Config, adapter Messenger, chat
 		summaryPrompt = "This connector bridges Telegram to agy. Reply only with 'agy Connector Ready.'"
 	}
 
-	newID, _, err := createNewConversationRuntimeWithPrompt(ctx, summaryPrompt)
+	// Commands and self-healing outrank the quota cooldown (see /clear).
+	newID, _, err := createNewConversationRuntimeWithPrompt(ctx, summaryPrompt, AgyCallOptions{BypassQuotaGate: true})
 	if err != nil {
 		if ctx.Err() != nil {
 			log.Printf("Conversation reset cancelled by /stop")
@@ -774,6 +775,7 @@ func resetConversation(ctx context.Context, cfg *Config, adapter Messenger, chat
 	}
 	cfg.applyNewConversation(newID)
 	log.Printf("Conversation reset complete. New conversation ID: %s", newID)
+	QuotaClear()
 
 	deleteConversationArtifacts(oldID)
 	deleteTranscript(oldID)
@@ -781,7 +783,7 @@ func resetConversation(ctx context.Context, cfg *Config, adapter Messenger, chat
 	notice := fmt.Sprintf("⚠️ 이전 대화를 요약해 새 세션으로 전환했습니다. (새 세션 ID: %s)", truncateString(newID, 8))
 
 	if replayPrompt != "" {
-		response, rerr := executeAgy(ctx, replayPrompt, newID)
+		response, rerr := executeAgy(ctx, replayPrompt, newID, AgyCallOptions{BypassQuotaGate: true})
 		if rerr == nil && response != "" && ctx.Err() == nil {
 			appendTranscript(newID, "user", replayPrompt)
 			appendTranscript(newID, "assistant", response)
@@ -811,8 +813,10 @@ func clearConversation(ctx context.Context, cfg *Config, adapter Messenger, chat
 
 	replyOpt := SendOptions{ReplyToMessageID: replyTo}
 
+	// User commands outrank the quota cooldown: attempt execution even while
+	// it is active. A repeated 429 is captured back into the cooldown.
 	bootstrap := "This connector bridges Telegram to agy. Reply only with 'agy Connector Ready.'"
-	newID, _, err := createNewConversationRuntimeWithPrompt(ctx, bootstrap)
+	newID, _, err := createNewConversationRuntimeWithPrompt(ctx, bootstrap, AgyCallOptions{BypassQuotaGate: true})
 	if err != nil {
 		if ctx.Err() != nil {
 			log.Printf("Conversation clear cancelled by /stop")
@@ -837,6 +841,9 @@ func clearConversation(ctx context.Context, cfg *Config, adapter Messenger, chat
 		deleteTranscript(oldID)
 	}
 	log.Printf("Conversation cleared. New conversation ID: %s", newID)
+	// The successful agy call proves quota is available again; drop any stale
+	// cooldown so regular chat turns are not blocked unnecessarily.
+	QuotaClear()
 	adapter.Send(chatID, fmt.Sprintf("🗑️ 대화 기록을 모두 지우고 새 세션을 시작했습니다. (새 세션 ID: %s)", truncateString(newID, 8)), replyOpt)
 }
 

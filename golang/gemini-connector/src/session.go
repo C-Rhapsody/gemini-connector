@@ -208,10 +208,15 @@ func createNewConversationRuntime(ctx context.Context) (string, error) {
 // createNewConversationRuntimeWithPrompt creates a fresh agy conversation and
 // sends the given prompt as its first turn, returning the new conversation ID
 // and the agy response text. Cancelling ctx stops the underlying CLI.
-func createNewConversationRuntimeWithPrompt(ctx context.Context, prompt string) (string, string, error) {
-	// Respect the quota cooldown: creating a conversation also calls agy.
-	if QuotaActive() {
-		return "", "", &AgyError{Type: "quota_cooldown", Detail: QuotaRefreshedDetail()}
+func createNewConversationRuntimeWithPrompt(ctx context.Context, prompt string, opts ...AgyCallOptions) (string, string, error) {
+	var o AgyCallOptions
+	if len(opts) > 0 {
+		o = opts[0]
+	}
+	// Respect the quota cooldown: creating a conversation also calls agy,
+	// unless the caller explicitly bypasses it (user commands).
+	if ae := quotaBlockErr(o.BypassQuotaGate); ae != nil {
+		return "", "", ae
 	}
 
 	cmd := exec.CommandContext(ctx, "agy", "--output-format", "json", "--dangerously-skip-permissions", "--print-timeout", "5m")
@@ -230,11 +235,17 @@ func createNewConversationRuntimeWithPrompt(ctx context.Context, prompt string) 
 		ConversationID string `json:"conversation_id"`
 		Status         string `json:"status"`
 		Response       string `json:"response"`
+		Error          string `json:"error,omitempty"`
 	}
 	if err := json.Unmarshal(out, &result); err != nil {
 		return "", "", fmt.Errorf("failed to parse agy response: %w (raw: %s)", err, string(out))
 	}
 	if result.ConversationID == "" {
+		// A bypassed attempt can still hit the exhausted quota; capture the
+		// fresh reset time so the cooldown stays accurate and report it.
+		if QuotaCapture(result.Error) {
+			return "", "", &AgyError{Type: "quota_cooldown", Detail: QuotaRefreshedDetail()}
+		}
 		return "", "", fmt.Errorf("agy did not return a conversation_id (status: %s)", result.Status)
 	}
 

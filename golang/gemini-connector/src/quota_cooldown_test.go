@@ -201,6 +201,23 @@ func TestExecuteAgy_BlockedDuringCooldown(t *testing.T) {
 	}
 }
 
+func TestQuotaBlockErr(t *testing.T) {
+	resetQuotaState(t)
+	if quotaBlockErr(false) != nil {
+		t.Fatal("inactive cooldown must not block")
+	}
+	if !QuotaCapture(makeQuotaDetail(2 * time.Hour)) {
+		t.Fatal("capture failed")
+	}
+	if quotaBlockErr(true) != nil {
+		t.Fatal("bypass must be allowed even during active cooldown")
+	}
+	ae := quotaBlockErr(false)
+	if ae == nil || ae.Type != "quota_cooldown" {
+		t.Fatalf("active cooldown must block with quota_cooldown error, got %#v", ae)
+	}
+}
+
 func TestRecordStuckError_CategoriesAreIndependent(t *testing.T) {
 	cfg := &Config{}
 	if cfg.recordStuckError("invalid_args", "boom") {

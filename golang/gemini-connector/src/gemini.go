@@ -41,14 +41,34 @@ func (e *AgyError) Error() string {
 	return fmt.Sprintf("%s: %s", e.Type, e.Detail)
 }
 
-func executeAgy(ctx context.Context, prompt string, conversationID string) (string, error) {
+// AgyCallOptions tweaks individual agy invocations.
+type AgyCallOptions struct {
+	// BypassQuotaGate lets the call proceed even while a 429 quota cooldown
+	// is active. Used for explicit commands (/reset, /clear), which should
+	// always attempt execution; regular chat turns keep being gated.
+	BypassQuotaGate bool
+}
+
+// quotaBlockErr returns the rejection error for gated calls during an active
+// quota cooldown, or nil when the call may proceed.
+func quotaBlockErr(bypass bool) *AgyError {
+	if bypass || !QuotaActive() {
+		return nil
+	}
+	log.Printf("agy call blocked by quota cooldown (%s remaining)", formatQuotaDuration(QuotaRemaining()))
+	return &AgyError{Type: "quota_cooldown", Detail: QuotaRefreshedDetail()}
+}
+
+func executeAgy(ctx context.Context, prompt string, conversationID string, opts ...AgyCallOptions) (string, error) {
+	var o AgyCallOptions
+	if len(opts) > 0 {
+		o = opts[0]
+	}
 	// While quota cooldown is active, do not spawn agy at all; reply with
 	// the stored error text whose time fields show the remaining time.
-	if QuotaActive() {
-		log.Printf("agy call blocked by quota cooldown (%s remaining)", formatQuotaDuration(QuotaRemaining()))
-		return "", &AgyError{Type: "quota_cooldown", Detail: QuotaRefreshedDetail()}
+	if ae := quotaBlockErr(o.BypassQuotaGate); ae != nil {
+		return "", ae
 	}
-
 	log.Printf("Triggering agy CLI for message (via Stdin): %s", truncateString(prompt, 50))
 
 	args := []string{
