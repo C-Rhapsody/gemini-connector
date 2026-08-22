@@ -160,7 +160,7 @@ var defaultMessages = Messages{
 	ImageGenerating:        "⏳ 이미지를 생성하고 있습니다…",
 	ImageTimeout:           "⏱️ NVIDIA 응답이 지연되어 시간 초과되었습니다. 잠시 후 다시 시도해 주세요.",
 	ImageFail:              "❌ 이미지 생성 실패: %v",
-	ImageTranslateTemplate: "Translate the following request into a detailed English prompt for a text-to-image model. Keep all visual details, style and composition. Ensure the result is safe-for-work: avoid explicit, sexual or graphic content, and phrase body descriptions tastefully. Reply with ONLY the English prompt text - no quotes, no explanations:\n\n%s",
+	ImageTranslateTemplate: "Translate the following request into a detailed English prompt for a text-to-image model. Keep all visual details, style and composition. Reply with ONLY the English prompt text - no quotes, no explanations:\n\n%s",
 	ImageFiltered:          "🚫 NVIDIA 안전 필터가 이 요청을 차단했습니다. 프롬프트 표현을 바꿔 다시 시도해 주세요.",
 }
 
