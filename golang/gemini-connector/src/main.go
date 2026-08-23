@@ -747,6 +747,18 @@ func main() {
 								adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorSystemResponse, QuotaRefreshedDetail()), replyOpt)
 								return
 							}
+							// agy occasionally reports ERROR because an
+							// intermediate tool failed (e.g. its built-in
+							// grep_search exiting non-zero) while the model
+							// still finished the turn; the brain transcript
+							// then holds the real answer.
+							if salvaged := salvageTurnResponse(cfg.ConversationID(), m.Content, turnStart); salvaged != "" {
+								log.Printf("agy reported an error (%s) but the turn completed; delivering the recovered response", truncateString(detail, 80))
+								appendTranscript(cfg.ConversationID(), "user", m.Content)
+								appendTranscript(cfg.ConversationID(), "assistant", salvaged)
+								adapter.Send(m.ChatID, salvaged, SendOptions{ReplyToMessageID: m.MessageID, AttachAfter: turnStart})
+								return
+							}
 							if extractUrlFetchFailure(detail) != "" && cfg.recordStuckError("url_fetch", detail) {
 								log.Printf("Stuck conversation detected (repeated URL fetch failure), resetting session")
 								resetConversation(ctx, cfg, adapter, m.ChatID, m.MessageID, m.Content, msgs)
