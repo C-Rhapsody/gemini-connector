@@ -121,6 +121,20 @@ cd golang/gemini-connector/bin
 ```
 (Tip: Use `Start-Process` (Windows) or `nohup` (Linux) or other background execution tools to keep the connector running continuously without blocking the foreground shell.)
 
+### Run Options
+
+| Option | Description |
+| --- | --- |
+| `--port <number>` | Port used for the single-instance lock (default: 49152) |
+| `--env <path>` | Explicit location of the `.env` file (default: `../src/.env` relative to the executable) |
+
+A relative `--env` path is resolved against the current working directory. If the given file does not exist yet, the setup wizard creates it there.
+
+```bash
+./gemini-connector_windows_x64.exe --env C:\configs\gemini-connector.env
+./gemini-connector_linux_x64 --env /etc/gemini-connector/.env
+```
+
 ## ⚠️ Disclaimer and Risk Warning
 
 This connector explicitly executes **agy with the `--dangerously-skip-permissions` flag** to achieve full automation and convenience. This means that all tool invocations and local file system controls (modifications, deletions, etc.) determined by the AI will be executed immediately **without requiring any prior user confirmation**.

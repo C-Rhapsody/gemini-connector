@@ -261,14 +261,31 @@ func loadMessages(exeDir string) (*Messages, error) {
 	return &msgs, nil
 }
 
-func loadConfig() (*Config, error) {
+// resolveEnvPath determines which .env file the connector uses. An empty
+// flag value keeps the historical default next to the executable; explicit
+// relative paths are interpreted against the current working directory,
+// like any other CLI argument.
+func resolveEnvPath(flagValue string, exeDir string) string {
+	if flagValue == "" {
+		return filepath.Join(exeDir, "..", "src", ".env")
+	}
+	if filepath.IsAbs(flagValue) {
+		return filepath.Clean(flagValue)
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return filepath.Clean(flagValue)
+	}
+	return filepath.Join(cwd, flagValue)
+}
+
+func loadConfig(envFlag string) (*Config, error) {
 	exePath, err := os.Executable()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get executable path: %v", err)
 	}
-	exeDir := filepath.Dir(exePath)
-	srcDir := filepath.Join(exeDir, "..", "src")
-	envPath := filepath.Join(srcDir, ".env")
+	envPath := resolveEnvPath(envFlag, filepath.Dir(exePath))
+	log.Printf("Using .env file: %s", envPath)
 
 	_ = godotenv.Overload(envPath)
 
@@ -524,6 +541,7 @@ func fanIn(channels ...<-chan InternalMessage) <-chan InternalMessage {
 
 func main() {
 	portPtr := flag.Int("port", 49152, "Port number to use for single instance lock")
+	envPtr := flag.String("env", "", "Path to the .env file (default: <executable dir>/../src/.env)")
 	flag.Parse()
 
 	lockAddr := fmt.Sprintf("127.0.0.1:%d", *portPtr)
@@ -578,7 +596,7 @@ func main() {
 		log.Printf("Failed to load custom messages, using defaults: %v", err)
 	}
 
-	cfg, err := loadConfig()
+	cfg, err := loadConfig(*envPtr)
 	if err != nil {
 		log.Fatalf("Config Error: %v", err)
 	}

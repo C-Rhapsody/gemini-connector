@@ -121,6 +121,20 @@ cd golang/gemini-connector/bin
 ```
 (팁: 서버 환경에서는 쉘을 점유하지 않도록 `Start-Process`(Windows)나 `nohup`(Linux) 등을 활용하여 백그라운드로 구동하십시오.)
 
+### 실행 옵션
+
+| 옵션 | 설명 |
+| --- | --- |
+| `--port <번호>` | 단일 인스턴스 잠금에 사용할 포트 (기본값: 49152) |
+| `--env <경로>` | `.env` 파일 위치 직접 지정 (기본값: 실행 파일 기준 `../src/.env`) |
+
+`--env`에 상대경로를 지정하면 현재 작업 디렉터리 기준으로 해석됩니다. 지정한 파일이 없으면 기존 설정 마법사가 해당 위치에 생성합니다.
+
+```bash
+./gemini-connector_windows_x64.exe --env C:\configs\gemini-connector.env
+./gemini-connector_linux_x64 --env /etc/gemini-connector/.env
+```
+
 ## ⚠️ 주의 및 면책 조항 (Disclaimer)
 
 본 커넥터는 사용자의 편의성과 완전한 자동화를 위해 **agy를 `--dangerously-skip-permissions` 플래그로 실행**합니다. 이는 AI가 판단한 모든 도구 사용 및 로컬 파일 시스템 제어(수정, 삭제 등) 권한이 사용자의 사전 승인(Confirm) 없이 즉시 실행됨을 의미합니다.
