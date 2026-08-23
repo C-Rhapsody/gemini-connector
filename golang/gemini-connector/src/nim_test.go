@@ -135,6 +135,65 @@ func TestCleanTranslatedPrompt(t *testing.T) {
 	}
 }
 
+func TestClampNimPrompt(t *testing.T) {
+	long := strings.Repeat("a", nimMaxPromptChars+50)
+	got := clampNimPrompt(long)
+	if len(got) != nimMaxPromptChars || got != long[:nimMaxPromptChars] {
+		t.Fatalf("ascii clamp failed: %d chars", len([]rune(got)))
+	}
+
+	multibyte := strings.Repeat("가", nimMaxPromptChars+50)
+	got = clampNimPrompt(multibyte)
+	if len([]rune(got)) != nimMaxPromptChars {
+		t.Fatalf("multibyte clamp failed: %d runes", len([]rune(got)))
+	}
+
+	exact := strings.Repeat("b", nimMaxPromptChars)
+	if got := clampNimPrompt(exact); got != exact {
+		t.Fatal("prompt at the limit must be untouched")
+	}
+	short := "short prompt"
+	if got := clampNimPrompt(short); got != short {
+		t.Fatalf("short prompt modified: %q", got)
+	}
+}
+
+func TestGenerateNimImage_PromptLengthCapped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req nimImageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if len([]rune(req.Prompt)) > nimMaxPromptChars {
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"artifacts": []any{map[string]any{
+				"base64": base64.StdEncoding.EncodeToString([]byte("img")),
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	old := nimInvokeURL
+	nimInvokeURL = srv.URL
+	defer func() { nimInvokeURL = old }()
+
+	tooLong := strings.Repeat("프롬프트", 300) // 900 runes
+	if _, err := generateNimImage(context.Background(), "test-key", tooLong); err != nil {
+		t.Fatalf("clamped prompt must be accepted: %v", err)
+	}
+}
+
+func TestDefaultTranslateTemplateMentionsLimit(t *testing.T) {
+	tpl := defaultMessages.ImageTranslateTemplate
+	if !strings.Contains(tpl, "750") {
+		t.Fatalf("translation template must instruct a character budget: %q", tpl)
+	}
+}
+
 func TestGenerateNimImage_Success(t *testing.T) {
 	want := []byte("generated-image-bytes")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

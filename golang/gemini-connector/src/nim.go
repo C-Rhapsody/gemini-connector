@@ -25,6 +25,10 @@ const (
 	nimWidth          = 768
 	nimHeight         = 1344
 	nimSteps          = 4
+	// nimMaxPromptChars is the hard prompt limit enforced by the NIM
+	// endpoint (HTTP 422 string_too_long beyond it), counted in Unicode
+	// characters.
+	nimMaxPromptChars = 800
 )
 
 // errNimContentFiltered marks responses rejected by NVIDIA's safety
@@ -61,6 +65,18 @@ func readBodySnippet(r io.Reader, max int) string {
 	return strings.TrimSpace(string(b))
 }
 
+// clampNimPrompt caps the prompt at nimMaxPromptChars Unicode characters so
+// the endpoint's hard validation can never reject the request. The full
+// original text is never logged; only its length is.
+func clampNimPrompt(prompt string) string {
+	r := []rune(prompt)
+	if len(r) <= nimMaxPromptChars {
+		return prompt
+	}
+	log.Printf("NIM prompt too long (%d chars); truncating to %d", len(r), nimMaxPromptChars)
+	return string(r[:nimMaxPromptChars])
+}
+
 // generateNimImage posts the prompt to NVIDIA NIM and returns the decoded
 // image bytes. Non-2xx replies, network failures and timeouts become
 // descriptive errors; the raw response body is logged, never shown whole.
@@ -70,7 +86,7 @@ func generateNimImage(ctx context.Context, apiKey string, prompt string) ([]byte
 		return nil, fmt.Errorf("failed to generate seed: %w", err)
 	}
 	payload, err := json.Marshal(nimImageRequest{
-		Prompt: prompt,
+		Prompt: clampNimPrompt(prompt),
 		Width:  nimWidth,
 		Height: nimHeight,
 		Seed:   seed,
