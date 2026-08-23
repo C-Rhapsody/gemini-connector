@@ -175,6 +175,7 @@ func createNewConversation() (string, error) {
 
 	prompt := "This connector bridges Telegram to agy. Reply only with 'agy Connector Ready.'"
 	cmd := exec.Command("agy", "--output-format", "json", "--dangerously-skip-permissions", "--print-timeout", "5m")
+	cmd.Env = agyEnv()
 	cmd.Stdin = strings.NewReader(prompt)
 	cmd.Dir = findProjectRoot()
 
@@ -220,6 +221,7 @@ func createNewConversationRuntimeWithPrompt(ctx context.Context, prompt string, 
 	}
 
 	cmd := exec.CommandContext(ctx, "agy", "--output-format", "json", "--dangerously-skip-permissions", "--print-timeout", "5m")
+	cmd.Env = agyEnv()
 	configureAgyProcess(cmd)
 	cmd.Cancel = func() error { return killAgyProcess(cmd.Process) }
 	cmd.WaitDelay = 10 * time.Second

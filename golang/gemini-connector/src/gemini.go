@@ -81,6 +81,9 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 	}
 
 	cmd := exec.CommandContext(ctx, "agy", args...)
+	// agy shells out to grep for its grep_search tool; make sure a grep is
+	// resolvable no matter which terminal launched the connector.
+	cmd.Env = agyEnv()
 	configureAgyProcess(cmd)
 	// /stop must take down the whole agy process tree, not just the root.
 	cmd.Cancel = func() error { return killAgyProcess(cmd.Process) }
