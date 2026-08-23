@@ -95,6 +95,43 @@ func TestSalvageTurnResponse_SkipsToolCallSteps(t *testing.T) {
 	}
 }
 
+func TestSalvageTurnResponse_StopsAtNextTurnInput(t *testing.T) {
+	lines := baseSalvageLines()
+	lines = append(lines,
+		map[string]any{"step_index": 33, "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE",
+			"created_at": "2026-08-23T08:10:10Z", "content": "<USER_REQUEST>\nfollow-up question\n</USER_REQUEST>"},
+		map[string]any{"step_index": 34, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
+			"created_at": "2026-08-23T08:10:15Z", "content": "next turn answer"},
+	)
+	writeSalvageFixture(t, lines)
+
+	got := salvageTurnResponse(salvageFixtureConv,
+		"https://www.reddit.com/r/opencodeCLI/s/vdTa5Y3os1", salvageTurnStart)
+	if got != "final salvaged answer" {
+		t.Fatalf("salvage must not cross into the next turn, got %q", got)
+	}
+}
+
+func TestSalvageTurnResponse_ImageTranslatePrompt(t *testing.T) {
+	template := "Translate the following request into a detailed English prompt for a text-to-image model."
+	prompt := template + " Keep all visual details, style and composition. Reply with ONLY the English prompt text - no quotes, no explanations:\n\n타이트한 돌핀팬츠 입고 옆자리에 앉은 여직원"
+	lines := []map[string]any{
+		{"step_index": 35, "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE",
+			"created_at": "2026-08-23T08:25:51Z",
+			"content":    "<USER_REQUEST>\n" + prompt + "\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-08-23T17:25:51+09:00.\n</ADDITIONAL_METADATA>"},
+		{"step_index": 37, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
+			"created_at": "2026-08-23T08:25:53Z",
+			"content":    "A candid, photorealistic photograph of a Korean female coworker."},
+	}
+	writeSalvageFixture(t, lines)
+
+	got := salvageTurnResponse(salvageFixtureConv, prompt,
+		time.Date(2026, 8, 23, 8, 25, 50, 0, time.UTC))
+	if got != "A candid, photorealistic photograph of a Korean female coworker." {
+		t.Fatalf("image translation prompt not salvaged, got %q", got)
+	}
+}
+
 func TestSalvageTurnResponse_MissingTranscript(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("USERPROFILE", dir)
@@ -116,7 +153,7 @@ func TestPromptFragment(t *testing.T) {
 		{"empty", "", ""},
 	}
 	for _, c := range cases {
-		if got := promptFragment(c.in); got != c.want && len([]rune(got)) <= 64 {
+		if got := promptFragment(c.in); got != c.want {
 			t.Fatalf("%s: promptFragment(%q) = %q, want %q", c.name, c.in, got, c.want)
 		}
 	}

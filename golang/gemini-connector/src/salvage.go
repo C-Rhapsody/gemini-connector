@@ -75,6 +75,10 @@ func salvageTurnResponse(convID string, userPrompt string, turnStart time.Time) 
 
 	best := ""
 	for _, s := range steps[userIdx+1:] {
+		// Anything past the next user input belongs to another turn.
+		if s.Type == "USER_INPUT" {
+			break
+		}
 		if s.Type != "PLANNER_RESPONSE" || !s.done() ||
 			s.hasToolCalls() || strings.TrimSpace(s.Content) == "" {
 			continue

@@ -71,6 +71,10 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 	}
 	log.Printf("Triggering agy CLI for message (via Stdin): %s", truncateString(prompt, 50))
 
+	// Turn start marker for transcript salvage: brain steps created from this
+	// point on belong to the turn we are about to spawn.
+	turnStart := time.Now()
+
 	args := []string{
 		"--output-format", "json",
 		"--dangerously-skip-permissions",
@@ -128,6 +132,18 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 			detail = "agy returned status: " + result.Status
 		}
 		log.Printf("agy returned non-success status: %s, error: %s", result.Status, detail)
+
+		// agy occasionally reports ERROR because an intermediate tool failed
+		// (e.g. its built-in grep_search exiting non-zero) while the model
+		// still finished the turn; the brain transcript then holds the real
+		// answer. Quota exhaustion outranks salvage: a 429 turn produces no
+		// answer and the cooldown flow must stay authoritative.
+		if !isQuotaExhaustedDetail(detail) {
+			if salvaged := salvageTurnResponse(conversationID, prompt, turnStart); salvaged != "" {
+				log.Printf("agy reported an error (%s) but the turn completed; delivering the recovered response", truncateString(detail, 80))
+				return salvaged, nil
+			}
+		}
 		return "", &AgyError{Type: "error_status", Detail: detail}
 	}
 
