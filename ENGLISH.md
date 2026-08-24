@@ -34,6 +34,7 @@ The following `/` commands are available on the Telegram channel and are automat
 | `/new` (or `/reset`) | Summarize the previous conversation and switch to a fresh agy session |
 | `/clear` | Delete all conversation artifacts (DB, brain, transcript) and start a completely fresh session without summary carry-over |
 | `/stop` | Immediately cancel the running agy job and clear the queue |
+| `/cron <request>` | Create/modify/delete/pause/resume scheduled tasks in natural language (see `/cron help`) |
 | `/status` | Show the current conversation ID and recorded turn count |
 | `/summary` | Preview recent conversation turns (no agy invocation) |
 | `/list` | List agy conversations found in the local cache |
@@ -43,6 +44,25 @@ The following `/` commands are available on the Telegram channel and are automat
 > ⚠️ `AGY_CONVERSATION_ID` is global bot state shared across all channels. A `/switch` applies to every channel.
 
 > ℹ️ If repeated URL fetch failures are detected, the connector automatically summarizes the previous conversation and switches to a new session.
+
+### Scheduled Tasks (/cron, experimental)
+
+`/cron` turns natural-language requests into scheduled tasks: agy produces a candidate JSON, the connector strictly validates it, and a Telegram inline keyboard provides final confirmation. (Telegram only)
+
+-   `/cron Summarize AI news every morning at 9` — create a periodic task
+-   `/cron Tomorrow 10 AM list report drafts` — create a one-shot task
+-   `/cron pause the daily news task` — resolve the target and pause
+-   `/cron list` / `/cron help` — list and help (no agy invocation)
+-   `/cron kill`, `/cron resume-all`, `/cron status` — global scheduler stop/resume/status (admin only; register Telegram user IDs in `CRON_ADMIN_TELEGRAM_USER_IDS`, comma-separated)
+
+Security model:
+
+-   agy only drafts JSON. Unknown fields, internal identifiers (`chat_id`, `user_id`, `job_id`, ...) and dangerous keys (`url`, `command`, `exec`, ...) are rejected wholesale in Go.
+-   Every write requires button confirmation (10-minute TTL, single use) plus an optimistic revision check.
+-   Minimum periodic interval is 15 minutes; slots missed across restarts are skipped (catch-up = skip).
+-   Scheduled runs execute against the currently active agy conversation and are delivered as plain messages; their output is never re-interpreted as cron commands.
+-   Data is stored in `context/cron.db` (SQLite) with an append-only audit log.
+-   ⚠️ Scheduled runs launch agy with the same full permissions as interactive chats (`--dangerously-skip-permissions`). If untrusted content can reach a scheduled prompt, OS-level side effects remain possible — register trusted tasks only. Use `--cron-disabled` to disable the subsystem entirely.
 
 ## Directory Structure
 
@@ -128,6 +148,7 @@ cd golang/gemini-connector/bin
 | `--port <number>` | Port used for the single-instance lock (default: 49152) |
 | `--env <path>` | Explicit location of the `.env` file (default: `../src/.env` relative to the executable) |
 | `--telegram-proxy <URL>` | Proxy for all Telegram traffic (`http://`, `https://`, `socks5://`, or `socks5h://`) |
+| `--cron-disabled` | Fully disable the `/cron` scheduled-task subsystem (no DB access, no scheduler) |
 
 A relative `--env` path is resolved against the current working directory. If the given file does not exist yet, the setup wizard creates it there.
 

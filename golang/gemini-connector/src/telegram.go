@@ -70,6 +70,7 @@ func (t *TelegramAdapter) Init() error {
 		{Command: "reset", Description: "/new 의 별칭"},
 		{Command: "clear", Description: "대화 기록을 지우고 새 세션 시작"},
 		{Command: "stop", Description: "진행 중인 agy 작업 즉시 중지"},
+		{Command: "cron", Description: "예약 작업 관리 (/cron help)"},
 		{Command: "status", Description: "현재 대화 정보"},
 		{Command: "summary", Description: "최근 대화 미리보기"},
 		{Command: "list", Description: "캐시된 대화 목록"},
@@ -135,10 +136,15 @@ func newTelegramHTTPClient(rawProxyURL string) (*http.Client, error) {
 func (t *TelegramAdapter) Listen() (<-chan InternalMessage, error) {
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
+	u.AllowedUpdates = []string{"message", "callback_query"}
 	updates := t.bot.GetUpdatesChan(u)
 
 	go func() {
 		for update := range updates {
+			if update.CallbackQuery != nil {
+				go t.handleCallbackQuery(update.CallbackQuery)
+				continue
+			}
 			if update.Message == nil {
 				continue
 			}
@@ -154,6 +160,42 @@ func (t *TelegramAdapter) Listen() (<-chan InternalMessage, error) {
 	}()
 
 	return t.msgChan, nil
+}
+
+// handleCallbackQuery routes cron inline-keyboard presses into the message
+// pipeline. Non-cron callbacks are acknowledged and dropped.
+func (t *TelegramAdapter) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
+	if cq.Message == nil {
+		t.AnswerCallbackQuery(cq.ID, "")
+		return
+	}
+	if t.chatID != 0 && cq.Message.Chat.ID != t.chatID {
+		log.Printf("Ignored unauthorized callback from Chat ID: %d", cq.Message.Chat.ID)
+		t.AnswerCallbackQuery(cq.ID, "권한이 없습니다.")
+		return
+	}
+	data := cq.Data
+	if !strings.HasPrefix(data, cronCbConfirm) &&
+		!strings.HasPrefix(data, cronCbCancel) &&
+		!strings.HasPrefix(data, cronCbSelectRef) {
+		t.AnswerCallbackQuery(cq.ID, "")
+		return
+	}
+
+	userID := ""
+	if cq.From != nil {
+		userID = strconv.FormatInt(cq.From.ID, 10)
+	}
+	t.msgChan <- InternalMessage{
+		Platform:     "telegram",
+		UserID:       userID,
+		ChatID:       strconv.FormatInt(cq.Message.Chat.ID, 10),
+		Command:      "/cron-callback",
+		Args:         data,
+		MessageID:    cq.Message.MessageID,
+		CallbackID:   cq.ID,
+		CallbackData: data,
+	}
 }
 
 const maxAttachmentsPerMessage = 10
@@ -414,6 +456,10 @@ func (t *TelegramAdapter) GetFile(fileID string) (string, error) {
 
 func (t *TelegramAdapter) handleIncomingMessage(msg *tgbotapi.Message) {
 	chatID := strconv.FormatInt(msg.Chat.ID, 10)
+	userID := ""
+	if msg.From != nil {
+		userID = strconv.FormatInt(msg.From.ID, 10)
+	}
 
 	if msg.IsCommand() {
 		switch msg.Command() {
@@ -422,27 +468,29 @@ func (t *TelegramAdapter) handleIncomingMessage(msg *tgbotapi.Message) {
 		case "reset", "new":
 			t.msgChan <- InternalMessage{
 				Platform:  "telegram",
-				UserID:    "",
+				UserID:    userID,
 				ChatID:    chatID,
 				Command:   "/reset",
 				MessageID: msg.MessageID,
 			}
 		case "clear":
-			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/clear", MessageID: msg.MessageID}
+			t.msgChan <- InternalMessage{Platform: "telegram", UserID: userID, ChatID: chatID, Command: "/clear", MessageID: msg.MessageID}
 		case "image":
-			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/image", Args: msg.CommandArguments(), MessageID: msg.MessageID}
+			t.msgChan <- InternalMessage{Platform: "telegram", UserID: userID, ChatID: chatID, Command: "/image", Args: msg.CommandArguments(), MessageID: msg.MessageID}
 		case "stop":
-			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/stop", MessageID: msg.MessageID}
+			t.msgChan <- InternalMessage{Platform: "telegram", UserID: userID, ChatID: chatID, Command: "/stop", MessageID: msg.MessageID}
+		case "cron":
+			t.msgChan <- InternalMessage{Platform: "telegram", UserID: userID, ChatID: chatID, Command: "/cron", Args: msg.CommandArguments(), MessageID: msg.MessageID}
 		case "status":
-			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/status", MessageID: msg.MessageID}
+			t.msgChan <- InternalMessage{Platform: "telegram", UserID: userID, ChatID: chatID, Command: "/status", MessageID: msg.MessageID}
 		case "summary":
-			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/summary", MessageID: msg.MessageID}
+			t.msgChan <- InternalMessage{Platform: "telegram", UserID: userID, ChatID: chatID, Command: "/summary", MessageID: msg.MessageID}
 		case "version":
-			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/version", MessageID: msg.MessageID}
+			t.msgChan <- InternalMessage{Platform: "telegram", UserID: userID, ChatID: chatID, Command: "/version", MessageID: msg.MessageID}
 		case "list":
-			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/list", Args: msg.CommandArguments(), MessageID: msg.MessageID}
+			t.msgChan <- InternalMessage{Platform: "telegram", UserID: userID, ChatID: chatID, Command: "/list", Args: msg.CommandArguments(), MessageID: msg.MessageID}
 		case "switch":
-			t.msgChan <- InternalMessage{Platform: "telegram", ChatID: chatID, Command: "/switch", Args: msg.CommandArguments(), MessageID: msg.MessageID}
+			t.msgChan <- InternalMessage{Platform: "telegram", UserID: userID, ChatID: chatID, Command: "/switch", Args: msg.CommandArguments(), MessageID: msg.MessageID}
 		default:
 			t.Send(chatID, t.msgs.CommandUnknown, SendOptions{ReplyToMessageID: msg.MessageID})
 		}
@@ -705,17 +753,4 @@ func downloadFile(url string, destPath string) (int, error) {
 
 	_, err = io.Copy(out, resp.Body)
 	return 0, err
-}
-
-// redactToken removes secret material from error strings before they reach
-// the log file; Telegram API errors historically embed the full request URL,
-// including the bot token.
-func redactToken(msg string, secrets ...string) string {
-	for _, s := range secrets {
-		if s == "" {
-			continue
-		}
-		msg = strings.ReplaceAll(msg, s, "***")
-	}
-	return msg
 }

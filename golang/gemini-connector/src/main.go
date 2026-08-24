@@ -24,14 +24,15 @@ import (
 // --- Configuration & Messages ---
 
 type Config struct {
-	ActiveMessengers  []string
-	TelegramBotToken  string
-	TelegramChatID    int64
-	TeamsTenantID     string
-	TeamsAppID        string
-	TeamsAppSecret    string
-	TeamsChatID       string
-	AgyConversationID string
+	ActiveMessengers         []string
+	TelegramBotToken         string
+	TelegramChatID           int64
+	TeamsTenantID            string
+	TeamsAppID               string
+	TeamsAppSecret           string
+	TeamsChatID              string
+	AgyConversationID        string
+	CronAdminTelegramUserIDs []string
 
 	mu                sync.Mutex
 	envPath           string
@@ -327,16 +328,27 @@ func loadConfig(envFlag string) (*Config, error) {
 		log.Println("Warning: AGY_CONVERSATION_ID is not set. Bot will not be able to trigger AI.")
 	}
 
+	// Cron admin allowlist (optional; no wizard prompt by design).
+	var cronAdmins []string
+	if raw := os.Getenv("CRON_ADMIN_TELEGRAM_USER_IDS"); raw != "" {
+		for _, part := range strings.Split(raw, ",") {
+			if id := strings.TrimSpace(part); id != "" {
+				cronAdmins = append(cronAdmins, id)
+			}
+		}
+	}
+
 	return &Config{
-		ActiveMessengers:  activeMessengers,
-		TelegramBotToken:  token,
-		TelegramChatID:    chatID,
-		TeamsTenantID:     teamsTenantID,
-		TeamsAppID:        teamsAppID,
-		TeamsAppSecret:    teamsAppSecret,
-		TeamsChatID:       teamsChatID,
-		AgyConversationID: convID,
-		envPath:           envPath,
+		ActiveMessengers:         activeMessengers,
+		TelegramBotToken:         token,
+		TelegramChatID:           chatID,
+		TeamsTenantID:            teamsTenantID,
+		TeamsAppID:               teamsAppID,
+		TeamsAppSecret:           teamsAppSecret,
+		TeamsChatID:              teamsChatID,
+		AgyConversationID:        convID,
+		CronAdminTelegramUserIDs: cronAdmins,
+		envPath:                  envPath,
 	}, nil
 }
 
@@ -543,6 +555,7 @@ func main() {
 	portPtr := flag.Int("port", 49152, "Port number to use for single instance lock")
 	envPtr := flag.String("env", "", "Path to the .env file (default: <executable dir>/../src/.env)")
 	telegramProxyPtr := flag.String("telegram-proxy", "", "Proxy URL for Telegram API (http://, https://, socks5://, or socks5h://)")
+	cronDisabledPtr := flag.Bool("cron-disabled", false, "Disable the /cron scheduled-task subsystem entirely")
 	flag.Parse()
 
 	lockAddr := fmt.Sprintf("127.0.0.1:%d", *portPtr)
@@ -578,15 +591,16 @@ func main() {
 	// 시그널 핸들링: 정상 종료 시 로그 플러시 보장
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	stopCh := make(chan struct{})
+	var stopOnce sync.Once
 	go func() {
 		sig := <-sigChan
 		log.Printf("Received signal: %v. Shutting down...", sig)
 		if logFile != nil {
 			logFile.Sync()
-			logFile.Close()
 		}
 		listener.Close()
-		os.Exit(0)
+		stopOnce.Do(func() { close(stopCh) })
 	}()
 
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
@@ -663,161 +677,225 @@ func main() {
 	// Serializes agy work; /stop cancels the running job and drops queued ones.
 	turnQ := newAgyTurnQueue()
 
+	// Cron subsystem: Telegram-only, backed by SQLite under ../context.
+	var cronStore *CronStore
+	var cronSvc *CronService
+	var cronSched *CronScheduler
+	if *cronDisabledPtr {
+		log.Println("Cron subsystem disabled via --cron-disabled")
+	} else if _, ok := adapters["telegram"]; !ok {
+		log.Println("Cron subsystem unavailable: telegram adapter is not active")
+	} else {
+		cronDBPath, err := cronDatabasePath()
+		if err != nil {
+			log.Printf("Cron disabled: cannot resolve database path: %v", err)
+		} else if cronStore, err = OpenCronStore(cronDBPath); err != nil {
+			log.Printf("Cron disabled: database open failed (%s): %v", cronDBPath, err)
+			cronStore = nil
+		} else {
+			planner := func(ctx context.Context, prompt string) (string, error) {
+				return executeAgy(ctx, prompt, cfg.ConversationID(), AgyCallOptions{PlannerMode: true})
+			}
+			cronUI := adapters["telegram"].(CronTelegramUI)
+			cronSched = NewCronScheduler(cronStore, cfg, cronUI, nil)
+			cronSched.SetQueue(turnQ)
+			cronSvc = NewCronService(cronStore, cfg, cronUI, planner, cfg.CronAdminTelegramUserIDs, cronSched)
+			if missed, err := cronSched.Reconcile(); err != nil {
+				log.Printf("Cron initial reconcile failed: %v", err)
+			} else if missed > 0 {
+				log.Printf("Cron reconcile adjusted %d trigger(s) after downtime", missed)
+			}
+			cronSched.Start()
+			log.Printf("Cron scheduler started (db: %s)", cronDBPath)
+		}
+	}
+
 	log.Println("Waiting for messages...")
 
-	for msg := range msgChan {
-		go func(m InternalMessage) {
-			adapter, ok := adapters[m.Platform]
+	for running := true; running; {
+		select {
+		case <-stopCh:
+			running = false
+		case msg, ok := <-msgChan:
 			if !ok {
-				log.Printf("No adapter for platform: %s", m.Platform)
-				return
+				running = false
+				break
 			}
-
-			replyOpt := SendOptions{ReplyToMessageID: m.MessageID}
-
-			switch m.Command {
-			case "/stop":
-				active, dropped := turnQ.StopActive()
-				switch {
-				case active && dropped > 0:
-					adapter.Send(m.ChatID, fmt.Sprintf(msgs.StopDoneWithQueued, dropped), replyOpt)
-				case active:
-					adapter.Send(m.ChatID, msgs.StopDone, replyOpt)
-				default:
-					adapter.Send(m.ChatID, msgs.StopNothing, replyOpt)
+			go func(m InternalMessage) {
+				adapter, ok := adapters[m.Platform]
+				if !ok {
+					log.Printf("No adapter for platform: %s", m.Platform)
+					return
 				}
-				return
-			case "/reset":
-				enqueueTurn(turnQ, adapter, m.ChatID, m.MessageID, msgs, func(ctx context.Context) {
-					resetConversation(ctx, cfg, adapter, m.ChatID, m.MessageID, "", msgs)
-				})
-				return
-			case "/clear":
-				enqueueTurn(turnQ, adapter, m.ChatID, m.MessageID, msgs, func(ctx context.Context) {
-					clearConversation(ctx, cfg, adapter, m.ChatID, m.MessageID, msgs)
-				})
-				return
-			case "/image":
-				enqueueTurn(turnQ, adapter, m.ChatID, m.MessageID, msgs, func(ctx context.Context) {
-					imageCommand(ctx, cfg, adapter, m.ChatID, m.MessageID, m.Args, msgs)
-				})
-				return
-			case "/status":
-				statusConversation(cfg, adapter, m.ChatID, m.MessageID, msgs)
-				return
-			case "/summary":
-				summaryConversation(cfg, adapter, m.ChatID, m.MessageID, msgs)
-				return
-			case "/version":
-				versionInfo(adapter, m.ChatID, m.MessageID, msgs)
-				return
-			case "/list":
-				listConversations(cfg, adapter, m.ChatID, m.Args, m.MessageID, msgs)
-				return
-			case "/switch":
-				enqueueTurn(turnQ, adapter, m.ChatID, m.MessageID, msgs, func(ctx context.Context) {
-					switchConversation(cfg, adapter, m.ChatID, m.Args, m.MessageID, msgs)
-				})
-				return
-			}
 
-			if cfg.ConversationID() == "" {
-				adapter.Send(m.ChatID, msgs.ErrorMissingUUID, replyOpt)
-				return
-			}
+				replyOpt := SendOptions{ReplyToMessageID: m.MessageID}
 
-			// Fast path during quota cooldown: reply immediately without
-			// touching the turn queue. Jobs that are already queued get the
-			// same treatment inside executeAgy.
-			if QuotaActive() {
-				adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorSystemResponse, QuotaRefreshedDetail()), replyOpt)
-				return
-			}
-
-			ahead := turnQ.Enqueue(func(ctx context.Context) {
-				stop := adapter.StartTyping(m.ChatID)
-				defer stop()
-
-				// Turn start marker: files modified from this point on are
-				// considered AI-produced and eligible for attachment delivery.
-				turnStart := time.Now()
-
-				response, err := executeAgy(ctx, m.Content, cfg.ConversationID())
-				if err != nil {
-					if ctx.Err() != nil {
-						// Cancelled via /stop: stay silent, the stop notice
-						// already went out.
-						log.Printf("agy turn cancelled by /stop: %s", truncateString(m.Content, 50))
+				switch m.Command {
+				case "/stop":
+					active, dropped := turnQ.StopActive()
+					switch {
+					case active && dropped > 0:
+						adapter.Send(m.ChatID, fmt.Sprintf(msgs.StopDoneWithQueued, dropped), replyOpt)
+					case active:
+						adapter.Send(m.ChatID, msgs.StopDone, replyOpt)
+					default:
+						adapter.Send(m.ChatID, msgs.StopNothing, replyOpt)
+					}
+					return
+				case "/reset":
+					enqueueTurn(turnQ, adapter, m.ChatID, m.MessageID, msgs, func(ctx context.Context) {
+						resetConversation(ctx, cfg, adapter, m.ChatID, m.MessageID, "", msgs)
+					})
+					return
+				case "/clear":
+					enqueueTurn(turnQ, adapter, m.ChatID, m.MessageID, msgs, func(ctx context.Context) {
+						clearConversation(ctx, cfg, adapter, m.ChatID, m.MessageID, msgs)
+					})
+					return
+				case "/image":
+					enqueueTurn(turnQ, adapter, m.ChatID, m.MessageID, msgs, func(ctx context.Context) {
+						imageCommand(ctx, cfg, adapter, m.ChatID, m.MessageID, m.Args, msgs)
+					})
+					return
+				case "/cron", "/cron-callback":
+					if cronSvc == nil {
+						adapter.Send(m.ChatID, cronDisabledNotice, replyOpt)
 						return
 					}
-					if ae, ok := err.(*AgyError); ok {
-						switch ae.Type {
-						case "cli_failure":
-							adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorCLIFailure, ae.Err, ae.Detail), replyOpt)
-						case "json_parse_fail":
-							adapter.Send(m.ChatID, msgs.ErrorJSONParseFail, replyOpt)
-						case "quota_cooldown":
-							adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorSystemResponse, ae.Detail), replyOpt)
-						case "error_status":
-							detail := ae.Detail
-							// 429 quota exhaustion: start/refresh cooldown and
-							// answer with the decremented error text.
-							if QuotaCapture(detail) {
-								adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorSystemResponse, QuotaRefreshedDetail()), replyOpt)
-								return
-							}
-							if extractUrlFetchFailure(detail) != "" && cfg.recordStuckError("url_fetch", detail) {
-								log.Printf("Stuck conversation detected (repeated URL fetch failure), resetting session")
-								resetConversation(ctx, cfg, adapter, m.ChatID, m.MessageID, m.Content, msgs)
-								return
-							}
-							// Conversation-state validation failures poison every
-							// subsequent turn; auto-reset after a repeat.
-							if strings.Contains(detail, "invalid arguments") {
-								if cfg.recordStuckError("invalid_args", detail) {
-									log.Printf("Repeated invalid-arguments errors, auto-resetting session")
+					if m.Command == "/cron" {
+						cronSvc.HandleMessage(m)
+					} else {
+						cronSvc.HandleCallback(m)
+					}
+					return
+				case "/status":
+					statusConversation(cfg, adapter, m.ChatID, m.MessageID, msgs)
+					return
+				case "/summary":
+					summaryConversation(cfg, adapter, m.ChatID, m.MessageID, msgs)
+					return
+				case "/version":
+					versionInfo(adapter, m.ChatID, m.MessageID, msgs)
+					return
+				case "/list":
+					listConversations(cfg, adapter, m.ChatID, m.Args, m.MessageID, msgs)
+					return
+				case "/switch":
+					enqueueTurn(turnQ, adapter, m.ChatID, m.MessageID, msgs, func(ctx context.Context) {
+						switchConversation(cfg, adapter, m.ChatID, m.Args, m.MessageID, msgs)
+					})
+					return
+				}
+
+				if cfg.ConversationID() == "" {
+					adapter.Send(m.ChatID, msgs.ErrorMissingUUID, replyOpt)
+					return
+				}
+
+				// Fast path during quota cooldown: reply immediately without
+				// touching the turn queue. Jobs that are already queued get the
+				// same treatment inside executeAgy.
+				if QuotaActive() {
+					adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorSystemResponse, QuotaRefreshedDetail()), replyOpt)
+					return
+				}
+
+				ahead := turnQ.Enqueue(func(ctx context.Context) {
+					stop := adapter.StartTyping(m.ChatID)
+					defer stop()
+
+					// Turn start marker: files modified from this point on are
+					// considered AI-produced and eligible for attachment delivery.
+					turnStart := time.Now()
+
+					response, err := executeAgy(ctx, m.Content, cfg.ConversationID())
+					if err != nil {
+						if ctx.Err() != nil {
+							// Cancelled via /stop: stay silent, the stop notice
+							// already went out.
+							log.Printf("agy turn cancelled by /stop: %s", truncateString(m.Content, 50))
+							return
+						}
+						if ae, ok := err.(*AgyError); ok {
+							switch ae.Type {
+							case "cli_failure":
+								adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorCLIFailure, ae.Err, ae.Detail), replyOpt)
+							case "json_parse_fail":
+								adapter.Send(m.ChatID, msgs.ErrorJSONParseFail, replyOpt)
+							case "quota_cooldown":
+								adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorSystemResponse, ae.Detail), replyOpt)
+							case "error_status":
+								detail := ae.Detail
+								// 429 quota exhaustion: start/refresh cooldown and
+								// answer with the decremented error text.
+								if QuotaCapture(detail) {
+									adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorSystemResponse, QuotaRefreshedDetail()), replyOpt)
+									return
+								}
+								if extractUrlFetchFailure(detail) != "" && cfg.recordStuckError("url_fetch", detail) {
+									log.Printf("Stuck conversation detected (repeated URL fetch failure), resetting session")
 									resetConversation(ctx, cfg, adapter, m.ChatID, m.MessageID, m.Content, msgs)
 									return
 								}
-								adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorSystemResponse, detail+invalidArgsHint), replyOpt)
-								return
+								// Conversation-state validation failures poison every
+								// subsequent turn; auto-reset after a repeat.
+								if strings.Contains(detail, "invalid arguments") {
+									if cfg.recordStuckError("invalid_args", detail) {
+										log.Printf("Repeated invalid-arguments errors, auto-resetting session")
+										resetConversation(ctx, cfg, adapter, m.ChatID, m.MessageID, m.Content, msgs)
+										return
+									}
+									adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorSystemResponse, detail+invalidArgsHint), replyOpt)
+									return
+								}
+								// Any other repeating error_status: fall back to a fresh
+								// session WITHOUT replaying the failing prompt — such
+								// errors are often environmental or model-behavioural,
+								// so replaying would just burn quota in a loop.
+								if cfg.recordStuckError("generic", detail) {
+									log.Printf("Repeated error detected, auto-resetting session without replay")
+									resetConversation(ctx, cfg, adapter, m.ChatID, m.MessageID, "", msgs)
+									return
+								}
+								adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorSystemResponse, detail), replyOpt)
+							case "authentication_required":
+								adapter.Send(m.ChatID, "⚠️ agy 인증이 필요합니다. 터미널에서 'agy'를 한 번 실행해 인증을 완료한 뒤 봇을 재시작하세요.", replyOpt)
 							}
-							// Any other repeating error_status: fall back to a fresh
-							// session WITHOUT replaying the failing prompt — such
-							// errors are often environmental or model-behavioural,
-							// so replaying would just burn quota in a loop.
-							if cfg.recordStuckError("generic", detail) {
-								log.Printf("Repeated error detected, auto-resetting session without replay")
-								resetConversation(ctx, cfg, adapter, m.ChatID, m.MessageID, "", msgs)
-								return
-							}
-							adapter.Send(m.ChatID, fmt.Sprintf(msgs.ErrorSystemResponse, detail), replyOpt)
-						case "authentication_required":
-							adapter.Send(m.ChatID, "⚠️ agy 인증이 필요합니다. 터미널에서 'agy'를 한 번 실행해 인증을 완료한 뒤 봇을 재시작하세요.", replyOpt)
 						}
+						return
 					}
-					return
-				}
 
-				QuotaClear()
+					QuotaClear()
 
-				if ctx.Err() != nil {
-					log.Printf("agy turn cancelled by /stop (after completion): %s", truncateString(m.Content, 50))
-					return
+					if ctx.Err() != nil {
+						log.Printf("agy turn cancelled by /stop (after completion): %s", truncateString(m.Content, 50))
+						return
+					}
+					if response != "" {
+						appendTranscript(cfg.ConversationID(), "user", m.Content)
+						appendTranscript(cfg.ConversationID(), "assistant", response)
+						adapter.Send(m.ChatID, response, SendOptions{ReplyToMessageID: m.MessageID, AttachAfter: turnStart})
+					} else {
+						adapter.Send(m.ChatID, msgs.ErrorEmptyResponse, replyOpt)
+					}
+				})
+				if ahead > 0 {
+					adapter.Send(m.ChatID, fmt.Sprintf(msgs.QueuedNotice, ahead), replyOpt)
 				}
-				if response != "" {
-					appendTranscript(cfg.ConversationID(), "user", m.Content)
-					appendTranscript(cfg.ConversationID(), "assistant", response)
-					adapter.Send(m.ChatID, response, SendOptions{ReplyToMessageID: m.MessageID, AttachAfter: turnStart})
-				} else {
-					adapter.Send(m.ChatID, msgs.ErrorEmptyResponse, replyOpt)
-				}
-			})
-			if ahead > 0 {
-				adapter.Send(m.ChatID, fmt.Sprintf(msgs.QueuedNotice, ahead), replyOpt)
-			}
-		}(msg)
+			}(msg)
+		}
 	}
+
+	log.Println("Shutting down connector...")
+	if cronSched != nil {
+		cronSched.Stop()
+	}
+	if cronStore != nil {
+		if err := cronStore.Close(); err != nil {
+			log.Printf("Cron store close error: %v", err)
+		}
+	}
+	listener.Close()
 }
 
 // enqueueTurn queues a state-changing command (/reset, /switch) on the agy

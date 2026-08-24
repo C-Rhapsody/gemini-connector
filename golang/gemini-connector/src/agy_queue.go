@@ -7,11 +7,15 @@ import (
 
 // turnJob is a unit of sequential agy work. Each job carries its own
 // cancellable context so that /stop can abort the running job and drop
-// queued ones without touching jobs enqueued afterwards.
+// queued ones without touching jobs enqueued afterwards. An optional onDrop
+// hook lets owners observe queued-but-cancelled work (cron executions use it
+// to mark their ledger rows cancelled).
 type turnJob struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	run    func(ctx context.Context)
+	ctx     context.Context
+	cancel  context.CancelFunc
+	run     func(ctx context.Context)
+	onDrop  func()
+	started bool
 }
 
 // agyTurnQueue serializes agy work (AI turns, conversation resets, switches).
@@ -33,13 +37,21 @@ func newAgyTurnQueue() *agyTurnQueue {
 // (the actively running job plus queued predecessors), so callers can tell
 // the user that the request is waiting. Zero means it runs immediately.
 func (q *agyTurnQueue) Enqueue(run func(ctx context.Context)) (ahead int) {
+	return q.EnqueueManaged(run, nil)
+}
+
+// EnqueueManaged behaves like Enqueue but invokes onDrop when the job is
+// discarded by StopActive before it ever starts. Jobs cancelled while
+// already running are NOT routed through onDrop; their run function observes
+// context cancellation directly.
+func (q *agyTurnQueue) EnqueueManaged(run func(ctx context.Context), onDrop func()) (ahead int) {
 	ctx, cancel := context.WithCancel(context.Background())
 	q.mu.Lock()
 	ahead = len(q.jobs)
 	if q.running {
 		ahead++
 	}
-	q.jobs = append(q.jobs, turnJob{ctx: ctx, cancel: cancel, run: run})
+	q.jobs = append(q.jobs, turnJob{ctx: ctx, cancel: cancel, run: run, onDrop: onDrop})
 	if q.running {
 		q.mu.Unlock()
 		return ahead
@@ -62,6 +74,7 @@ func (q *agyTurnQueue) worker() {
 		}
 		job := q.jobs[0]
 		q.jobs = q.jobs[1:]
+		job.started = true
 		q.curCancel = job.cancel
 		q.mu.Unlock()
 
@@ -85,6 +98,9 @@ func (q *agyTurnQueue) StopActive() (active bool, dropped int) {
 	dropped = len(q.jobs)
 	for _, job := range q.jobs {
 		job.cancel()
+		if !job.started && job.onDrop != nil {
+			job.onDrop()
+		}
 	}
 	q.jobs = nil
 	return active, dropped

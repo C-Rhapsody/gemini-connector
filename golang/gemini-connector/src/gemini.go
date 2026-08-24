@@ -47,6 +47,10 @@ type AgyCallOptions struct {
 	// is active. Used for explicit commands (/reset, /clear), which should
 	// always attempt execution; regular chat turns keep being gated.
 	BypassQuotaGate bool
+	// PlannerMode runs the call under plan/sandbox restrictions for /cron
+	// candidate generation: the model must answer with a single JSON object
+	// and cannot modify the workspace while producing it.
+	PlannerMode bool
 }
 
 // quotaBlockErr returns the rejection error for gated calls during an active
@@ -79,6 +83,9 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 		"--output-format", "json",
 		"--dangerously-skip-permissions",
 		"--print-timeout", "5m",
+	}
+	if o.PlannerMode {
+		args = append(args, "--mode", "plan", "--sandbox", "--disable-slash-commands")
 	}
 	if conversationID != "" {
 		args = append(args, "--conversation", conversationID)

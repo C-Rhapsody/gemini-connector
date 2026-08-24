@@ -34,6 +34,7 @@
 | `/new` (또는 `/reset`) | 이전 대화를 요약해 새 agy 대화 세션으로 전환 |
 | `/clear` | 대화 기록(DB·브레인·transcript)을 모두 지우고 요약 이월 없이 완전히 새 세션 시작 |
 | `/stop` | 진행 중인 agy 작업과 대기열을 즉시 중지 |
+| `/cron <요청>` | 자연어로 예약 작업 생성/수정/삭제/일시정지/재개 (상세: `/cron help`) |
 | `/status` | 현재 대화 ID와 기록된 턴 수 표시 |
 | `/summary` | 최근 대화 내용 미리보기 (agy 호출 없음) |
 | `/list` | 로컬 캐시에 있는 agy 대화 목록 표시 |
@@ -43,6 +44,25 @@
 > ⚠️ `AGY_CONVERSATION_ID`는 봇 전체에서 공유되는 전역 상태입니다. `/switch`로 전환한 대화는 모든 채널에 동일하게 적용됩니다.
 
 > ℹ️ URL 접속 실패가 반복 감지되면 커넥터가 이전 대화를 요약해 새 세션으로 **자동 전환**합니다.
+
+### 예약 작업 (/cron, 실험적)
+
+`/cron`은 자연어 요청을 agy가 JSON 후보로 변환하고, 커넥터가 엄격 검증 후 Telegram 인라인 버튼으로 최종 확인하는 예약 작업 기능입니다. (Telegram 전용)
+
+-   `/cron 매일 아침 9시에 AI 뉴스를 요약해줘` — 반복(periodic) 작업 생성
+-   `/cron 내일 오전 10시에 보고서 목록 정리해줘` — 일회성(once) 작업 생성
+-   `/cron 매일 뉴스 요약 작업 일시정지해줘` — 대상 지정 후 일시정지
+-   `/cron list` / `/cron help` — 목록 및 도움말 (agy 호출 없음)
+-   `/cron kill`, `/cron resume-all`, `/cron status` — 스케줄러 전역 중지/재개/상태 (관리자 전용, `CRON_ADMIN_TELEGRAM_USER_IDS` 환경 변수에 Telegram 사용자 ID를 쉼표로 구분해 등록)
+
+보안 모델:
+
+-   agy는 후보 JSON을 만들 뿐이며, 알 수 없는 필드·내부 식별자(chat_id/user_id/job_id 등)·위험 키(url/command/exec 등)는 Go에서 전면 거부합니다.
+-   모든 쓰기는 버튼 확인(10분 TTL, 단일 사용)과 낙관적 revision 검사를 통과해야 적용됩니다.
+-   주기 최소 간격은 15분이며, 재시작으로 놓친 슬롯은 건너뜁니다(catch-up = skip).
+-   예약 실행 결과는 현재 활성 agy 대화에서 실행되어 일반 메시지로만 전달되며, cron 명령으로 재해석되지 않습니다.
+-   데이터는 `context/cron.db`(SQLite)에 저장되고 감사 로그가 남습니다.
+-   ⚠️ 예약 실행은 일반 대화와 동일한 권한(`--dangerously-skip-permissions`)으로 agy를 구동합니다. 외부 콘텐츠가 예약 프롬프트에 유입되는 경우 OS 수준 부작용 위험이 있으니 신뢰할 수 있는 작업만 등록하십시오. 완전 비활성화는 `--cron-disabled` 플래그를 사용하세요.
 
 ## 프로젝트 구조 (Directory Structure)
 
@@ -128,6 +148,7 @@ cd golang/gemini-connector/bin
 | `--port <번호>` | 단일 인스턴스 잠금에 사용할 포트 (기본값: 49152) |
 | `--env <경로>` | `.env` 파일 위치 직접 지정 (기본값: 실행 파일 기준 `../src/.env`) |
 | `--telegram-proxy <URL>` | Telegram 전체 통신에 사용할 프록시 (`http://`, `https://`, `socks5://`, `socks5h://`) |
+| `--cron-disabled` | `/cron` 예약 작업 기능을 완전히 비활성화 (DB 접근·스케줄러 구동 없음) |
 
 `--env`에 상대경로를 지정하면 현재 작업 디렉터리 기준으로 해석됩니다. 지정한 파일이 없으면 기존 설정 마법사가 해당 위치에 생성합니다.
 
