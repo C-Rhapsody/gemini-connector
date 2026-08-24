@@ -19,7 +19,7 @@ type TeamsAdapter struct {
 	appSecret   string
 	chatID      string
 	msgs        *Messages
-	msgChan     chan InternalMessage
+	msgChan     chan InboundEvent
 	accessToken string
 	tokenExpiry time.Time
 	tokenMutex  sync.Mutex
@@ -67,7 +67,7 @@ func NewTeamsAdapter(tenantID, appID, appSecret, chatID string, msgs *Messages) 
 		appSecret:  appSecret,
 		chatID:     chatID,
 		msgs:       msgs,
-		msgChan:    make(chan InternalMessage, 100),
+		msgChan:    make(chan InboundEvent, 100),
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}
 }
@@ -81,7 +81,7 @@ func (t *TeamsAdapter) Init() error {
 	return nil
 }
 
-func (t *TeamsAdapter) Listen() (<-chan InternalMessage, error) {
+func (t *TeamsAdapter) Listen() (<-chan InboundEvent, error) {
 	go func() {
 		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
@@ -284,7 +284,7 @@ func (t *TeamsAdapter) pollMessages() {
 			userID = msg.From.User.ID
 		}
 
-		t.msgChan <- InternalMessage{
+		t.msgChan <- InboundEvent{
 			Platform: "teams",
 			UserID:   userID,
 			ChatID:   t.chatID,

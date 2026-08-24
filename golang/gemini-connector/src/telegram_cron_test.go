@@ -8,9 +8,9 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-func testAdapter(t *testing.T) (*TelegramAdapter, chan InternalMessage) {
+func testAdapter(t *testing.T) (*TelegramAdapter, chan InboundEvent) {
 	t.Helper()
-	ch := make(chan InternalMessage, 10)
+	ch := make(chan InboundEvent, 10)
 	return &TelegramAdapter{
 		msgs:    &Messages{},
 		msgChan: ch,
@@ -26,10 +26,18 @@ func tgMessage(userID int64, chatID int64, text string) *tgbotapi.Message {
 	}
 }
 
+// tgCommandMessage builds a message carrying a real bot_command entity, like
+// actual Telegram updates do; without it IsCommand() reports false.
+func tgCommandMessage(userID int64, chatID int64, text string, commandLength int) *tgbotapi.Message {
+	m := tgMessage(userID, chatID, text)
+	m.Entities = []tgbotapi.MessageEntity{{Type: "bot_command", Offset: 0, Length: commandLength}}
+	return m
+}
+
 // Regression: every Telegram command must carry the sender identity; the
-// cron ownership model depends on InternalMessage.UserID being populated.
+// cron ownership model depends on InboundEvent.UserID being populated.
 func TestTelegramCommandsFillUserID(t *testing.T) {
-	commands := map[string]InternalMessage{
+	commands := map[string]InboundEvent{
 		"/stop":   {Command: "/stop"},
 		"/clear":  {Command: "/clear"},
 		"/status": {Command: "/status"},
@@ -47,11 +55,46 @@ func TestTelegramCommandsFillUserID(t *testing.T) {
 				t.Fatalf("%s: ChatID = %q", text, m.ChatID)
 			}
 		default:
-			t.Fatalf("%s produced no InternalMessage", text)
+			t.Fatalf("%s produced no InboundEvent", text)
 		}
 	}
 }
 
+// The adapter identifies commands but must not interpret them: every slash
+// command — including /start, /help and unknown ones — is forwarded to the
+// central Controller as a command event.
+func TestTelegramCommandsForwardVerbatim(t *testing.T) {
+	cases := []struct {
+		text      string
+		cmdLength int
+		command   string
+		args      string
+	}{
+		{text: "/start", cmdLength: 6, command: "/start"},
+		{text: "/help", cmdLength: 5, command: "/help"},
+		{text: "/stop", cmdLength: 5, command: "/stop"},
+		{text: "/cron list", cmdLength: 5, command: "/cron", args: "list"},
+		{text: "/image a cat", cmdLength: 6, command: "/image", args: "a cat"},
+		{text: "/nope extra", cmdLength: 5, command: "/nope", args: "extra"},
+	}
+	for _, tc := range cases {
+		adapter, ch := testAdapter(t)
+		adapter.handleIncomingMessage(tgCommandMessage(42, -7, tc.text, tc.cmdLength))
+		select {
+		case ev := <-ch:
+			if ev.RouteKind() != EventCommand {
+				t.Fatalf("%s: kind = %q", tc.text, ev.Kind)
+			}
+			if ev.Command != tc.command || ev.Args != tc.args {
+				t.Fatalf("%s: command=%q args=%q", tc.text, ev.Command, ev.Args)
+			}
+		default:
+			t.Fatalf("%s produced no event", tc.text)
+		}
+	}
+}
+
+// Cron button presses reach the pipeline as opaque interaction events.
 func TestHandleCallbackQueryRoutesCronData(t *testing.T) {
 	adapter, ch := testAdapter(t)
 	cq := &tgbotapi.CallbackQuery{
@@ -66,22 +109,24 @@ func TestHandleCallbackQueryRoutesCronData(t *testing.T) {
 	adapter.handleCallbackQuery(cq)
 
 	select {
-	case m := <-ch:
-		if m.Command != "/cron-callback" {
-			t.Fatalf("command = %q", m.Command)
+	case ev := <-ch:
+		if ev.RouteKind() != EventInteraction {
+			t.Fatalf("kind = %q", ev.Kind)
 		}
-		if m.CallbackID != "cbq-1" || m.CallbackData != cq.Data || m.Args != cq.Data {
-			t.Fatalf("callback fields wrong: %+v", m)
+		if ev.CallbackID != "cbq-1" || ev.CallbackData != cq.Data {
+			t.Fatalf("callback fields wrong: %+v", ev)
 		}
-		if m.UserID != "42" || m.ChatID != "-7" || m.MessageID != 9 {
-			t.Fatalf("scope fields wrong: %+v", m)
+		if ev.UserID != "42" || ev.ChatID != "-7" || ev.MessageID != 9 {
+			t.Fatalf("scope fields wrong: %+v", ev)
 		}
 	default:
 		t.Fatal("callback was not routed")
 	}
 }
 
-func TestHandleCallbackQueryIgnoresForeignData(t *testing.T) {
+// Foreign callback payloads are forwarded verbatim too; dropping and
+// acknowledging them is the central interaction router's job.
+func TestHandleCallbackQueryForwardsForeignData(t *testing.T) {
 	adapter, ch := testAdapter(t)
 	cq := &tgbotapi.CallbackQuery{
 		ID:      "cbq-2",
@@ -89,11 +134,14 @@ func TestHandleCallbackQueryIgnoresForeignData(t *testing.T) {
 		Message: &tgbotapi.Message{MessageID: 9, Chat: &tgbotapi.Chat{ID: -7}},
 		Data:    "game:score",
 	}
-	adapter.handleCallbackQuery(cq) // answered (bot nil-safe) and dropped
+	adapter.handleCallbackQuery(cq)
 	select {
-	case m := <-ch:
-		t.Fatalf("foreign callback leaked through: %+v", m)
+	case ev := <-ch:
+		if ev.RouteKind() != EventInteraction || ev.CallbackData != "game:score" {
+			t.Fatalf("foreign callback not forwarded intact: %+v", ev)
+		}
 	default:
+		t.Fatal("foreign callback was not forwarded")
 	}
 }
 

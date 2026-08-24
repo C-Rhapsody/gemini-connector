@@ -32,7 +32,7 @@ type TelegramAdapter struct {
 	albumBuffer map[string][]*tgbotapi.Message
 	albumTimer  map[string]*time.Timer
 	albumMutex  sync.Mutex
-	msgChan     chan InternalMessage
+	msgChan     chan InboundEvent
 }
 
 func NewTelegramAdapter(token string, chatID int64, msgs *Messages, convID func() string, proxyURL string) *TelegramAdapter {
@@ -44,7 +44,7 @@ func NewTelegramAdapter(token string, chatID int64, msgs *Messages, convID func(
 		proxyURL:    strings.TrimSpace(proxyURL),
 		albumBuffer: make(map[string][]*tgbotapi.Message),
 		albumTimer:  make(map[string]*time.Timer),
-		msgChan:     make(chan InternalMessage, 100),
+		msgChan:     make(chan InboundEvent, 100),
 	}
 }
 
@@ -133,7 +133,7 @@ func newTelegramHTTPClient(rawProxyURL string) (*http.Client, error) {
 	return &http.Client{Transport: transport}, nil
 }
 
-func (t *TelegramAdapter) Listen() (<-chan InternalMessage, error) {
+func (t *TelegramAdapter) Listen() (<-chan InboundEvent, error) {
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 	u.AllowedUpdates = []string{"message", "callback_query"}
@@ -162,8 +162,10 @@ func (t *TelegramAdapter) Listen() (<-chan InternalMessage, error) {
 	return t.msgChan, nil
 }
 
-// handleCallbackQuery routes cron inline-keyboard presses into the message
-// pipeline. Non-cron callbacks are acknowledged and dropped.
+// handleCallbackQuery forwards every callback press into the event pipeline
+// as an interaction event. The adapter only enforces the chat allowlist and
+// acknowledges presses nobody downstream claims (the central interaction
+// router owns that decision).
 func (t *TelegramAdapter) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 	if cq.Message == nil {
 		t.AnswerCallbackQuery(cq.ID, "")
@@ -174,27 +176,19 @@ func (t *TelegramAdapter) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 		t.AnswerCallbackQuery(cq.ID, "권한이 없습니다.")
 		return
 	}
-	data := cq.Data
-	if !strings.HasPrefix(data, cronCbConfirm) &&
-		!strings.HasPrefix(data, cronCbCancel) &&
-		!strings.HasPrefix(data, cronCbSelectRef) {
-		t.AnswerCallbackQuery(cq.ID, "")
-		return
-	}
 
 	userID := ""
 	if cq.From != nil {
 		userID = strconv.FormatInt(cq.From.ID, 10)
 	}
-	t.msgChan <- InternalMessage{
+	t.msgChan <- InboundEvent{
 		Platform:     "telegram",
 		UserID:       userID,
 		ChatID:       strconv.FormatInt(cq.Message.Chat.ID, 10),
-		Command:      "/cron-callback",
-		Args:         data,
+		Kind:         EventInteraction,
 		MessageID:    cq.Message.MessageID,
 		CallbackID:   cq.ID,
-		CallbackData: data,
+		CallbackData: cq.Data,
 	}
 }
 
@@ -257,7 +251,7 @@ func (t *TelegramAdapter) Send(chatID string, text string, opts ...SendOptions) 
 	}
 
 	for _, a := range attachments {
-		if err := t.sendAttachment(id, a.path, opt.ReplyToMessageID); err != nil {
+		if err := t.sendAttachmentFile(id, a.path, opt.ReplyToMessageID); err != nil {
 			log.Printf("Attachment send failed (%s): %v", a.path, err)
 			return err
 		}
@@ -358,9 +352,17 @@ func (t *TelegramAdapter) collectDeliverables(after time.Time) []deliverable {
 	return out
 }
 
-// sendAttachment uploads a single local file, choosing the Telegram message
-// type by extension (photo / video / document).
-func (t *TelegramAdapter) sendAttachment(chatID int64, path string, replyToID int) error {
+// SendAttachment uploads a single local file, choosing the Telegram message
+// type by extension (photo / video / document). It implements AttachmentSender.
+func (t *TelegramAdapter) SendAttachment(chatID string, path string, replyTo int) error {
+	id, err := strconv.ParseInt(chatID, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid chat ID: %s", chatID)
+	}
+	return t.sendAttachmentFile(id, path, replyTo)
+}
+
+func (t *TelegramAdapter) sendAttachmentFile(chatID int64, path string, replyToID int) error {
 	var cfg tgbotapi.Chattable
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp":
@@ -461,38 +463,18 @@ func (t *TelegramAdapter) handleIncomingMessage(msg *tgbotapi.Message) {
 		userID = strconv.FormatInt(msg.From.ID, 10)
 	}
 
+	// The adapter identifies commands but never interprets them: every
+	// slash command is forwarded to the central Controller, including
+	// /start, /help and unknown ones.
 	if msg.IsCommand() {
-		switch msg.Command() {
-		case "start", "help":
-			t.Send(chatID, t.msgs.CommandStartHelp, SendOptions{ReplyToMessageID: msg.MessageID})
-		case "reset", "new":
-			t.msgChan <- InternalMessage{
-				Platform:  "telegram",
-				UserID:    userID,
-				ChatID:    chatID,
-				Command:   "/reset",
-				MessageID: msg.MessageID,
-			}
-		case "clear":
-			t.msgChan <- InternalMessage{Platform: "telegram", UserID: userID, ChatID: chatID, Command: "/clear", MessageID: msg.MessageID}
-		case "image":
-			t.msgChan <- InternalMessage{Platform: "telegram", UserID: userID, ChatID: chatID, Command: "/image", Args: msg.CommandArguments(), MessageID: msg.MessageID}
-		case "stop":
-			t.msgChan <- InternalMessage{Platform: "telegram", UserID: userID, ChatID: chatID, Command: "/stop", MessageID: msg.MessageID}
-		case "cron":
-			t.msgChan <- InternalMessage{Platform: "telegram", UserID: userID, ChatID: chatID, Command: "/cron", Args: msg.CommandArguments(), MessageID: msg.MessageID}
-		case "status":
-			t.msgChan <- InternalMessage{Platform: "telegram", UserID: userID, ChatID: chatID, Command: "/status", MessageID: msg.MessageID}
-		case "summary":
-			t.msgChan <- InternalMessage{Platform: "telegram", UserID: userID, ChatID: chatID, Command: "/summary", MessageID: msg.MessageID}
-		case "version":
-			t.msgChan <- InternalMessage{Platform: "telegram", UserID: userID, ChatID: chatID, Command: "/version", MessageID: msg.MessageID}
-		case "list":
-			t.msgChan <- InternalMessage{Platform: "telegram", UserID: userID, ChatID: chatID, Command: "/list", Args: msg.CommandArguments(), MessageID: msg.MessageID}
-		case "switch":
-			t.msgChan <- InternalMessage{Platform: "telegram", UserID: userID, ChatID: chatID, Command: "/switch", Args: msg.CommandArguments(), MessageID: msg.MessageID}
-		default:
-			t.Send(chatID, t.msgs.CommandUnknown, SendOptions{ReplyToMessageID: msg.MessageID})
+		t.msgChan <- InboundEvent{
+			Platform:  "telegram",
+			UserID:    userID,
+			ChatID:    chatID,
+			Kind:      EventCommand,
+			Command:   "/" + msg.Command(),
+			Args:      msg.CommandArguments(),
+			MessageID: msg.MessageID,
 		}
 		return
 	}
@@ -570,10 +552,11 @@ func (t *TelegramAdapter) processSingleMessage(msg *tgbotapi.Message) {
 		content = fmt.Sprintf("[인용된 이전 메시지 (%s)]\n%s\n\n---\n\n[새 메시지]\n%s", role, quote, prompt)
 	}
 
-	t.msgChan <- InternalMessage{
+	t.msgChan <- InboundEvent{
 		Platform:  "telegram",
 		UserID:    userID,
 		ChatID:    chatID,
+		Kind:      EventMessage,
 		Content:   content,
 		MessageID: msg.MessageID,
 	}
@@ -645,10 +628,11 @@ func (t *TelegramAdapter) processAlbum(groupID string, chatID int64) {
 		userID = strconv.FormatInt(messages[0].From.ID, 10)
 	}
 
-	t.msgChan <- InternalMessage{
+	t.msgChan <- InboundEvent{
 		Platform:  "telegram",
 		UserID:    userID,
 		ChatID:    chatIDStr,
+		Kind:      EventMessage,
 		Content:   combinedPrompt.String(),
 		MessageID: messages[0].MessageID,
 	}
@@ -753,4 +737,76 @@ func downloadFile(url string, destPath string) (int, error) {
 
 	_, err = io.Copy(out, resp.Body)
 	return 0, err
+}
+
+// --- Rich interaction capability (InteractiveSender) ---
+
+// SendWithKeyboard posts plain text with inline buttons attached.
+func (t *TelegramAdapter) SendWithKeyboard(chatID string, text string, kb InlineKeyboard) error {
+	id, err := strconv.ParseInt(chatID, 10, 64)
+	if err != nil {
+		return err
+	}
+	msg := tgbotapi.NewMessage(id, text)
+	msg.ReplyMarkup = buildTGKeyboard(kb)
+	if _, err := t.bot.Send(msg); err != nil {
+		log.Printf("Telegram keyboard send failed: %v", err)
+		return err
+	}
+	return nil
+}
+
+// AnswerCallbackQuery acknowledges a button press so Telegram stops showing
+// the loading spinner on the client. Failures are non-fatal.
+func (t *TelegramAdapter) AnswerCallbackQuery(callbackID, text string) {
+	if t.bot == nil || callbackID == "" {
+		return
+	}
+	cb := tgbotapi.NewCallback(callbackID, text)
+	cb.ShowAlert = false
+	if _, err := t.bot.Request(cb); err != nil {
+		log.Printf("Telegram callback answer failed: %v", err)
+	}
+}
+
+// EditMessage rewrites an existing bot message in place; a nil keyboard
+// removes any buttons, which is how consumed confirmations retire their UI.
+func (t *TelegramAdapter) EditMessage(chatID string, messageID int, text string, kb InlineKeyboard) {
+	id, err := strconv.ParseInt(chatID, 10, 64)
+	if err != nil || messageID <= 0 {
+		return
+	}
+	edit := tgbotapi.NewEditMessageText(id, messageID, text)
+	if kb != nil {
+		markup := buildTGKeyboard(kb)
+		edit.ReplyMarkup = &markup
+	}
+	if _, err := t.bot.Request(edit); err != nil {
+		log.Printf("Telegram message edit failed: %v", err)
+	}
+}
+
+func buildTGKeyboard(kb InlineKeyboard) tgbotapi.InlineKeyboardMarkup {
+	rows := make([][]tgbotapi.InlineKeyboardButton, 0, len(kb))
+	for _, row := range kb {
+		buttons := make([]tgbotapi.InlineKeyboardButton, 0, len(row))
+		for _, b := range row {
+			buttons = append(buttons, tgbotapi.NewInlineKeyboardButtonData(b.Text, b.Data))
+		}
+		rows = append(rows, buttons)
+	}
+	return tgbotapi.NewInlineKeyboardMarkup(rows...)
+}
+
+// redactToken removes secret material from error strings before they reach
+// the log file; Telegram API errors historically embed the full request URL,
+// including the bot token.
+func redactToken(msg string, secrets ...string) string {
+	for _, s := range secrets {
+		if s == "" {
+			continue
+		}
+		msg = strings.ReplaceAll(msg, s, "***")
+	}
+	return msg
 }

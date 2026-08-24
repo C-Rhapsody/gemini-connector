@@ -41,16 +41,41 @@ func (e *AgyError) Error() string {
 	return fmt.Sprintf("%s: %s", e.Type, e.Detail)
 }
 
+// AgyProfile selects the execution policy of one agy invocation. Profiles
+// make the intent explicit at the call site instead of leaking boolean
+// flags (e.g. planner mode) through the runner boundary.
+type AgyProfile int
+
+const (
+	// ProfileInteractive is a regular user chat turn.
+	ProfileInteractive AgyProfile = iota
+	// ProfilePlanner runs under plan/sandbox restrictions for /cron candidate
+	// generation: the model must answer with a single JSON object and cannot
+	// modify the workspace while producing it.
+	ProfilePlanner
+	// ProfileScheduled is a cron-triggered background turn.
+	ProfileScheduled
+	// ProfileBootstrap creates or replays into a fresh conversation.
+	ProfileBootstrap
+)
+
+// agyInvoker indirection lets controller-level tests stub interactive turns.
+var agyInvoker = executeAgy
+
+func swapAgyInvoker(fn func(ctx context.Context, prompt string, conversationID string, opts ...AgyCallOptions) (string, error)) func() {
+	old := agyInvoker
+	agyInvoker = fn
+	return func() { agyInvoker = old }
+}
+
 // AgyCallOptions tweaks individual agy invocations.
 type AgyCallOptions struct {
+	// Profile selects argument assembly and execution policy.
+	Profile AgyProfile
 	// BypassQuotaGate lets the call proceed even while a 429 quota cooldown
 	// is active. Used for explicit commands (/reset, /clear), which should
 	// always attempt execution; regular chat turns keep being gated.
 	BypassQuotaGate bool
-	// PlannerMode runs the call under plan/sandbox restrictions for /cron
-	// candidate generation: the model must answer with a single JSON object
-	// and cannot modify the workspace while producing it.
-	PlannerMode bool
 }
 
 // quotaBlockErr returns the rejection error for gated calls during an active
@@ -84,7 +109,7 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 		"--dangerously-skip-permissions",
 		"--print-timeout", "5m",
 	}
-	if o.PlannerMode {
+	if o.Profile == ProfilePlanner {
 		args = append(args, "--mode", "plan", "--sandbox", "--disable-slash-commands")
 	}
 	if conversationID != "" {

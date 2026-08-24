@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -173,4 +175,136 @@ func switchConversation(cfg *Config, adapter Messenger, chatID, args string, rep
 	}
 	cfg.applyNewConversation(newID)
 	adapter.Send(chatID, fmt.Sprintf("✅ 대화를 전환했습니다. (새 대화 ID: %s)", truncateString(newID, 8)), SendOptions{ReplyToMessageID: replyTo})
+}
+
+// resetConversation summarizes the old conversation into a fresh agy
+// conversation, persists the new ID to .env, replays the given prompt on the
+// new session, and deletes the old session artifacts. Cancelling ctx aborts
+// the underlying agy calls silently.
+func resetConversation(ctx context.Context, cfg *Config, adapter Messenger, chatID string, replyTo int, replayPrompt string, msgs *Messages) {
+	oldID := cfg.ConversationID()
+	log.Printf("Resetting conversation. Old conversation ID: %s", oldID)
+
+	replyOpt := SendOptions{ReplyToMessageID: replyTo}
+
+	summaryPrompt := buildSummaryPrompt(oldID)
+	if strings.TrimSpace(summaryPrompt) == "" {
+		summaryPrompt = "This connector bridges Telegram to agy. Reply only with 'agy Connector Ready.'"
+	}
+
+	// Commands and self-healing outrank the quota cooldown (see /clear).
+	newID, _, err := createNewConversationRuntimeWithPrompt(ctx, summaryPrompt, AgyCallOptions{Profile: ProfileBootstrap, BypassQuotaGate: true})
+	if err != nil {
+		if ctx.Err() != nil {
+			log.Printf("Conversation reset cancelled by /stop")
+			return
+		}
+		if ae, ok := err.(*AgyError); ok && ae.Type == "quota_cooldown" {
+			// Creating a conversation is an agy call too; respect cooldown.
+			adapter.Send(chatID, fmt.Sprintf(msgs.ErrorSystemResponse, QuotaRefreshedDetail()), replyOpt)
+			return
+		}
+		log.Printf("Failed to create new conversation: %v", err)
+		cfg.applyNewConversation(oldID)
+		adapter.Send(chatID, fmt.Sprintf("⚠️ 새 대화 세션 생성에 실패했습니다: %v", err), replyOpt)
+		return
+	}
+
+	if err := updateEnvKey(cfg.envPath, "AGY_CONVERSATION_ID", newID); err != nil {
+		log.Printf("Failed to update .env with new conversation ID: %v", err)
+	}
+	cfg.applyNewConversation(newID)
+	log.Printf("Conversation reset complete. New conversation ID: %s", newID)
+	QuotaClear()
+
+	deleteConversationArtifacts(oldID)
+	deleteTranscript(oldID)
+
+	notice := fmt.Sprintf("⚠️ 이전 대화를 요약해 새 세션으로 전환했습니다. (새 세션 ID: %s)", truncateString(newID, 8))
+
+	if replayPrompt != "" {
+		response, rerr := executeAgy(ctx, replayPrompt, newID, AgyCallOptions{Profile: ProfileBootstrap, BypassQuotaGate: true})
+		if rerr == nil && response != "" && ctx.Err() == nil {
+			appendTranscript(newID, "user", replayPrompt)
+			appendTranscript(newID, "assistant", response)
+			adapter.Send(chatID, notice+"\n\n"+response, replyOpt)
+			return
+		}
+		if ctx.Err() != nil {
+			log.Printf("Replay on new conversation cancelled by /stop")
+			return
+		}
+		if rerr != nil {
+			log.Printf("Replay on new conversation failed: %v", rerr)
+		}
+	}
+
+	adapter.Send(chatID, notice, replyOpt)
+}
+
+// clearConversation deletes the current session's artifacts (DB, brain
+// folder, transcript) and starts a completely fresh conversation without any
+// summary carry-over. The new session is created first; the old artifacts are
+// only removed after success, so a failure (or /stop cancellation) leaves the
+// existing session intact.
+func clearConversation(ctx context.Context, cfg *Config, adapter Messenger, chatID string, replyTo int, msgs *Messages) {
+	oldID := cfg.ConversationID()
+	log.Printf("Clearing conversation %s (no summary carry-over)", truncateString(oldID, 8))
+
+	replyOpt := SendOptions{ReplyToMessageID: replyTo}
+
+	// User commands outrank the quota cooldown: attempt execution even while
+	// it is active. A repeated 429 is captured back into the cooldown.
+	bootstrap := "This connector bridges Telegram to agy. Reply only with 'agy Connector Ready.'"
+	newID, _, err := createNewConversationRuntimeWithPrompt(ctx, bootstrap, AgyCallOptions{Profile: ProfileBootstrap, BypassQuotaGate: true})
+	if err != nil {
+		if ctx.Err() != nil {
+			log.Printf("Conversation clear cancelled by /stop")
+			return
+		}
+		if ae, ok := err.(*AgyError); ok && ae.Type == "quota_cooldown" {
+			adapter.Send(chatID, fmt.Sprintf(msgs.ErrorSystemResponse, QuotaRefreshedDetail()), replyOpt)
+			return
+		}
+		log.Printf("Failed to create replacement conversation: %v", err)
+		adapter.Send(chatID, fmt.Sprintf("⚠️ 새 세션 생성에 실패했습니다. 기존 세션이 유지됩니다: %v", err), replyOpt)
+		return
+	}
+
+	if err := updateEnvKey(cfg.envPath, "AGY_CONVERSATION_ID", newID); err != nil {
+		log.Printf("Failed to update .env with new conversation ID: %v", err)
+	}
+	cfg.applyNewConversation(newID)
+
+	if oldID != "" {
+		deleteConversationArtifacts(oldID)
+		deleteTranscript(oldID)
+	}
+	log.Printf("Conversation cleared. New conversation ID: %s", newID)
+	// The successful agy call proves quota is available again; drop any stale
+	// cooldown so regular chat turns are not blocked unnecessarily.
+	QuotaClear()
+	adapter.Send(chatID, fmt.Sprintf("🗑️ 대화 기록을 모두 지우고 새 세션을 시작했습니다. (새 세션 ID: %s)", truncateString(newID, 8)), replyOpt)
+}
+
+// deleteConversationArtifacts removes the old conversation's on-disk state
+// (SQLite files and brain folder) in a best-effort manner.
+func deleteConversationArtifacts(convID string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	base := filepath.Join(home, ".gemini", "antigravity-cli")
+
+	for _, suffix := range []string{"", "-shm", "-wal"} {
+		p := filepath.Join(base, "conversations", convID+".db"+suffix)
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			log.Printf("Failed to delete old conversation file %s: %v", p, err)
+		}
+	}
+
+	brainDir := filepath.Join(base, "brain", convID)
+	if err := os.RemoveAll(brainDir); err != nil && !os.IsNotExist(err) {
+		log.Printf("Failed to delete old conversation brain dir %s: %v", brainDir, err)
+	}
 }

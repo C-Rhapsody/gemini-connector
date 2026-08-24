@@ -15,36 +15,50 @@ import (
 // cronPlannerFunc generates candidate JSON via agy. Injectable for tests.
 type cronPlannerFunc func(ctx context.Context, prompt string) (string, error)
 
+// CronSurface is everything the cron subsystem (service + scheduler) may call
+// on the messaging side: plain sends, typing state and rich interactions.
+// Telegram implements it; tests stub it. Cron code never depends on a
+// concrete adapter type.
+type CronSurface interface {
+	Send(chatID string, text string, opts ...SendOptions) error
+	StartTyping(chatID string) (stop func())
+	SendWithKeyboard(chatID string, text string, kb InlineKeyboard) error
+	AnswerCallbackQuery(callbackID, text string)
+	EditMessage(chatID string, messageID int, text string, kb InlineKeyboard)
+}
+
 // CronService implements the /cron command surface: planning, validation,
 // target selection, confirmation buttons, idempotency and the kill switch.
 // It owns no scheduling logic itself; successful writes nudge the scheduler.
 type CronService struct {
-	store   *CronStore
-	cfg     *Config
-	ui      CronTelegramUI
-	planner cronPlannerFunc
-	clock   cronClock
-	sched   *CronScheduler
-	admins  map[string]bool
+	store          *CronStore
+	convID         func() string
+	missingConvMsg string
+	ui             CronSurface
+	planner        cronPlannerFunc
+	clock          cronClock
+	sched          *CronScheduler
+	admins         map[string]bool
 }
 
-func NewCronService(store *CronStore, cfg *Config, ui CronTelegramUI, planner cronPlannerFunc, admins []string, sched *CronScheduler) *CronService {
+func NewCronService(store *CronStore, convID func() string, missingConvMsg string, ui CronSurface, planner cronPlannerFunc, admins []string, sched *CronScheduler) *CronService {
 	adminSet := make(map[string]bool, len(admins))
 	for _, id := range admins {
 		adminSet[strings.TrimSpace(id)] = true
 	}
 	return &CronService{
-		store:   store,
-		cfg:     cfg,
-		ui:      ui,
-		planner: planner,
-		clock:   realCronClock{},
-		sched:   sched,
-		admins:  adminSet,
+		store:          store,
+		convID:         convID,
+		missingConvMsg: missingConvMsg,
+		ui:             ui,
+		planner:        planner,
+		clock:          realCronClock{},
+		sched:          sched,
+		admins:         adminSet,
 	}
 }
 
-func (s *CronService) ownerOf(m InternalMessage) CronOwner {
+func (s *CronService) ownerOf(m InboundEvent) CronOwner {
 	return CronOwner{Platform: m.Platform, ChatID: m.ChatID, UserID: m.UserID}
 }
 
@@ -68,7 +82,7 @@ const (
 )
 
 // HandleMessage processes an inbound /cron command.
-func (s *CronService) HandleMessage(m InternalMessage) {
+func (s *CronService) HandleMessage(m InboundEvent) {
 	if m.Platform != "telegram" {
 		s.ui.Send(m.ChatID, "⚠️ cron 기능은 현재 Telegram에서만 지원됩니다.", SendOptions{ReplyToMessageID: m.MessageID})
 		return
@@ -108,7 +122,7 @@ func (s *CronService) HandleMessage(m InternalMessage) {
 	}
 }
 
-func (s *CronService) cmdList(m InternalMessage, owner CronOwner) {
+func (s *CronService) cmdList(m InboundEvent, owner CronOwner) {
 	jobs, err := s.store.ListJobs(owner)
 	if err != nil {
 		s.ui.Send(m.ChatID, fmt.Sprintf("⚠️ 목록 조회 실패: %v", err), SendOptions{ReplyToMessageID: m.MessageID})
@@ -137,7 +151,7 @@ func (s *CronService) cmdList(m InternalMessage, owner CronOwner) {
 	s.ui.Send(m.ChatID, strings.TrimRight(b.String(), "\n"), SendOptions{Plain: true, ReplyToMessageID: m.MessageID})
 }
 
-func (s *CronService) cmdKill(m InternalMessage, owner CronOwner, kill bool) {
+func (s *CronService) cmdKill(m InboundEvent, owner CronOwner, kill bool) {
 	if !s.admins[owner.UserID] {
 		s.audit(&owner, "reject_admin", "high", "kill="+fmt.Sprint(kill))
 		s.ui.Send(m.ChatID, cronNotAdminNotice, SendOptions{ReplyToMessageID: m.MessageID})
@@ -160,7 +174,7 @@ func (s *CronService) cmdKill(m InternalMessage, owner CronOwner, kill bool) {
 	}
 }
 
-func (s *CronService) cmdStatus(m InternalMessage, owner CronOwner) {
+func (s *CronService) cmdStatus(m InboundEvent, owner CronOwner) {
 	killed, err := s.store.Killed()
 	if err != nil {
 		s.ui.Send(m.ChatID, fmt.Sprintf("⚠️ 상태 조회 실패: %v", err), SendOptions{ReplyToMessageID: m.MessageID})
@@ -179,7 +193,7 @@ func (s *CronService) audit(actor *CronOwner, event, severity, detail string) {
 
 // --- Planner flow ---
 
-func cronIdempotencyKey(m InternalMessage, args string) string {
+func cronIdempotencyKey(m InboundEvent, args string) string {
 	normalized := strings.Join(strings.Fields(args), " ")
 	sum := sha256.Sum256([]byte(strings.Join([]string{
 		m.Platform, m.ChatID, m.UserID,
@@ -189,7 +203,7 @@ func cronIdempotencyKey(m InternalMessage, args string) string {
 }
 
 // planFlow turns natural language into a validated cron command through agy.
-func (s *CronService) planFlow(m InternalMessage, owner CronOwner, args string) {
+func (s *CronService) planFlow(m InboundEvent, owner CronOwner, args string) {
 	replyOpt := SendOptions{ReplyToMessageID: m.MessageID}
 
 	key := cronIdempotencyKey(m, args)
@@ -198,8 +212,8 @@ func (s *CronService) planFlow(m InternalMessage, owner CronOwner, args string) 
 		return
 	}
 
-	if s.cfg.ConversationID() == "" {
-		s.ui.Send(m.ChatID, s.cfg.ErrorMissingUUIDMsg(), replyOpt)
+	if s.convID() == "" {
+		s.ui.Send(m.ChatID, s.missingConvMsg, replyOpt)
 		return
 	}
 
@@ -258,7 +272,7 @@ func (s *CronService) callPlanner(prompt string) (string, error) {
 	return s.planner(ctx, prompt)
 }
 
-func (s *CronService) failPlan(m InternalMessage, key, text string) {
+func (s *CronService) failPlan(m InboundEvent, key, text string) {
 	s.remember(key, text)
 	s.ui.Send(m.ChatID, text, SendOptions{ReplyToMessageID: m.MessageID})
 }
@@ -274,7 +288,7 @@ func (s *CronService) remember(key, text string) {
 
 // beginConfirm resolves the target (explicit ref / unambiguous single job /
 // selection buttons) and posts the confirmation UI for write actions.
-func (s *CronService) beginConfirm(m InternalMessage, owner CronOwner, key string, spec cronCommandSpec, refs map[int64]string, jobs []CronJobRecord) {
+func (s *CronService) beginConfirm(m InboundEvent, owner CronOwner, key string, spec cronCommandSpec, refs map[int64]string, jobs []CronJobRecord) {
 	replyOpt := SendOptions{ReplyToMessageID: m.MessageID}
 
 	if spec.Action == CronActionCreate {
@@ -335,7 +349,7 @@ func (s *CronService) beginConfirm(m InternalMessage, owner CronOwner, key strin
 	s.audit(&owner, "select_offered", "info", fmt.Sprintf("action=%s candidates=%d", spec.Action, len(active)))
 }
 
-func (s *CronService) handleTargetFailure(m InternalMessage, owner CronOwner, key string, spec cronCommandSpec, err error) {
+func (s *CronService) handleTargetFailure(m InboundEvent, owner CronOwner, key string, spec cronCommandSpec, err error) {
 	var text string
 	switch {
 	case errors.Is(err, errCronNotFound):
@@ -350,7 +364,7 @@ func (s *CronService) handleTargetFailure(m InternalMessage, owner CronOwner, ke
 
 // postConfirmationFromStore loads the live job and hands off to
 // postConfirmation with a rendered before-state.
-func (s *CronService) postConfirmationFromStore(m InternalMessage, owner CronOwner, key string, spec cronCommandSpec, jobID, rev int64, replyOpt SendOptions) {
+func (s *CronService) postConfirmationFromStore(m InboundEvent, owner CronOwner, key string, spec cronCommandSpec, jobID, rev int64, replyOpt SendOptions) {
 	job, err := s.store.GetJob(owner, jobID)
 	if err != nil || job.Revision != rev {
 		text := "⚠️ 대상 작업이 최근 변경되었습니다. /cron 을 다시 실행해 주세요."
@@ -369,7 +383,7 @@ func (s *CronService) postConfirmationFromStore(m InternalMessage, owner CronOwn
 }
 
 // postConfirmation freezes the change into a confirm/cancel button pair.
-func (s *CronService) postConfirmation(m InternalMessage, owner CronOwner, key string, spec cronCommandSpec, jobID, revision int64, beforeText string, replyOpt SendOptions) {
+func (s *CronService) postConfirmation(m InboundEvent, owner CronOwner, key string, spec cronCommandSpec, jobID, revision int64, beforeText string, replyOpt SendOptions) {
 	payloadBytes, _ := json.Marshal(cronConfirmPayload{Spec: spec, JobID: jobID, Revision: revision, BeforeText: beforeText})
 	ctok, xtok, err := s.store.PutConfirmationPair(owner, spec.Action, string(payloadBytes), 0, s.clock)
 	if err != nil {
@@ -431,7 +445,7 @@ func summarizeCronSpec(spec cronCommandSpec) string {
 // --- Callbacks ---
 
 // HandleCallback processes inline-keyboard presses routed as /cron-callback.
-func (s *CronService) HandleCallback(m InternalMessage) {
+func (s *CronService) HandleCallback(m InboundEvent) {
 	owner := s.ownerOf(m)
 	data := m.CallbackData
 	if data == "" {
@@ -467,7 +481,7 @@ func (s *CronService) HandleCallback(m InternalMessage) {
 	}
 }
 
-func (s *CronService) onSelectPressed(m InternalMessage, owner CronOwner, confToken, refToken string, edit func(string), answer func(string)) {
+func (s *CronService) onSelectPressed(m InboundEvent, owner CronOwner, confToken, refToken string, edit func(string), answer func(string)) {
 	jobID, rev, err := s.store.ConsumeTargetRef(refToken, owner, s.clock)
 	if err != nil {
 		if errors.Is(err, errCronNotFound) {
@@ -508,7 +522,7 @@ func (s *CronService) onSelectPressed(m InternalMessage, owner CronOwner, confTo
 	// The new confirmation arrives as a separate keyboard message.
 }
 
-func (s *CronService) onConfirmPressed(m InternalMessage, owner CronOwner, token string, edit func(string), answer func(string)) {
+func (s *CronService) onConfirmPressed(m InboundEvent, owner CronOwner, token string, edit func(string), answer func(string)) {
 	conf, err := s.store.ConsumeConfirmation(token, owner, s.clock)
 	if err != nil {
 		if errors.Is(err, errCronNotFound) {
@@ -725,10 +739,4 @@ func buildCronPlannerPrompt(jobLines []string, userRequest string, now time.Time
 	}
 	b.WriteString("[사용자 요청]\n" + userRequest + "\n")
 	return b.String()
-}
-
-// ErrorMissingUUIDMsg exposes the shared missing-conversation notice without
-// coupling the service to Messages plumbing.
-func (c *Config) ErrorMissingUUIDMsg() string {
-	return defaultMessages.ErrorMissingUUID
 }

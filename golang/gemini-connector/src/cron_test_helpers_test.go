@@ -60,7 +60,7 @@ type stubCronUI struct {
 }
 
 func (s *stubCronUI) Init() error { return nil }
-func (s *stubCronUI) Listen() (<-chan InternalMessage, error) {
+func (s *stubCronUI) Listen() (<-chan InboundEvent, error) {
 	return nil, nil
 }
 func (s *stubCronUI) GetFile(id string) (string, error) { return "", nil }
@@ -178,9 +178,9 @@ func testOwner(id string) CronOwner {
 	return CronOwner{Platform: "telegram", ChatID: "-100chat", UserID: id}
 }
 
-// cronMsg builds a /cron InternalMessage.
-func cronMsg(user string, args string, msgID int) InternalMessage {
-	return InternalMessage{
+// cronMsg builds a /cron InboundEvent.
+func cronMsg(user string, args string, msgID int) InboundEvent {
+	return InboundEvent{
 		Platform:  "telegram",
 		UserID:    user,
 		ChatID:    testOwner(user).ChatID,
@@ -190,8 +190,8 @@ func cronMsg(user string, args string, msgID int) InternalMessage {
 	}
 }
 
-func cbMsg(user, data string, msgID int) InternalMessage {
-	return InternalMessage{
+func cbMsg(user, data string, msgID int) InboundEvent {
+	return InboundEvent{
 		Platform:     "telegram",
 		UserID:       user,
 		ChatID:       testOwner(user).ChatID,

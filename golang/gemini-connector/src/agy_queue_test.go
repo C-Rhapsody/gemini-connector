@@ -7,7 +7,12 @@ import (
 	"time"
 )
 
-func waitQueueIdle(t *testing.T, q *agyTurnQueue) {
+// busyReporter lets waitQueueIdle work for both raw queues and coordinators.
+type busyReporter interface {
+	Busy() bool
+}
+
+func waitQueueIdle(t *testing.T, q busyReporter) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for q.Busy() {
@@ -70,11 +75,13 @@ func TestAgyTurnQueue_EnqueueReportsWaiting(t *testing.T) {
 
 func TestAgyTurnQueue_StopCancelsActiveAndDropsQueued(t *testing.T) {
 	q := newAgyTurnQueue()
+	started := make(chan struct{})
 	cancelled := make(chan struct{})
 	var droppedRan bool
 	var mu sync.Mutex
 
 	q.Enqueue(func(ctx context.Context) {
+		close(started)
 		<-ctx.Done()
 		close(cancelled)
 	})
@@ -86,6 +93,8 @@ func TestAgyTurnQueue_StopCancelsActiveAndDropsQueued(t *testing.T) {
 	if ahead != 0 { // nothing running yet at enqueue time is fine either way
 		t.Logf("queued job reported ahead=%d", ahead)
 	}
+
+	<-started // deterministic: the first job has been claimed by the worker
 
 	active, dropped := q.StopActive()
 	if !active {
@@ -149,6 +158,69 @@ func TestAgyTurnQueue_StopWhenIdle(t *testing.T) {
 	active, dropped := q.StopActive()
 	if active || dropped != 0 {
 		t.Fatalf("idle stop should be a no-op, got active=%v dropped=%d", active, dropped)
+	}
+}
+
+// TestAgyTurnQueue_StopStartRaceStress hammers Enqueue and StopActive
+// concurrently. It pins down the historical race where StopActive could run
+// between Enqueue and the worker's first claim: whatever the interleaving,
+// dropped jobs must never execute, onDrop must fire exactly once per dropped
+// hook-bearing job, and the queue must keep working afterwards.
+func TestAgyTurnQueue_StopStartRaceStress(t *testing.T) {
+	for iteration := 0; iteration < 200; iteration++ {
+		q := newAgyTurnQueue()
+
+		const jobsPerRound = 8
+		var mu sync.Mutex
+		ran := make(map[int]bool)
+		drops := make(map[int]int)
+
+		stopDone := make(chan struct{})
+		go func() {
+			defer close(stopDone)
+			time.Sleep(time.Duration(iteration%7) * time.Microsecond)
+			q.StopActive()
+		}()
+
+		for i := 0; i < jobsPerRound; i++ {
+			i := i
+			q.EnqueueManaged(func(ctx context.Context) {
+				time.Sleep(time.Millisecond)
+				mu.Lock()
+				ran[i] = true
+				mu.Unlock()
+			}, func() {
+				mu.Lock()
+				drops[i]++
+				mu.Unlock()
+			})
+		}
+
+		<-stopDone
+		waitQueueIdle(t, q)
+
+		mu.Lock()
+		for id := range drops {
+			if drops[id] != 1 {
+				mu.Unlock()
+				t.Fatalf("iteration %d: onDrop fired %d times for job %d", iteration, drops[id], id)
+			}
+			if ran[id] {
+				mu.Unlock()
+				t.Fatalf("iteration %d: dropped job %d executed", iteration, id)
+			}
+		}
+		mu.Unlock()
+
+		// The queue must remain fully functional after a stop.
+		done := make(chan struct{})
+		q.Enqueue(func(ctx context.Context) { close(done) })
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("iteration %d: queue unusable after stop", iteration)
+		}
+		waitQueueIdle(t, q)
 	}
 }
 

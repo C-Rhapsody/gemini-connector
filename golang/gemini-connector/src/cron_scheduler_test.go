@@ -12,6 +12,13 @@ func cfgForScheduler() *Config {
 	return &Config{TelegramChatID: 42, AgyConversationID: "conv-test"}
 }
 
+// convForScheduler mirrors the production wiring: a read accessor over the
+// active conversation ID.
+func convForScheduler() func() string {
+	cfg := cfgForScheduler()
+	return cfg.ConversationID
+}
+
 // seedDueJob inserts an enabled job whose single periodic trigger is due in
 // dueIn relative to the fake clock.
 func seedDueJob(t *testing.T, store *CronStore, clock *fakeClock, owner CronOwner, cronExpr string, dueIn time.Duration) int64 {
@@ -45,12 +52,12 @@ func (r *execRecorder) count() int {
 	return len(r.runs)
 }
 
-func newTestScheduler(store *CronStore, clock *fakeClock, ui Messenger, rec *execRecorder) (*CronScheduler, *agyTurnQueue) {
-	q := newAgyTurnQueue()
-	sched := NewCronScheduler(store, cfgForScheduler(), ui, rec.execute)
+func newTestScheduler(store *CronStore, clock *fakeClock, ui CronSurface, rec *execRecorder) (*CronScheduler, *TurnCoordinator) {
+	turns := NewTurnCoordinator()
+	sched := NewCronScheduler(store, convForScheduler(), ui, rec.execute)
 	sched.clock = clock
-	sched.SetQueue(q)
-	return sched, q
+	sched.SetCoordinator(turns)
+	return sched, turns
 }
 
 func TestCronScheduler_ClaimRunAndDedup(t *testing.T) {
@@ -194,8 +201,7 @@ func TestCronScheduler_ReconcileSkipsMissedSlots(t *testing.T) {
 }
 
 func TestDefaultExecutor_WrapperConversationPlainSend(t *testing.T) {
-	cfg := cfgForScheduler()
-	cfg.AgyConversationID = "conv-123"
+	conv := func() string { return "conv-123" }
 
 	restore := swapCronAgyRunner(func(ctx context.Context, prompt, convID string) (string, error) {
 		if convID != "conv-123" {
@@ -209,7 +215,7 @@ func TestDefaultExecutor_WrapperConversationPlainSend(t *testing.T) {
 	defer restore()
 
 	ui := &stubCronUI{}
-	ex := defaultCronJobExecutor(cfg, ui)
+	ex := defaultCronJobExecutor(conv, ui)
 	err := ex(context.Background(), ScheduledExecution{
 		ExecutionID: 1,
 		Slot:        time.Now(),
@@ -228,7 +234,7 @@ func TestDefaultExecutor_WrapperConversationPlainSend(t *testing.T) {
 }
 
 func TestDefaultExecutor_NoActiveConversationFails(t *testing.T) {
-	cfg := &Config{TelegramChatID: 42} // empty AgyConversationID
+	conv := func() string { return "" }
 	restore := swapCronAgyRunner(func(ctx context.Context, prompt, convID string) (string, error) {
 		t.Fatal("agy must not be called without a conversation")
 		return "", nil
@@ -236,7 +242,7 @@ func TestDefaultExecutor_NoActiveConversationFails(t *testing.T) {
 	defer restore()
 
 	ui := &stubCronUI{}
-	err := defaultCronJobExecutor(cfg, ui)(context.Background(), ScheduledExecution{
+	err := defaultCronJobExecutor(conv, ui)(context.Background(), ScheduledExecution{
 		Job:   CronJobRecord{ID: 6},
 		Owner: testOwner("921"),
 	})

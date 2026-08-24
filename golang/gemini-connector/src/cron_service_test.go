@@ -9,7 +9,7 @@ func newTestService(t *testing.T, clock *fakeClock, planner cronPlannerFunc, adm
 	t.Helper()
 	store := newTestCronStore(t)
 	ui := &stubCronUI{}
-	svc := NewCronService(store, cfgForScheduler(), ui, planner, admins, nil)
+	svc := NewCronService(store, convForScheduler(), defaultMessages.ErrorMissingUUID, ui, planner, admins, nil)
 	svc.clock = clock
 	return svc, ui, store
 }
