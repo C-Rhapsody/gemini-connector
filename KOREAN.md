@@ -127,13 +127,17 @@ cd golang/gemini-connector/bin
 | --- | --- |
 | `--port <번호>` | 단일 인스턴스 잠금에 사용할 포트 (기본값: 49152) |
 | `--env <경로>` | `.env` 파일 위치 직접 지정 (기본값: 실행 파일 기준 `../src/.env`) |
+| `--telegram-proxy <URL>` | Telegram 전체 통신에 사용할 프록시 (`http://`, `https://`, `socks5://`, `socks5h://`) |
 
 `--env`에 상대경로를 지정하면 현재 작업 디렉터리 기준으로 해석됩니다. 지정한 파일이 없으면 기존 설정 마법사가 해당 위치에 생성합니다.
 
 ```bash
 ./gemini-connector_windows_x64.exe --env C:\configs\gemini-connector.env
 ./gemini-connector_linux_x64 --env /etc/gemini-connector/.env
+./gemini-connector_windows_x64.exe --telegram-proxy socks5://127.0.0.1:1080
 ```
+
+프록시 옵션을 지정하지 않으면 Telegram에 직접 연결합니다. 사용자명과 비밀번호가 포함된 프록시 URL은 실행 명령줄이나 프로세스 목록에 노출될 수 있으므로 주의하십시오.
 
 ## ⚠️ 주의 및 면책 조항 (Disclaimer)
 

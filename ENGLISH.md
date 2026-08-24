@@ -127,13 +127,17 @@ cd golang/gemini-connector/bin
 | --- | --- |
 | `--port <number>` | Port used for the single-instance lock (default: 49152) |
 | `--env <path>` | Explicit location of the `.env` file (default: `../src/.env` relative to the executable) |
+| `--telegram-proxy <URL>` | Proxy for all Telegram traffic (`http://`, `https://`, `socks5://`, or `socks5h://`) |
 
 A relative `--env` path is resolved against the current working directory. If the given file does not exist yet, the setup wizard creates it there.
 
 ```bash
 ./gemini-connector_windows_x64.exe --env C:\configs\gemini-connector.env
 ./gemini-connector_linux_x64 --env /etc/gemini-connector/.env
+./gemini-connector_windows_x64.exe --telegram-proxy socks5://127.0.0.1:1080
 ```
+
+If no proxy option is provided, Telegram traffic uses a direct connection. Be aware that proxy URLs containing usernames and passwords may be visible in the shell history or process list.
 
 ## ⚠️ Disclaimer and Risk Warning
 

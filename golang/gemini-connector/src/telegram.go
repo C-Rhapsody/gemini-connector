@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -15,6 +19,7 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	xproxy "golang.org/x/net/proxy"
 )
 
 type TelegramAdapter struct {
@@ -23,18 +28,20 @@ type TelegramAdapter struct {
 	chatID      int64
 	msgs        *Messages
 	convID      func() string
+	proxyURL    string
 	albumBuffer map[string][]*tgbotapi.Message
 	albumTimer  map[string]*time.Timer
 	albumMutex  sync.Mutex
 	msgChan     chan InternalMessage
 }
 
-func NewTelegramAdapter(token string, chatID int64, msgs *Messages, convID func() string) *TelegramAdapter {
+func NewTelegramAdapter(token string, chatID int64, msgs *Messages, convID func() string, proxyURL string) *TelegramAdapter {
 	return &TelegramAdapter{
 		token:       token,
 		chatID:      chatID,
 		msgs:        msgs,
 		convID:      convID,
+		proxyURL:    strings.TrimSpace(proxyURL),
 		albumBuffer: make(map[string][]*tgbotapi.Message),
 		albumTimer:  make(map[string]*time.Timer),
 		msgChan:     make(chan InternalMessage, 100),
@@ -42,9 +49,15 @@ func NewTelegramAdapter(token string, chatID int64, msgs *Messages, convID func(
 }
 
 func (t *TelegramAdapter) Init() error {
-	bot, err := tgbotapi.NewBotAPI(t.token)
+	client, err := newTelegramHTTPClient(t.proxyURL)
 	if err != nil {
-		return fmt.Errorf("bot init error: %v", err)
+		return fmt.Errorf("telegram proxy configuration: %w", err)
+	}
+	bot, err := tgbotapi.NewBotAPIWithClient(t.token, tgbotapi.APIEndpoint, client)
+	if err != nil {
+		// Telegram API errors embed the request URL, which contains the bot
+		// token; scrub it before the message reaches bot.log.
+		return fmt.Errorf("bot init error: %s", redactToken(err.Error(), t.token))
 	}
 	t.bot = bot
 	log.Printf("Bot Authorized as: %s", bot.Self.UserName)
@@ -67,6 +80,56 @@ func (t *TelegramAdapter) Init() error {
 		log.Printf("Failed to register bot commands: %v", err)
 	}
 	return nil
+}
+
+// newTelegramHTTPClient creates the single HTTP client used by every Telegram
+// API operation. A direct client explicitly disables environment proxy
+// variables so an empty --telegram-proxy value has deterministic behavior.
+func newTelegramHTTPClient(rawProxyURL string) (*http.Client, error) {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return nil, errors.New("unexpected default HTTP transport type")
+	}
+	transport := base.Clone()
+	transport.Proxy = nil
+
+	rawProxyURL = strings.TrimSpace(rawProxyURL)
+	if rawProxyURL == "" {
+		log.Println("Telegram proxy disabled; using direct connection")
+		return &http.Client{Transport: transport}, nil
+	}
+
+	proxyURL, err := url.Parse(rawProxyURL)
+	if err != nil {
+		// Do not include the raw URL: it may contain proxy credentials.
+		return nil, errors.New("invalid proxy URL")
+	}
+	proxyURL.Scheme = strings.ToLower(proxyURL.Scheme)
+	if proxyURL.Host == "" {
+		return nil, errors.New("proxy URL must include a host")
+	}
+
+	switch proxyURL.Scheme {
+	case "http", "https":
+		transport.Proxy = http.ProxyURL(proxyURL)
+	case "socks5", "socks5h":
+		dialer, err := xproxy.FromURL(proxyURL, xproxy.Direct)
+		if err != nil {
+			return nil, fmt.Errorf("invalid SOCKS5 proxy: %w", err)
+		}
+		contextDialer, ok := dialer.(xproxy.ContextDialer)
+		if !ok {
+			return nil, errors.New("SOCKS5 proxy does not support context-aware dialing")
+		}
+		transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			return contextDialer.DialContext(ctx, network, address)
+		}
+	default:
+		return nil, fmt.Errorf("unsupported proxy scheme %q; use http, https, socks5, or socks5h", proxyURL.Scheme)
+	}
+
+	log.Printf("Telegram proxy enabled: %s", proxyURL.Redacted())
+	return &http.Client{Transport: transport}, nil
 }
 
 func (t *TelegramAdapter) Listen() (<-chan InternalMessage, error) {
@@ -642,4 +705,17 @@ func downloadFile(url string, destPath string) (int, error) {
 
 	_, err = io.Copy(out, resp.Body)
 	return 0, err
+}
+
+// redactToken removes secret material from error strings before they reach
+// the log file; Telegram API errors historically embed the full request URL,
+// including the bot token.
+func redactToken(msg string, secrets ...string) string {
+	for _, s := range secrets {
+		if s == "" {
+			continue
+		}
+		msg = strings.ReplaceAll(msg, s, "***")
+	}
+	return msg
 }

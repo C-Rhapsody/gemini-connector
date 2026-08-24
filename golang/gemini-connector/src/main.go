@@ -542,6 +542,7 @@ func fanIn(channels ...<-chan InternalMessage) <-chan InternalMessage {
 func main() {
 	portPtr := flag.Int("port", 49152, "Port number to use for single instance lock")
 	envPtr := flag.String("env", "", "Path to the .env file (default: <executable dir>/../src/.env)")
+	telegramProxyPtr := flag.String("telegram-proxy", "", "Proxy URL for Telegram API (http://, https://, socks5://, or socks5h://)")
 	flag.Parse()
 
 	lockAddr := fmt.Sprintf("127.0.0.1:%d", *portPtr)
@@ -623,7 +624,7 @@ func main() {
 	for _, name := range cfg.ActiveMessengers {
 		switch name {
 		case "telegram":
-			adapters["telegram"] = NewTelegramAdapter(cfg.TelegramBotToken, cfg.TelegramChatID, msgs, cfg.ConversationID)
+			adapters["telegram"] = NewTelegramAdapter(cfg.TelegramBotToken, cfg.TelegramChatID, msgs, cfg.ConversationID, *telegramProxyPtr)
 		case "teams":
 			adapters["teams"] = NewTeamsAdapter(cfg.TeamsTenantID, cfg.TeamsAppID, cfg.TeamsAppSecret, cfg.TeamsChatID, msgs)
 		default:
