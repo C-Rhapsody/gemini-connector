@@ -441,12 +441,21 @@ func (t *TelegramAdapter) sendAttachmentFile(chatID int64, path string, replyToI
 	return nil
 }
 
+// telegramChunkMinTail is the smallest acceptable size of the final message
+// produced by splitTelegramChunks. When a size-driven cut would strand a
+// smaller remainder, the cut is moved back to the latest Markdown section
+// boundary so the trailing message carries a coherent, reasonably sized
+// section instead of an orphaned fragment.
+const telegramChunkMinTail = 800
+
 // splitTelegramChunks splits a message into chunks no longer than limit
-// bytes. It breaks at line boundaries and keeps fenced code blocks intact
-// whenever the whole block fits into a single chunk; a block larger than the
-// limit is split with its fence closed and re-opened (info string preserved)
-// so that every chunk renders as well-formed Markdown on its own. Multi-byte
-// UTF-8 runes are never cut in half.
+// bytes. It breaks at line boundaries and keeps fenced code blocks intact:
+// a block that fits into the remaining space stays beside the preceding
+// text, a block that fits into one chunk but not into this one starts the
+// next chunk whole, and only a block larger than the limit is split with its
+// fence closed and re-opened (info string preserved). When the natural last
+// chunk would be tiny, the cut moves back to the latest section boundary
+// (heading or "---"). Multi-byte UTF-8 runes are never cut in half.
 func splitTelegramChunks(s string, limit int) []string {
 	if len(s) <= limit {
 		return []string{s}
@@ -458,6 +467,8 @@ func splitTelegramChunks(s string, limit int) []string {
 		inFence  bool   // fenced-code state of the source stream
 		carry    string // info string of the fence spanning a forced split
 		realBase int    // len(buf) excluding a synthetic re-opened fence
+		marks    []int  // buf offsets of section-boundary lines outside fences
+		pos      int    // current read offset into s
 	)
 
 	// overhead is the bytes occupied by a synthetic fence opener at the start
@@ -494,28 +505,76 @@ func splitTelegramChunks(s string, limit int) []string {
 			buf = append(buf, '\n')
 		}
 		realBase = len(buf)
+		marks = marks[:0]
+	}
+	// relocate moves the imminent split point back to the latest section
+	// boundary so that the trailing remainder reaches at least
+	// telegramChunkMinTail bytes. It reports whether the stream was rewound.
+	relocate := func() bool {
+		rem := len(s) - pos
+		if rem >= telegramChunkMinTail || len(marks) == 0 {
+			return false
+		}
+		for i := len(marks) - 1; i >= 0; i-- {
+			m := marks[i]
+			if len(buf)-m+rem < telegramChunkMinTail {
+				continue
+			}
+			head := make([]byte, m)
+			copy(head, buf[:m])
+			chunks = append(chunks, string(head))
+			pending := make([]byte, 0, len(buf)-m+len(s)-pos)
+			pending = append(pending, buf[m:]...)
+			pending = append(pending, s[pos:]...)
+			s = string(pending)
+			pos = 0
+			// Everything before m lies outside fences by construction, so
+			// parsing restarts from a clean state.
+			buf = buf[:0]
+			inFence = false
+			carry = ""
+			realBase = 0
+			marks = marks[:0]
+			return true
+		}
+		return false
 	}
 
-	pos := 0
 	for pos < len(s) {
 		line := s[pos:]
 		if nl := strings.IndexByte(s[pos:], '\n'); nl >= 0 {
 			line = s[pos : pos+nl+1]
 		}
 
-		// A fenced block that fits in one chunk but not in the remainder of
-		// the current chunk must not be entered: cut before its opener so it
-		// starts the next chunk whole.
-		if !inFence {
-			if _, ok := fenceInfoString(line); ok {
-				if blk := fencedBlockLen(s, pos); blk >= 0 && blk <= limit && len(buf) > 0 {
-					flush()
-					continue
+		if len(line) <= free() {
+			// Fenced blocks get special treatment so they never dangle at a
+			// chunk edge: keep them beside their context when possible.
+			if !inFence {
+				if _, ok := fenceInfoString(line); ok {
+					blk := fencedBlockLen(s, pos)
+					switch {
+					case blk >= 0 && blk <= free():
+						// Whole block fits into the remaining space: append
+						// it atomically so it stays in one message.
+						buf = append(buf, s[pos:pos+blk]...)
+						pos += blk
+						continue
+					case blk >= 0 && blk <= limit && len(buf) > 0:
+						// It fits in a dedicated chunk but not here: start
+						// the next message with it intact, avoiding a tiny
+						// tail by relocating the cut when possible.
+						if !relocate() {
+							flush()
+						}
+						continue
+					}
+					// blk > limit or unterminated: stream it line by line
+					// below, splitting mid-fence when necessary.
 				}
 			}
-		}
-
-		if len(line) <= free() {
+			if !inFence && len(buf) > 0 && isSectionBoundary(line) {
+				marks = append(marks, len(buf))
+			}
 			buf = append(buf, line...)
 			pos += len(line)
 			if inFence {
@@ -530,33 +589,35 @@ func splitTelegramChunks(s string, limit int) []string {
 			continue
 		}
 
-		// The line does not fit: emit what we have (closing an open fence)
-		// and retry it in a fresh chunk.
-		if len(buf) > overhead() {
-			flush()
-			continue
-		}
-
-		// Oversized single line with nothing usable buffered: take as many
-		// whole runes as fit. The budget is tracked locally because buf does
-		// not grow until after the loop.
-		budget := free()
-		take := 0
-		for take < len(line) {
-			_, sz := utf8.DecodeRuneInString(line[take:])
-			if sz > budget {
-				break
+		// The line does not fit: prefer a semantic cut over a size-driven
+		// one when the remainder would end up too small.
+		if !relocate() {
+			if len(buf) > overhead() {
+				flush()
+				continue
 			}
-			take += sz
-			budget -= sz
+
+			// Oversized single line with nothing usable buffered: take as
+			// many whole runes as fit. The budget is tracked locally because
+			// buf does not grow until after the loop.
+			budget := free()
+			take := 0
+			for take < len(line) {
+				_, sz := utf8.DecodeRuneInString(line[take:])
+				if sz > budget {
+					break
+				}
+				take += sz
+				budget -= sz
+			}
+			if take == 0 {
+				_, sz := utf8.DecodeRuneInString(line)
+				take = sz // degenerate limit smaller than one rune: force progress
+			}
+			buf = append(buf, line[:take]...)
+			pos += take
+			flush()
 		}
-		if take == 0 {
-			_, sz := utf8.DecodeRuneInString(line)
-			take = sz // degenerate limit smaller than one rune: force progress
-		}
-		buf = append(buf, line[:take]...)
-		pos += take
-		flush()
 	}
 	flush()
 	return chunks
@@ -584,6 +645,20 @@ func isFenceClose(line string) bool {
 		return false
 	}
 	return strings.TrimSpace(t[3:]) == ""
+}
+
+// isSectionBoundary reports whether the line starts a top-level Markdown
+// section usable as a message-break point: an ATX heading or a thematic
+// break. Fenced code content is excluded by the caller.
+func isSectionBoundary(line string) bool {
+	t := strings.TrimSpace(line)
+	if t == "" {
+		return false
+	}
+	if strings.HasPrefix(t, "#") {
+		return true
+	}
+	return t == "---"
 }
 
 // fencedBlockLen measures the byte length of the complete fenced code block

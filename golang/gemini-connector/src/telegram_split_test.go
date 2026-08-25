@@ -69,6 +69,9 @@ func TestSplitTelegramChunks_ProductionShapeSecondMermaidIntact(t *testing.T) {
 
 	chunks := splitTelegramChunks(input, 4000)
 	requireBalancedChunks(t, chunks, 4000)
+	if len(chunks) != 2 {
+		t.Fatalf("expected exactly 2 chunks, got %d", len(chunks))
+	}
 
 	for _, c := range chunks {
 		if strings.Contains(c, b2) {
@@ -76,6 +79,62 @@ func TestSplitTelegramChunks_ProductionShapeSecondMermaidIntact(t *testing.T) {
 		}
 	}
 	t.Fatalf("second mermaid block was split across chunks (%d chunks): %q", len(chunks), chunks)
+}
+
+// Mirrors the tested JEUS summary response: prose sections interleaved with
+// Mermaid and Java blocks, slightly over one message. Blocks must stay beside
+// their introducing text, and the split should land on a section boundary so
+// the trailing message is a coherent section rather than an orphan.
+func TestSplitTelegramChunks_KeepsBlocksBesideProseAndRebalances(t *testing.T) {
+	filler := func(n int, ch byte) string { return strings.Repeat(string(rune(ch)), n) }
+	b1 := "```mermaid\n" + filler(600, 'a') + "\n```\n"
+	java := "```java\n" + filler(360, 'j') + "\n```\n"
+	b3 := "```mermaid\n" + filler(340, 'c') + "\n```\n"
+
+	input := filler(300, 'p') + "\n" +
+		"---\n# 제목\n\n" +
+		b1 +
+		"---\n### 섹션1 소개\n" +
+		filler(900, 'q') + "\n" +
+		java +
+		filler(900, 'r') + "\n" +
+		"---\n### 마지막 섹션 요약\n" +
+		b3 +
+		filler(750, 't') + "\n"
+
+	chunks := splitTelegramChunks(input, 4000)
+	requireBalancedChunks(t, chunks, 4000)
+
+	if len(chunks) != 2 {
+		t.Fatalf("expected exactly 2 chunks, got %d: %q", len(chunks), chunks)
+	}
+	first, last := chunks[0], chunks[1]
+	for _, want := range []string{b1, java, "### 섹션1 소개"} {
+		if !strings.Contains(first, want) {
+			t.Fatalf("first chunk lost %q: %q", want, first)
+		}
+	}
+	if strings.Contains(first, b3) {
+		t.Fatalf("last mermaid block should start the second message: %q", first)
+	}
+	if len(last) < telegramChunkMinTail {
+		t.Fatalf("trailing message too small: %d bytes", len(last))
+	}
+	if !strings.HasPrefix(last, "### 마지막 섹션 요약") || !strings.Contains(last, b3) {
+		t.Fatalf("second message should carry the final section whole: %q", last)
+	}
+}
+
+// Without any section markers there is nothing to rebalance against; the
+// splitter must still terminate with valid, size-bounded chunks.
+func TestSplitTelegramChunks_PlainProseWithoutMarkers(t *testing.T) {
+	input := strings.Repeat("x", 4300)
+	chunks := splitTelegramChunks(input, 4000)
+
+	requireBalancedChunks(t, chunks, 4000)
+	if len(chunks) != 2 || strings.Join(chunks, "") != input {
+		t.Fatalf("unexpected chunks: %d pieces", len(chunks))
+	}
 }
 
 // A single fenced block larger than the limit is split, but every fragment
