@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
@@ -46,7 +47,8 @@ func convertMarkdownToTelegramHTML(s string) string {
 		goldmark.WithExtensions(extension.Table),
 		goldmark.WithParserOptions(
 			parser.WithInlineParsers(
-				util.Prioritized(koreanBoldParser{}, 450), // before the default emphasis parser (500)
+				util.Prioritized(koreanBoldParser{}, 450),   // before the default emphasis parser (500)
+				util.Prioritized(koreanItalicParser{}, 455), // ditto, for single-asterisk italics
 			),
 			parser.WithASTTransformers(
 				util.Prioritized(delimiterTextTransformer{}, 100),
@@ -156,6 +158,9 @@ type telegramHTMLRenderer struct {
 	out *lineTrackingWriter
 	// listCounters tracks the next number to print for each ordered list.
 	listCounters map[ast.Node]int
+	// inCodeSpan counts nesting inside inline code spans, whose literal
+	// content must be exempt from prose normalizations (LaTeX arrows etc.).
+	inCodeSpan int
 }
 
 // ensureLineStart writes a newline unless the output already sits at one.
@@ -292,8 +297,10 @@ func (r *telegramHTMLRenderer) renderFencedCodeBlock(w util.BufWriter, source []
 
 func (r *telegramHTMLRenderer) renderCodeSpan(w util.BufWriter, _ []byte, _ ast.Node, entering bool) (ast.WalkStatus, error) {
 	if entering {
+		r.inCodeSpan++
 		_, _ = w.Write(tagCodeOpen)
 	} else {
+		r.inCodeSpan--
 		_, _ = w.Write(tagCodeClose)
 	}
 	return ast.WalkContinue, nil
@@ -356,7 +363,13 @@ func (r *telegramHTMLRenderer) renderText(w util.BufWriter, source []byte, n ast
 		// Inline content is always escaped to keep user/AI-provided text from
 		// injecting HTML. Raw text (e.g. inside code spans) is handled by the
 		// parent fenced-code-block renderer; here we always escape.
-		_, _ = w.WriteString(escapeHTML(string(seg.Value(source))))
+		value := string(seg.Value(source))
+		if r.inCodeSpan == 0 {
+			// Prose-only normalization: agy occasionally leaks LaTeX arrows
+			// ($\rightarrow$ etc.) into answers; render them as Unicode.
+			value = normalizeLatexArrows(value)
+		}
+		_, _ = w.WriteString(escapeHTML(value))
 		if textNode.HardLineBreak() {
 			_, _ = w.WriteString("\n")
 		} else if textNode.SoftLineBreak() {
@@ -480,9 +493,7 @@ func (koreanBoldDelimiterProcessor) CanOpenCloser(opener, closer *parser.Delimit
 
 func (koreanBoldDelimiterProcessor) OnMatch(consumes int) ast.Node {
 	return ast.NewEmphasis(consumes)
-}
-
-// koreanBoldParser handles exactly-two-asterisk (**bold**) runs with relaxed
+} // koreanBoldParser handles exactly-two-asterisk (**bold**) runs with relaxed
 // flanking rules. CommonMark rejects closers that follow punctuation when a
 // letter comes next, which is common in Korean text:
 //
@@ -508,6 +519,63 @@ func (koreanBoldParser) Parse(parent ast.Node, block text.Reader, pc parser.Cont
 	block.Advance(d.OriginalLength)
 	pc.PushDelimiter(d)
 	return d
+}
+
+// koreanItalicDelimiterProcessor matches single '*' runs and produces
+// level-1 (italic) Emphasis nodes.
+type koreanItalicDelimiterProcessor struct{}
+
+func (koreanItalicDelimiterProcessor) IsDelimiter(b byte) bool { return b == '*' }
+
+func (koreanItalicDelimiterProcessor) CanOpenCloser(opener, closer *parser.Delimiter) bool {
+	return opener.Char == closer.Char
+}
+
+func (koreanItalicDelimiterProcessor) OnMatch(consumes int) ast.Node {
+	return ast.NewEmphasis(consumes)
+}
+
+// koreanItalicParser handles exactly-one-asterisk (*italic*) runs with the
+// same relaxed Korean flanking as koreanBoldParser. CommonMark rejects the
+// closer in shapes like *"문자열"*도 (punctuation before, letter after),
+// which left literal asterisks in Telegram output. Spaced arithmetic such as
+// "2 * 3 * 4" stays literal because neither side gains flanking there.
+// Doubles and triples fall through to koreanBoldParser and goldmark's
+// default emphasis parser.
+type koreanItalicParser struct{}
+
+func (koreanItalicParser) Trigger() []byte { return []byte{'*'} }
+
+func (koreanItalicParser) Parse(parent ast.Node, block text.Reader, pc parser.Context) ast.Node {
+	before := block.PrecendingCharacter()
+	line, segment := block.PeekLine()
+	d := parser.ScanDelimiter(line, before, 1, koreanItalicDelimiterProcessor{})
+	if d == nil || d.OriginalLength != 1 {
+		return nil
+	}
+	relaxSingleStarFlanking(d, before, line)
+	d.Segment = segment.WithStop(segment.Start + d.OriginalLength)
+	block.Advance(d.OriginalLength)
+	pc.PushDelimiter(d)
+	return d
+}
+
+// relaxSingleStarFlanking keeps CommonMark flanking except for the two
+// Korean-prose shapes strict rules reject:
+//   - opener between a letter and punctuation: 단어*"…"
+//   - closer between punctuation and a letter: *"…"*도
+func relaxSingleStarFlanking(d *parser.Delimiter, before rune, line []byte) {
+	after := rune(' ')
+	if len(line) > 1 {
+		r, _ := utf8.DecodeRune(line[1:])
+		after = r
+	}
+	if util.IsPunctRune(before) && unicode.IsLetter(after) {
+		d.CanClose = true
+	}
+	if unicode.IsLetter(before) && util.IsPunctRune(after) {
+		d.CanOpen = true
+	}
 }
 
 const tableMaxWidth = 80
@@ -824,4 +892,63 @@ func stripMarkdownFormatting(s string) string {
 	s = italicStarRe.ReplaceAllString(s, "$1")
 	s = inlineCodeRe.ReplaceAllString(s, "$1")
 	return s
+}
+
+// --- LaTeX arrow normalization ---
+//
+// agy answers sometimes leak inline LaTeX arrow commands (often wrapped in
+// math delimiters like $\rightarrow$). They are rendered as their Unicode
+// glyphs in prose only; code spans and code blocks keep the literal source.
+
+var latexArrowSymbols = map[string]string{
+	"rightarrow":     "\u2192", // →
+	"to":             "\u2192", // →
+	"gets":           "\u2190", // ←
+	"leftarrow":      "\u2190", // ←
+	"leftrightarrow": "\u2194", // ↔
+	"Rightarrow":     "\u21D2", // ⇒
+	"Leftarrow":      "\u21D0", // ⇐
+	"Leftrightarrow": "\u21D4", // ⇔
+}
+
+// latexArrowRe matches an optional pair of math delimiters around a known
+// arrow command. Longer names come first so \leftarrow never shadows
+// \Leftrightarrow-style prefixes.
+var latexArrowRe = regexp.MustCompile(`\$?\\(Leftrightarrow|leftrightarrow|Rightarrow|Leftarrow|rightarrow|leftarrow|gets|to)\$?`)
+
+func isASCIILetterByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+// normalizeLatexArrows rewrites known LaTeX arrow commands into Unicode
+// arrows. A command that continues into a longer word (e.g. the \tools of a
+// Windows path) is left untouched so filesystem paths stay intact.
+func normalizeLatexArrows(s string) string {
+	if !strings.ContainsRune(s, '\\') {
+		return s
+	}
+	matches := latexArrowRe.FindAllStringSubmatchIndex(s, -1)
+	if matches == nil {
+		return s
+	}
+	var b strings.Builder
+	last := 0
+	for _, loc := range matches {
+		end := loc[1]
+		if end < len(s) && isASCIILetterByte(s[end]) {
+			continue // prefix of a longer identifier; keep literal
+		}
+		sym, ok := latexArrowSymbols[s[loc[2]:loc[3]]]
+		if !ok || sym == "" {
+			continue
+		}
+		b.WriteString(s[last:loc[0]])
+		b.WriteString(sym)
+		last = end
+	}
+	if last == 0 {
+		return s // nothing actually replaced
+	}
+	b.WriteString(s[last:])
+	return b.String()
 }

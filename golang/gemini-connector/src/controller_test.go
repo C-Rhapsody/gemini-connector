@@ -208,6 +208,40 @@ func TestController_ForeignInteractionAnsweredSilently(t *testing.T) {
 	// the registry's interactive capability.
 }
 
+// Inbound media paths must ride through to the reply's send options so the
+// auto-attachment scan never echoes the user's own photo back.
+func TestController_InboundAttachmentPathsExcludedFromReply(t *testing.T) {
+	c, tg, turns := newTestController(t, nil)
+
+	restore := swapAgyInvoker(func(ctx context.Context, prompt string, convID string, opts ...AgyCallOptions) (string, error) {
+		return "분석 완료", nil
+	})
+	defer restore()
+
+	inbound := []string{`C:\bot\downloads\51867851_26597_01.jpg`}
+	c.Handle(InboundEvent{
+		Platform:        "telegram",
+		ChatID:          "-7",
+		Kind:            EventMessage,
+		Content:         "[첨부파일: C:\\bot\\downloads\\51867851_26597_01.jpg] 이거 뭐야?",
+		MessageID:       9,
+		AttachmentPaths: inbound,
+	})
+
+	waitCond(t, "reply sent", func() bool { return !turns.Busy() && tg.sendCount() == 1 })
+	tg.mu.Lock()
+	excluded := tg.sent[0].opts.ExcludeAttachments
+	attachAfter := tg.sent[0].opts.AttachAfter
+	tg.mu.Unlock()
+
+	if attachAfter.IsZero() {
+		t.Fatal("AI reply must keep AttachAfter for real deliverables")
+	}
+	if len(excluded) != 1 || excluded[0] != inbound[0] {
+		t.Fatalf("exclusion not forwarded: %v", excluded)
+	}
+}
+
 // --- tiny atomic helpers ---
 
 type atomicPrompt struct {

@@ -204,6 +204,56 @@ func TestConvertMarkdownToTelegramHTML(t *testing.T) {
 			input: "1. 첫째\n   1. 중첩\n2. 둘째\n",
 			want:  "1. 첫째\n  1. 중첩\n2. 둘째\n",
 		},
+		{
+			name:  "latex arrow with math delimiters becomes unicode",
+			input: "A $\\rightarrow$ B",
+			want:  "A \u2192 B",
+		},
+		{
+			name:  "bare latex rightarrow becomes unicode",
+			input: "단계1 \\rightarrow 단계2",
+			want:  "단계1 \u2192 단계2",
+		},
+		{
+			name:  "latex to and gets become unicode arrows",
+			input: "x \\to y \\gets z",
+			want:  "x \u2192 y \u2190 z",
+		},
+		{
+			name:  "double-stroke latex arrows become unicode doubles",
+			input: "$\\Rightarrow$ $\\Leftarrow$ $\\Leftrightarrow$",
+			want:  "\u21D2 \u21D0 \u21D4",
+		},
+		{
+			name:  "latex arrow inside longer identifier is untouched",
+			input: "C:\\tools 폴더 확인",
+			want:  "C:\\tools 폴더 확인",
+		},
+		{
+			name:  "latex arrow inside inline code is preserved",
+			input: "`$\\rightarrow$` 그대로",
+			want:  codeOpen + "$\\rightarrow$" + codeClose + " 그대로",
+		},
+		{
+			name:  "latex arrow inside fenced code is preserved",
+			input: "```\na $\\to$ b\n```",
+			want:  preOpen + codeOpen + "a $\\to$ b\n" + codeClose + preClose + "\n",
+		},
+		{
+			name:  "korean single-asterisk italic closed by particle after quote",
+			input: "과거 *\"<문자열>\"*도 그대로 표현됩니다.",
+			want:  "과거 " + iOpen + quotE + ltE + "문자열" + gtE + quotE + iClose + "도 그대로 표현됩니다.",
+		},
+		{
+			name:  "korean single-asterisk italic opened after letter before quote",
+			input: "결과는 결과*\"값\"*이라고 합니다.",
+			want:  "결과는 결과" + iOpen + quotE + "값" + quotE + iClose + "이라고 합니다.",
+		},
+		{
+			name:  "spaced single asterisks stay literal",
+			input: "2 * 3 * 4 는 곱셈입니다.",
+			want:  "2 * 3 * 4 는 곱셈입니다.",
+		},
 	}
 
 	for _, tt := range tests {

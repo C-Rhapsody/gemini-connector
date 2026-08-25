@@ -14,17 +14,17 @@ import (
 )
 
 type TeamsAdapter struct {
-	tenantID    string
-	appID       string
-	appSecret   string
-	chatID      string
-	msgs        *Messages
-	msgChan     chan InboundEvent
-	accessToken string
-	tokenExpiry time.Time
-	tokenMutex  sync.Mutex
+	tenantID     string
+	appID        string
+	appSecret    string
+	chatID       string
+	msgs         *Messages
+	msgChan      chan InboundEvent
+	accessToken  string
+	tokenExpiry  time.Time
+	tokenMutex   sync.Mutex
 	lastSeenTime time.Time
-	httpClient  *http.Client
+	httpClient   *http.Client
 }
 
 // OAuth2 token response

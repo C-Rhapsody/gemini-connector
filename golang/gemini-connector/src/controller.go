@@ -239,7 +239,13 @@ func (c *Controller) runChatTurn(ctx context.Context, adapter Messenger, ev Inbo
 	if response != "" {
 		appendTranscript(c.cfg.ConversationID(), "user", ev.Content)
 		appendTranscript(c.cfg.ConversationID(), "assistant", response)
-		adapter.Send(ev.ChatID, response, SendOptions{ReplyToMessageID: ev.MessageID, AttachAfter: turnStart})
+		// Inbound media the user sent this turn must never be echoed back by
+		// the auto-attachment scan.
+		adapter.Send(ev.ChatID, response, SendOptions{
+			ReplyToMessageID:   ev.MessageID,
+			AttachAfter:        turnStart,
+			ExcludeAttachments: ev.AttachmentPaths,
+		})
 	} else {
 		adapter.Send(ev.ChatID, c.msgs.ErrorEmptyResponse, replyOpt)
 	}

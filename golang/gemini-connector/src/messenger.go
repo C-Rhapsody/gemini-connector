@@ -37,6 +37,10 @@ type InboundEvent struct {
 	CallbackID string
 	// CallbackData carries the opaque payload attached to the pressed button.
 	CallbackData string
+	// AttachmentPaths lists local files the adapter downloaded from inbound
+	// media (user-sent photos etc.). The Controller forwards them as send
+	// exclusions so auto-attachment never re-delivers what the user just sent.
+	AttachmentPaths []string
 }
 
 // RouteKind resolves the routing category, deriving it from the populated
@@ -76,6 +80,10 @@ type SendOptions struct {
 	// at or after this moment (the turn start). Zero disables delivery.
 	// Only set for AI response payloads.
 	AttachAfter time.Time
+	// ExcludeAttachments lists absolute paths that must never be delivered as
+	// auto-attachments (inbound media the user just sent). Exact-match
+	// comparison on cleaned paths, case-insensitive for platform safety.
+	ExcludeAttachments []string
 }
 
 // Messenger defines the lifecycle and base transport contract every messaging

@@ -217,10 +217,12 @@ func (t *TelegramAdapter) Send(chatID string, text string, opts ...SendOptions) 
 
 	// When the payload may carry deliverables, scan for files produced by
 	// the AI during this turn, strip their paths from the reply text, and
-	// send them as channel attachments afterwards.
+	// send them as channel attachments afterwards. Inbound media the user
+	// just sent (and agy's temp copies of it) are excluded so the bot never
+	// echoes the user's own image back.
 	var attachments []deliverable
 	if !opt.AttachAfter.IsZero() {
-		attachments = t.collectDeliverables(opt.AttachAfter)
+		attachments = t.collectDeliverables(opt.AttachAfter, newExclusionSet(opt.ExcludeAttachments))
 		for _, m := range filePathPattern.FindAllString(text, -1) {
 			text = strings.ReplaceAll(text, m, "")
 		}
@@ -302,10 +304,53 @@ func (t *TelegramAdapter) brainDir() string {
 	return filepath.Join(home, ".gemini", "antigravity-cli", "brain", id)
 }
 
+// exclusionSet holds canonical (cleaned, lowercased) absolute paths that are
+// barred from auto-attachment delivery.
+type exclusionSet map[string]bool
+
+// newExclusionSet canonicalizes raw paths; nil/empty input yields an empty set.
+func newExclusionSet(paths []string) exclusionSet {
+	if len(paths) == 0 {
+		return nil
+	}
+	set := make(exclusionSet, len(paths))
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		set[normalizeDeliverablePath(p)] = true
+	}
+	return set
+}
+
+// normalizeDeliverablePath converts a path to its comparison form: absolute,
+// cleaned and lowercased so Windows drive/case variance cannot dodge the match.
+func normalizeDeliverablePath(p string) string {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		abs = filepath.Clean(p)
+	}
+	return strings.ToLower(abs)
+}
+
+// isTempMediaStoragePath reports whether any path component marks agy's
+// temporary inbound-media storage (.tempmediaStorage), which mirrors what the
+// user just sent and must never be re-delivered as an AI attachment.
+func isTempMediaStoragePath(p string) bool {
+	for _, part := range strings.Split(filepath.ToSlash(p), "/") {
+		if strings.EqualFold(part, ".tempmediaStorage") {
+			return true
+		}
+	}
+	return false
+}
+
 // collectDeliverables finds files produced during the current turn: files
 // modified at or after `after` with whitelisted extensions, under the project
 // tree (deletable) or under the active agy brain directory (preserved).
-func (t *TelegramAdapter) collectDeliverables(after time.Time) []deliverable {
+// Paths in exclude (inbound media) and anything inside agy's temp media
+// storage are never eligible.
+func (t *TelegramAdapter) collectDeliverables(after time.Time, exclude exclusionSet) []deliverable {
 	root := findProjectRoot()
 	if root == "" {
 		return nil
@@ -322,7 +367,7 @@ func (t *TelegramAdapter) collectDeliverables(after time.Time) []deliverable {
 				return nil // best-effort scan; skip unreadable entries
 			}
 			if d.IsDir() {
-				if d.Name() == ".git" || d.Name() == "node_modules" {
+				if d.Name() == ".git" || d.Name() == "node_modules" || strings.EqualFold(d.Name(), ".tempmediaStorage") {
 					return filepath.SkipDir
 				}
 				return nil
@@ -332,6 +377,10 @@ func (t *TelegramAdapter) collectDeliverables(after time.Time) []deliverable {
 			}
 			info, err := d.Info()
 			if err != nil || info.Size() > maxAttachmentBytes || info.ModTime().Before(after) {
+				return nil
+			}
+			if exclude != nil && exclude[normalizeDeliverablePath(p)] {
+				log.Printf("Attachment candidate skipped (inbound media): %s", p)
 				return nil
 			}
 			seen[p] = true
@@ -509,6 +558,8 @@ func (t *TelegramAdapter) processSingleMessage(msg *tgbotapi.Message) {
 		prompt = msg.Caption
 	}
 
+	var inboundPaths []string
+
 	// Live locations keep arriving as edit updates of the same message;
 	// process only the initial share and ignore subsequent updates.
 	if msg.Location != nil && msg.Location.LivePeriod > 0 && msg.EditDate != 0 {
@@ -524,6 +575,7 @@ func (t *TelegramAdapter) processSingleMessage(msg *tgbotapi.Message) {
 	if msg.Photo != nil {
 		mediaPath := t.downloadMediaWithRetry(msg, msg.Chat.ID, 1)
 		if mediaPath != "" {
+			inboundPaths = append(inboundPaths, mediaPath)
 			if prompt == "" {
 				prompt = t.msgs.DefaultMediaPrompt
 			}
@@ -553,12 +605,13 @@ func (t *TelegramAdapter) processSingleMessage(msg *tgbotapi.Message) {
 	}
 
 	t.msgChan <- InboundEvent{
-		Platform:  "telegram",
-		UserID:    userID,
-		ChatID:    chatID,
-		Kind:      EventMessage,
-		Content:   content,
-		MessageID: msg.MessageID,
+		Platform:        "telegram",
+		UserID:          userID,
+		ChatID:          chatID,
+		Kind:            EventMessage,
+		Content:         content,
+		MessageID:       msg.MessageID,
+		AttachmentPaths: inboundPaths,
 	}
 }
 
@@ -599,11 +652,13 @@ func (t *TelegramAdapter) processAlbum(groupID string, chatID int64) {
 
 	var combinedPrompt strings.Builder
 	captionText := ""
+	var inboundPaths []string
 
 	for i, msg := range messages {
 		seqIndex := i + 1
 		mediaPath := t.downloadMediaWithRetry(msg, chatID, seqIndex)
 		if mediaPath != "" {
+			inboundPaths = append(inboundPaths, mediaPath)
 			combinedPrompt.WriteString(fmt.Sprintf("[첨부파일: %s] ", mediaPath))
 		} else {
 			t.Send(chatIDStr, fmt.Sprintf("⚠️ %d번째 미디어 다운로드에 실패했습니다.", seqIndex), SendOptions{ReplyToMessageID: messages[0].MessageID})
@@ -629,12 +684,13 @@ func (t *TelegramAdapter) processAlbum(groupID string, chatID int64) {
 	}
 
 	t.msgChan <- InboundEvent{
-		Platform:  "telegram",
-		UserID:    userID,
-		ChatID:    chatIDStr,
-		Kind:      EventMessage,
-		Content:   combinedPrompt.String(),
-		MessageID: messages[0].MessageID,
+		Platform:        "telegram",
+		UserID:          userID,
+		ChatID:          chatIDStr,
+		Kind:            EventMessage,
+		Content:         combinedPrompt.String(),
+		MessageID:       messages[0].MessageID,
+		AttachmentPaths: inboundPaths,
 	}
 }
 
