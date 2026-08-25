@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	xproxy "golang.org/x/net/proxy"
@@ -440,27 +441,167 @@ func (t *TelegramAdapter) sendAttachmentFile(chatID int64, path string, replyToI
 	return nil
 }
 
-// splitTelegramChunks splits a string into chunks no longer than limit bytes,
-// preferring to break at newline boundaries when possible so that we don't
-// split in the middle of a line of code or a paragraph.
+// splitTelegramChunks splits a message into chunks no longer than limit
+// bytes. It breaks at line boundaries and keeps fenced code blocks intact
+// whenever the whole block fits into a single chunk; a block larger than the
+// limit is split with its fence closed and re-opened (info string preserved)
+// so that every chunk renders as well-formed Markdown on its own. Multi-byte
+// UTF-8 runes are never cut in half.
 func splitTelegramChunks(s string, limit int) []string {
 	if len(s) <= limit {
 		return []string{s}
 	}
-	var chunks []string
-	for len(s) > limit {
-		cut := limit
-		nl := strings.LastIndex(s[:limit], "\n")
-		if nl > limit/2 {
-			cut = nl + 1
+
+	var (
+		chunks   []string
+		buf      []byte
+		inFence  bool   // fenced-code state of the source stream
+		carry    string // info string of the fence spanning a forced split
+		realBase int    // len(buf) excluding a synthetic re-opened fence
+	)
+
+	// overhead is the bytes occupied by a synthetic fence opener at the start
+	// of buf after a mid-fence flush.
+	overhead := func() int {
+		if inFence {
+			return len("```") + len(carry) + 1
 		}
-		chunks = append(chunks, s[:cut])
-		s = s[cut:]
+		return 0
 	}
-	if len(s) > 0 {
-		chunks = append(chunks, s)
+	// free reports how many source bytes still fit into buf. While inside a
+	// fence, room for the synthetic closer is reserved.
+	free := func() int {
+		n := limit - len(buf)
+		if inFence {
+			n -= len("\n```\n")
+		}
+		return n
 	}
+	flush := func() {
+		if len(buf) > realBase {
+			if inFence && buf[len(buf)-1] != '\n' {
+				buf = append(buf, '\n')
+			}
+			if inFence {
+				buf = append(buf, "```\n"...)
+			}
+			chunks = append(chunks, string(buf))
+		}
+		buf = buf[:0]
+		if inFence {
+			buf = append(buf, "```"...)
+			buf = append(buf, carry...)
+			buf = append(buf, '\n')
+		}
+		realBase = len(buf)
+	}
+
+	pos := 0
+	for pos < len(s) {
+		line := s[pos:]
+		if nl := strings.IndexByte(s[pos:], '\n'); nl >= 0 {
+			line = s[pos : pos+nl+1]
+		}
+
+		// A fenced block that fits in one chunk but not in the remainder of
+		// the current chunk must not be entered: cut before its opener so it
+		// starts the next chunk whole.
+		if !inFence {
+			if _, ok := fenceInfoString(line); ok {
+				if blk := fencedBlockLen(s, pos); blk >= 0 && blk <= limit && len(buf) > 0 {
+					flush()
+					continue
+				}
+			}
+		}
+
+		if len(line) <= free() {
+			buf = append(buf, line...)
+			pos += len(line)
+			if inFence {
+				if isFenceClose(line) {
+					inFence = false
+					carry = ""
+				}
+			} else if lang, ok := fenceInfoString(line); ok {
+				inFence = true
+				carry = lang
+			}
+			continue
+		}
+
+		// The line does not fit: emit what we have (closing an open fence)
+		// and retry it in a fresh chunk.
+		if len(buf) > overhead() {
+			flush()
+			continue
+		}
+
+		// Oversized single line with nothing usable buffered: take as many
+		// whole runes as fit. The budget is tracked locally because buf does
+		// not grow until after the loop.
+		budget := free()
+		take := 0
+		for take < len(line) {
+			_, sz := utf8.DecodeRuneInString(line[take:])
+			if sz > budget {
+				break
+			}
+			take += sz
+			budget -= sz
+		}
+		if take == 0 {
+			_, sz := utf8.DecodeRuneInString(line)
+			take = sz // degenerate limit smaller than one rune: force progress
+		}
+		buf = append(buf, line[:take]...)
+		pos += take
+		flush()
+	}
+	flush()
 	return chunks
+}
+
+// fenceInfoString reports the info string when the line opens a fenced code
+// block (three or more leading backticks outside any fence).
+func fenceInfoString(line string) (string, bool) {
+	t := strings.TrimLeft(line, " ")
+	if !strings.HasPrefix(t, "```") {
+		return "", false
+	}
+	info := strings.TrimSpace(t[3:])
+	if strings.Contains(info, "`") {
+		return "", false
+	}
+	return info, true
+}
+
+// isFenceClose reports whether the line terminates an open fenced code block:
+// only backticks (optionally indented), with no other content.
+func isFenceClose(line string) bool {
+	t := strings.TrimLeft(line, " ")
+	if !strings.HasPrefix(t, "```") {
+		return false
+	}
+	return strings.TrimSpace(t[3:]) == ""
+}
+
+// fencedBlockLen measures the byte length of the complete fenced code block
+// whose opening line starts at off. It returns -1 when the block never closes.
+func fencedBlockLen(s string, off int) int {
+	end := off
+	for first := true; end < len(s); {
+		line := s[end:]
+		if nl := strings.IndexByte(s[end:], '\n'); nl >= 0 {
+			line = s[end : end+nl+1]
+		}
+		if !first && isFenceClose(line) {
+			return end + len(line) - off
+		}
+		first = false
+		end += len(line)
+	}
+	return -1
 }
 
 func (t *TelegramAdapter) StartTyping(chatID string) (stop func()) {
