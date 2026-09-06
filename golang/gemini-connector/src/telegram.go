@@ -197,13 +197,78 @@ const maxAttachmentsPerMessage = 10
 
 const maxAttachmentBytes = 50 << 20 // Telegram bot upload limit
 
-// deliverableExtensions is the whitelist of file types eligible for channel
-// delivery. Source-code and plain-text extensions are deliberately excluded
-// so that filenames merely mentioned in AI answers are never picked up.
-var deliverableExtensions = map[string]bool{
+// outboundDeliverableExtensions is the whitelist of file types eligible for
+// channel delivery (files the AI produced during a turn). Source-code and
+// plain-text extensions are deliberately excluded so that filenames merely
+// mentioned in AI answers are never picked up. Inbound user documents are
+// governed by inboundDocumentExtensions instead.
+var outboundDeliverableExtensions = map[string]bool{
 	".jpg": true, ".jpeg": true, ".png": true, ".gif": true, ".webp": true, ".bmp": true,
 	".mp4": true, ".webm": true, ".mov": true, ".avi": true, ".mkv": true,
 	".pdf": true, ".zip": true, ".csv": true, ".xlsx": true, ".docx": true, ".pptx": true,
+}
+
+// inboundDocumentExtensions is the whitelist of document types Telegram users
+// may attach for agy to read. Unsupported documents are rejected before any
+// download. Photos are handled separately by message type, not here.
+var inboundDocumentExtensions = map[string]bool{
+	".txt": true, ".md": true, ".html": true,
+	".pdf": true, ".doc": true, ".docx": true, ".rtf": true, ".odt": true,
+	".csv": true, ".xls": true, ".xlsx": true,
+	".ppt": true, ".pptx": true,
+	".hwp": true, ".hwpx": true,
+}
+
+// isSupportedInboundDocument reports whether a Telegram document attachment is
+// eligible for download and forwarding to agy, matching the extension
+// case-insensitively.
+func isSupportedInboundDocument(fileName string) bool {
+	if fileName == "" {
+		return false
+	}
+	return inboundDocumentExtensions[strings.ToLower(filepath.Ext(fileName))]
+}
+
+// inboundMediaKind classifies the media carried by an inbound Telegram message.
+type inboundMediaKind int
+
+const (
+	inboundMediaNone inboundMediaKind = iota
+	inboundMediaPhoto
+	inboundMediaDocument
+	inboundMediaUnsupported
+)
+
+// classifyInboundMedia reports how handleIncomingMessage should treat the
+// message's media payload. Unsupported kinds are rejected before any download.
+func classifyInboundMedia(msg *tgbotapi.Message) inboundMediaKind {
+	if msg.Video != nil || msg.VideoNote != nil || msg.Audio != nil || msg.Voice != nil {
+		return inboundMediaUnsupported
+	}
+	if msg.Document != nil {
+		if isSupportedInboundDocument(msg.Document.FileName) {
+			return inboundMediaDocument
+		}
+		return inboundMediaUnsupported
+	}
+	if msg.Photo != nil && len(msg.Photo) > 0 {
+		return inboundMediaPhoto
+	}
+	return inboundMediaNone
+}
+
+// inboundFileName derives the deterministic download filename for an inbound
+// media message: <chat>_<message>_<seq><ext>. The extension is preserved from
+// the original document so agy can infer the format, but the path never uses
+// the user-supplied basename, which prevents path traversal.
+func inboundFileName(msg *tgbotapi.Message, chatID int64, seqIndex int) string {
+	switch classifyInboundMedia(msg) {
+	case inboundMediaPhoto:
+		return fmt.Sprintf("%d_%d_%02d%s", chatID, msg.MessageID, seqIndex, ".jpg")
+	case inboundMediaDocument:
+		return fmt.Sprintf("%d_%d_%02d%s", chatID, msg.MessageID, seqIndex, strings.ToLower(filepath.Ext(msg.Document.FileName)))
+	}
+	return ""
 }
 
 func (t *TelegramAdapter) Send(chatID string, text string, opts ...SendOptions) error {
@@ -373,7 +438,7 @@ func (t *TelegramAdapter) collectDeliverables(after time.Time, exclude exclusion
 				}
 				return nil
 			}
-			if seen[p] || !deliverableExtensions[strings.ToLower(filepath.Ext(d.Name()))] {
+			if seen[p] || !outboundDeliverableExtensions[strings.ToLower(filepath.Ext(d.Name()))] {
 				return nil
 			}
 			info, err := d.Info()
@@ -744,7 +809,10 @@ func (t *TelegramAdapter) handleIncomingMessage(msg *tgbotapi.Message) {
 		return
 	}
 
-	if msg.Video != nil || msg.VideoNote != nil || msg.Document != nil || msg.Audio != nil || msg.Voice != nil {
+	// Video, voice and unsupported document types are rejected before any
+	// download; photos and whitelisted documents proceed to single/album
+	// handling below.
+	if classifyInboundMedia(msg) == inboundMediaUnsupported {
 		t.Send(chatID, t.msgs.ErrorMediaNotSupported, SendOptions{ReplyToMessageID: msg.MessageID})
 		return
 	}
@@ -788,14 +856,22 @@ func (t *TelegramAdapter) processSingleMessage(msg *tgbotapi.Message) {
 		prompt = fmt.Sprintf("[위치: 위도 %.6f, 경도 %.6f]", msg.Location.Latitude, msg.Location.Longitude)
 	}
 
-	if msg.Photo != nil {
-		mediaPath := t.downloadMediaWithRetry(msg, msg.Chat.ID, 1)
+	if classifyInboundMedia(msg) == inboundMediaPhoto || classifyInboundMedia(msg) == inboundMediaDocument {
+		mediaPath := t.downloadInboundFileWithRetry(msg, msg.Chat.ID, 1)
 		if mediaPath != "" {
 			inboundPaths = append(inboundPaths, mediaPath)
 			if prompt == "" {
 				prompt = t.msgs.DefaultMediaPrompt
 			}
-			prompt = fmt.Sprintf("[첨부파일: %s] %s", mediaPath, prompt)
+			if msg.Document != nil {
+				original := msg.Document.FileName
+				if original == "" {
+					original = filepath.Base(mediaPath)
+				}
+				prompt = fmt.Sprintf("[첨부파일: %s]\n[원본파일명: %s]\n%s", mediaPath, original, prompt)
+			} else {
+				prompt = fmt.Sprintf("[첨부파일: %s] %s", mediaPath, prompt)
+			}
 		} else {
 			t.Send(chatID, t.msgs.ErrorMediaDownloadFail, SendOptions{ReplyToMessageID: msg.MessageID})
 			return
@@ -872,12 +948,15 @@ func (t *TelegramAdapter) processAlbum(groupID string, chatID int64) {
 
 	for i, msg := range messages {
 		seqIndex := i + 1
-		mediaPath := t.downloadMediaWithRetry(msg, chatID, seqIndex)
+		mediaPath := t.downloadInboundFileWithRetry(msg, chatID, seqIndex)
 		if mediaPath != "" {
 			inboundPaths = append(inboundPaths, mediaPath)
 			combinedPrompt.WriteString(fmt.Sprintf("[첨부파일: %s] ", mediaPath))
+			if msg.Document != nil && msg.Document.FileName != "" {
+				combinedPrompt.WriteString(fmt.Sprintf("[원본파일명: %s] ", msg.Document.FileName))
+			}
 		} else {
-			t.Send(chatIDStr, fmt.Sprintf("⚠️ %d번째 미디어 다운로드에 실패했습니다.", seqIndex), SendOptions{ReplyToMessageID: messages[0].MessageID})
+			t.Send(chatIDStr, fmt.Sprintf("⚠️ %d번째 첨부파일 다운로드에 실패했습니다.", seqIndex), SendOptions{ReplyToMessageID: messages[0].MessageID})
 		}
 
 		if msg.Caption != "" {
@@ -912,27 +991,40 @@ func (t *TelegramAdapter) processAlbum(groupID string, chatID int64) {
 
 // --- Media download ---
 
-func (t *TelegramAdapter) downloadMediaWithRetry(msg *tgbotapi.Message, chatID int64, seqIndex int) string {
+// getFileInfo resolves a Telegram file ID to its metadata. It is an
+// indirection point so inbound-media tests can stub the API response.
+var getFileInfo = func(bot *tgbotapi.BotAPI, fileID string) (tgbotapi.File, error) {
+	return bot.GetFile(tgbotapi.FileConfig{FileID: fileID})
+}
+
+// downloadInboundFileWithRetry downloads a photo or supported document from
+// Telegram into the local downloads folder, retrying transient failures.
+// It returns the local path, or "" when the message carries no downloadable
+// media or the download ultimately failed.
+func (t *TelegramAdapter) downloadInboundFileWithRetry(msg *tgbotapi.Message, chatID int64, seqIndex int) string {
 	var fileID string
-	var ext string
-
-	if msg.Photo != nil && len(msg.Photo) > 0 {
-		photo := msg.Photo[len(msg.Photo)-1]
-		fileID = photo.FileID
-		ext = ".jpg"
+	switch classifyInboundMedia(msg) {
+	case inboundMediaPhoto:
+		fileID = msg.Photo[len(msg.Photo)-1].FileID
+	case inboundMediaDocument:
+		fileID = msg.Document.FileID
+	default:
+		return ""
 	}
-
 	if fileID == "" {
 		return ""
 	}
 
-	fileName := fmt.Sprintf("%d_%d_%02d%s", chatID, msg.MessageID, seqIndex, ext)
+	fileName := inboundFileName(msg, chatID, seqIndex)
+	if fileName == "" {
+		return ""
+	}
 
 	var fileURL string
 	var err error
 
 	for attempt := 1; attempt <= 3; attempt++ {
-		file, apiErr := t.bot.GetFile(tgbotapi.FileConfig{FileID: fileID})
+		file, apiErr := getFileInfo(t.bot, fileID)
 		if apiErr == nil {
 			fileURL = file.Link(t.bot.Token)
 			break
@@ -982,7 +1074,9 @@ func (t *TelegramAdapter) downloadMediaWithRetry(msg *tgbotapi.Message, chatID i
 	return ""
 }
 
-func downloadFile(url string, destPath string) (int, error) {
+// downloadFile fetches url into destPath, honoring Retry-After on 429. It is
+// a var so inbound-media tests can stub network I/O.
+var downloadFile = func(url string, destPath string) (int, error) {
 	resp, err := http.Get(url)
 	if err != nil {
 		return 0, err
