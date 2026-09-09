@@ -34,6 +34,10 @@ type TelegramAdapter struct {
 	albumTimer  map[string]*time.Timer
 	albumMutex  sync.Mutex
 	msgChan     chan InboundEvent
+
+	sendOneFn             func(chatID int64, text string, parseMode string, replyToID int) error
+	sendAttachmentFn      func(chatID int64, path string, replyToID int) error
+	collectDeliverablesFn func(after time.Time, exclude exclusionSet) []deliverable
 }
 
 func NewTelegramAdapter(token string, chatID int64, msgs *Messages, convID func() string, proxyURL string) *TelegramAdapter {
@@ -282,17 +286,13 @@ func (t *TelegramAdapter) Send(chatID string, text string, opts ...SendOptions) 
 	}
 
 	// When the payload may carry deliverables, scan for files produced by
-	// the AI during this turn, strip their paths from the reply text, and
-	// send them as channel attachments afterwards. Inbound media the user
-	// just sent (and agy's temp copies of it) are excluded so the bot never
-	// echoes the user's own image back.
+	// the AI during this turn and send them as channel attachments afterwards.
+	// Inbound media the user just sent (and agy's temp copies of it) are excluded
+	// so the bot never echoes the user's own image back. Reply text is preserved
+	// as-is (including any filenames or paths mentioned in explanations).
 	var attachments []deliverable
 	if !opt.AttachAfter.IsZero() {
 		attachments = t.collectDeliverables(opt.AttachAfter, newExclusionSet(opt.ExcludeAttachments))
-		for _, m := range filePathPattern.FindAllString(text, -1) {
-			text = strings.ReplaceAll(text, m, "")
-		}
-		text = strings.TrimSpace(text)
 	}
 
 	if text != "" {
@@ -333,6 +333,9 @@ func (t *TelegramAdapter) Send(chatID string, text string, opts ...SendOptions) 
 }
 
 func (t *TelegramAdapter) sendOne(chatID int64, text string, parseMode string, replyToID int) error {
+	if t.sendOneFn != nil {
+		return t.sendOneFn(chatID, text, parseMode, replyToID)
+	}
 	msg := tgbotapi.NewMessage(chatID, text)
 	if parseMode != "" {
 		msg.ParseMode = parseMode
@@ -417,6 +420,9 @@ func isTempMediaStoragePath(p string) bool {
 // Paths in exclude (inbound media) and anything inside agy's temp media
 // storage are never eligible.
 func (t *TelegramAdapter) collectDeliverables(after time.Time, exclude exclusionSet) []deliverable {
+	if t.collectDeliverablesFn != nil {
+		return t.collectDeliverablesFn(after, exclude)
+	}
 	root := findProjectRoot()
 	if root == "" {
 		return nil
@@ -478,6 +484,9 @@ func (t *TelegramAdapter) SendAttachment(chatID string, path string, replyTo int
 }
 
 func (t *TelegramAdapter) sendAttachmentFile(chatID int64, path string, replyToID int) error {
+	if t.sendAttachmentFn != nil {
+		return t.sendAttachmentFn(chatID, path, replyToID)
+	}
 	var cfg tgbotapi.Chattable
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp":
