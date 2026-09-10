@@ -331,27 +331,27 @@ func (t *TelegramAdapter) Send(chatID string, text string, opts ...SendOptions) 
 
 		if !richSent {
 			for _, chunk := range splitTelegramChunks(text, 4000) {
-			if opt.Plain {
-				if err := t.sendOne(id, chunk, "", opt.ReplyToMessageID); err != nil {
-					log.Printf("Telegram plain send failed: %v", err)
-					return err
+				if opt.Plain {
+					if err := t.sendOne(id, chunk, "", opt.ReplyToMessageID); err != nil {
+						log.Printf("Telegram plain send failed: %v", err)
+						return err
+					}
+					continue
 				}
-				continue
-			}
-			htmlBody := convertMarkdownToTelegramHTML(chunk)
-			if err := t.sendOne(id, htmlBody, tgbotapi.ModeHTML, opt.ReplyToMessageID); err != nil {
-				log.Printf("Telegram HTML send failed (%v), retrying as stripped plain text", err)
-				// Send formatting-stripped text so raw Markdown markers
-				// (**, `, links) are not exposed to the user.
-				plain := stripMarkdownFormatting(chunk)
-				if err2 := t.sendOne(id, plain, "", opt.ReplyToMessageID); err2 != nil {
-					log.Printf("Telegram plain-text fallback also failed: %v", err2)
-					return err2
+				htmlBody := convertMarkdownToTelegramHTML(chunk)
+				if err := t.sendOne(id, htmlBody, tgbotapi.ModeHTML, opt.ReplyToMessageID); err != nil {
+					log.Printf("Telegram HTML send failed (%v), retrying as stripped plain text", err)
+					// Send formatting-stripped text so raw Markdown markers
+					// (**, `, links) are not exposed to the user.
+					plain := stripMarkdownFormatting(chunk)
+					if err2 := t.sendOne(id, plain, "", opt.ReplyToMessageID); err2 != nil {
+						log.Printf("Telegram plain-text fallback also failed: %v", err2)
+						return err2
+					}
 				}
 			}
 		}
 	}
-}
 
 	for _, a := range attachments {
 		if err := t.sendAttachmentFile(id, a.path, opt.ReplyToMessageID); err != nil {

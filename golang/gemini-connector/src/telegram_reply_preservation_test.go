@@ -5,6 +5,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 func TestReplyPreservation(t *testing.T) {
@@ -190,3 +192,78 @@ func TestReplyPreservationWithAttachmentsAndExclusions(t *testing.T) {
 	}
 }
 
+func TestReplyPreservation_RichAIResponseAndCommands(t *testing.T) {
+	var mu sync.Mutex
+	var richCalls int
+	var ordinaryCalls int
+	var sentAttachments []string
+
+	adapter := &TelegramAdapter{
+		chatID: 12345678,
+		richConfig: TelegramRichConfig{
+			Enabled:    true,
+			MathEscape: "numeric",
+			ChatID:     12345678,
+		},
+		makeRequestFn: func(endpoint string, params tgbotapi.Params) (*tgbotapi.APIResponse, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			richCalls++
+			return &tgbotapi.APIResponse{
+				Ok:     true,
+				Result: []byte(`{"message_id": 999, "chat": {"id": 12345678}}`),
+			}, nil
+		},
+		sendOneFn: func(chatID int64, text string, parseMode string, replyToID int) error {
+			mu.Lock()
+			defer mu.Unlock()
+			ordinaryCalls++
+			return nil
+		},
+		sendAttachmentFn: func(chatID int64, path string, replyToID int) error {
+			mu.Lock()
+			defer mu.Unlock()
+			sentAttachments = append(sentAttachments, path)
+			return nil
+		},
+		collectDeliverablesFn: func(after time.Time, exclude exclusionSet) []deliverable {
+			return []deliverable{
+				{path: "C:\\mock\\output.mp4", deletable: false},
+			}
+		},
+	}
+
+	// 1. Command send (AttachAfter is zero): MUST use ordinary sendOneFn, never rich
+	cmdOpts := SendOptions{
+		AttachAfter: time.Time{},
+	}
+	err := adapter.Send("12345678", "/status: running normally", cmdOpts)
+	if err != nil {
+		t.Fatalf("command send failed: %v", err)
+	}
+	mu.Lock()
+	if richCalls != 0 {
+		t.Errorf("command send must not invoke Rich API, got %d rich calls", richCalls)
+	}
+	if ordinaryCalls != 1 {
+		t.Errorf("command send must invoke ordinary sendOneFn once, got %d", ordinaryCalls)
+	}
+	mu.Unlock()
+
+	// 2. AI response with math and attachment: MUST invoke Rich API and still deliver attachment
+	aiOpts := SendOptions{
+		AttachAfter: time.Now(),
+	}
+	err = adapter.Send("12345678", "Here is result `output.mp4` with formula \\(E = mc^2\\)", aiOpts)
+	if err != nil {
+		t.Fatalf("AI send failed: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if richCalls != 1 {
+		t.Errorf("AI rich send should invoke Rich API once, got %d", richCalls)
+	}
+	if len(sentAttachments) != 1 || sentAttachments[0] != "C:\\mock\\output.mp4" {
+		t.Errorf("expected attachment output.mp4 delivered, got %v", sentAttachments)
+	}
+}

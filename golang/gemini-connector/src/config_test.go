@@ -148,4 +148,3 @@ func TestParseTelegramRichConfig(t *testing.T) {
 		}
 	})
 }
-

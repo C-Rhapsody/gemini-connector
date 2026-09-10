@@ -142,7 +142,7 @@ type MathKind int
 
 const (
 	MathInline MathKind = iota // \( ... \)
-	MathBlock                 // \[ ... \] or $$ ... $$
+	MathBlock                  // \[ ... \] or $$ ... $$
 )
 
 // MathToken records an extracted math formula and its nonce placeholder.
@@ -588,7 +588,3 @@ func (t *TelegramAdapter) classifyRichError(err error) richErrorAction {
 
 	return richActionNone
 }
-
-
-
-
