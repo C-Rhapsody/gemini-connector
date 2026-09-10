@@ -424,4 +424,66 @@ func tokenizeLaTeX(s string) (string, []MathToken) {
 	return sb.String(), tokens
 }
 
+// escapeFormula prepares formula content according to the configured math escape profile.
+func escapeFormula(formula string, profile string) (string, error) {
+	switch profile {
+	case "raw":
+		// Raw profile: preserve safe formula characters only.
+		// If the formula contains HTML-significant characters (<, >, &), fail closed so the caller falls back.
+		if strings.ContainsAny(formula, "<>&") {
+			return "", fmt.Errorf("formula contains HTML-significant characters (<, >, &) in raw escape profile: %q", formula)
+		}
+		return formula, nil
+	case "numeric":
+		// Numeric profile: encode &, <, and > as numeric HTML entities.
+		// Replace & first to avoid double-escaping.
+		res := strings.ReplaceAll(formula, "&", "&#38;")
+		res = strings.ReplaceAll(res, "<", "&#60;")
+		res = strings.ReplaceAll(res, ">", "&#62;")
+		return res, nil
+	default:
+		return "", fmt.Errorf("invalid math escape profile: %q", profile)
+	}
+}
+
+// renderRichHTML tokenizes LaTeX math, renders the remaining markdown to Telegram HTML,
+// verifies placeholder integrity, and restores math tokens as <tg-math> or <tg-math-block>.
+func renderRichHTML(s string, mathEscape string) (string, error) {
+	if s == "" {
+		return "", nil
+	}
+
+	masked, tokens := tokenizeLaTeX(s)
+	if len(tokens) == 0 {
+		return convertMarkdownToTelegramHTML(s), nil
+	}
+
+	html := convertMarkdownToTelegramHTML(masked)
+
+	// Verify all placeholders are present exactly once and restore them
+	for _, tok := range tokens {
+		count := strings.Count(html, tok.Placeholder)
+		if count != 1 {
+			return "", fmt.Errorf("placeholder %s integrity violation: expected exactly 1 occurrence, found %d", tok.Placeholder, count)
+		}
+
+		escapedBody, err := escapeFormula(tok.Formula, mathEscape)
+		if err != nil {
+			return "", err
+		}
+
+		var replacement string
+		if tok.Kind == MathInline {
+			replacement = "<tg-math>" + escapedBody + "</tg-math>"
+		} else {
+			replacement = "<tg-math-block>" + escapedBody + "</tg-math-block>"
+		}
+
+		html = strings.Replace(html, tok.Placeholder, replacement, 1)
+	}
+
+	return html, nil
+}
+
+
 

@@ -395,4 +395,119 @@ func TestTokenizeLaTeX(t *testing.T) {
 	})
 }
 
+func TestRenderRichHTML(t *testing.T) {
+	t.Run("no-math input produces byte-identical output to convertMarkdownToTelegramHTML", func(t *testing.T) {
+		inputs := []string{
+			"Hello **world**",
+			"# Heading\nParagraph with *italic* and [link](https://example.com)",
+			"- item 1\n- item 2\n  - nested",
+			"> a blockquote with <code>code</code>",
+			"```go\nfunc main() {}\n```",
+		}
+		for _, in := range inputs {
+			want := convertMarkdownToTelegramHTML(in)
+			got, err := renderRichHTML(in, "raw")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != want {
+				t.Errorf("expected byte-identical output:\ngot:  %q\nwant: %q", got, want)
+			}
+		}
+	})
+
+	t.Run("inline and block restoration with numeric escape", func(t *testing.T) {
+		in := "Inline \\(a < b & c > d\\) and block:\n\\[x \\le y\\]"
+		got, err := renderRichHTML(in, "numeric")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		wantInline := "<tg-math>a &#60; b &#38; c &#62; d</tg-math>"
+		wantBlock := "<tg-math-block>x \\le y</tg-math-block>"
+		if !strings.Contains(got, wantInline) {
+			t.Errorf("missing expected inline math %q in %q", wantInline, got)
+		}
+		if !strings.Contains(got, wantBlock) {
+			t.Errorf("missing expected block math %q in %q", wantBlock, got)
+		}
+	})
+
+	t.Run("raw escape rejects HTML-significant characters", func(t *testing.T) {
+		in := "Formula with less than: \\(a < b\\)"
+		_, err := renderRichHTML(in, "raw")
+		if err == nil {
+			t.Fatal("expected error for formula with '<' in raw escape profile, got nil")
+		}
+
+		inAmp := "Formula with amp: \\(A & B\\)"
+		_, err = renderRichHTML(inAmp, "raw")
+		if err == nil {
+			t.Fatal("expected error for formula with '&' in raw escape profile, got nil")
+		}
+
+		inSafe := "Safe formula: \\(E = mc^2\\)"
+		gotSafe, err := renderRichHTML(inSafe, "raw")
+		if err != nil {
+			t.Fatalf("unexpected error for safe formula: %v", err)
+		}
+		if !strings.Contains(gotSafe, "<tg-math>E = mc^2</tg-math>") {
+			t.Errorf("expected safe formula in <tg-math>, got %q", gotSafe)
+		}
+	})
+
+	t.Run("duplicate formulas restore exactly N times", func(t *testing.T) {
+		in := "First \\(x = 1\\) and second \\(x = 1\\) and third \\(x = 1\\)."
+		got, err := renderRichHTML(in, "raw")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		count := strings.Count(got, "<tg-math>x = 1</tg-math>")
+		if count != 3 {
+			t.Errorf("expected 3 restorations of '<tg-math>x = 1</tg-math>', got %d in %q", count, got)
+		}
+	})
+
+	t.Run("math adjacent to markdown constructs", func(t *testing.T) {
+		cases := []struct {
+			name string
+			in   string
+			want string
+		}{
+			{"adjacent to bold", "**bold**\\(x = 1\\)", "<b>bold</b><tg-math>x = 1</tg-math>"},
+			{"inside bold", "**\\(x = 1\\)**", "<b><tg-math>x = 1</tg-math></b>"},
+			{"adjacent to italic", "*italic*\\(x = 1\\)", "<i>italic</i><tg-math>x = 1</tg-math>"},
+			{"adjacent to link", "[link](https://example.com)\\(x = 1\\)", `<a href="https://example.com">link</a><tg-math>x = 1</tg-math>`},
+			{"in heading", "# Header \\(x = 1\\)", "<b>Header <tg-math>x = 1</tg-math></b>"},
+			{"in list item", "- list item \\(x = 1\\)", "<tg-math>x = 1</tg-math>"},
+			{"in blockquote", "> quote \\(x = 1\\)", "<blockquote>quote <tg-math>x = 1</tg-math></blockquote>"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				got, err := renderRichHTML(tc.in, "raw")
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if !strings.Contains(got, tc.want) {
+					t.Errorf("got %q, want it to contain %q", got, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("code containing literal LaTeX remains code and never restores as tg-math", func(t *testing.T) {
+		in := "Code: `\\(x = 1\\)` and block:\n```\n\\(y = 2\\)\n```"
+		got, err := renderRichHTML(in, "raw")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if strings.Contains(got, "<tg-math>") {
+			t.Errorf("code blocks must never contain <tg-math>, got %q", got)
+		}
+		if !strings.Contains(got, "<code>\\(x = 1\\)</code>") {
+			t.Errorf("expected inline code with literal LaTeX, got %q", got)
+		}
+	})
+}
+
+
 
