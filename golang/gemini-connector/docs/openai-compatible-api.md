@@ -170,6 +170,8 @@ data: {"id":"chatcmpl-0123456789abcdef","object":"chat.completion.chunk","create
 data: [DONE]
 ```
 
+*(참고: 스트리밍 시 모든 `data:` 프레임은 순수 JSON `ChatCompletionChunk` 또는 `[DONE]`만 전송됩니다. Request ID는 HTTP 응답 헤더 `X-Request-ID`로 전달되며 비표준 raw preamble은 사용하지 않습니다. 장시간 응답 유지를 위한 keepalive는 SSE comment (`: heartbeat\n\n`)로만 전송되어 JSON 파서에 영향을 주지 않습니다.)*
+
 ---
 
 ## 4. 큐 및 자원 보호 (Resource Protection)

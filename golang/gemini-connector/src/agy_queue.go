@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"log"
 	"sync"
 )
 
@@ -145,12 +146,18 @@ func (q *agyTurnQueue) worker() {
 		q.cur = &job
 		q.mu.Unlock()
 
-		job.run(job.ctx)
-		job.cancel() // release context resources
-
-		q.mu.Lock()
-		q.cur = nil
-		q.mu.Unlock()
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("agy turn worker recovered from panic: %v", r)
+				}
+				job.cancel() // release context resources
+				q.mu.Lock()
+				q.cur = nil
+				q.mu.Unlock()
+			}()
+			job.run(job.ctx)
+		}()
 	}
 }
 

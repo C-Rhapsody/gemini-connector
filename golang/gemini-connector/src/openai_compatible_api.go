@@ -448,8 +448,9 @@ type OpenAICompatibleServer struct {
 	logger     *APILogger
 	draining   int32
 	activeJobs sync.WaitGroup
-	rootCtx    context.Context
-	cancelRoot context.CancelFunc
+	rootCtx           context.Context
+	cancelRoot        context.CancelFunc
+	heartbeatInterval time.Duration
 }
 
 func NewOpenAICompatibleServer(apiKey string, turns *TurnCoordinator, logger *APILogger) *OpenAICompatibleServer {
@@ -790,7 +791,16 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 
 	// Prepare queue admission
 	queueStart := time.Now()
-	var queueWaitDuration time.Duration
+	var queueWaitMS atomic.Int64
+	var streamHeadersSent atomic.Bool
+
+	jobStarted := make(chan struct{})
+	var startOnce sync.Once
+	markStarted := func() {
+		startOnce.Do(func() {
+			close(jobStarted)
+		})
+	}
 
 	jobDone := make(chan struct{})
 	var turnErr error
@@ -802,7 +812,8 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 
 	// Enqueue in TurnCoordinator
 	_, submitErr := s.turns.SubmitAPI(reqCtx, func(jobCtx context.Context) {
-		queueWaitDuration = time.Since(queueStart)
+		markStarted()
+		queueWaitMS.Store(time.Since(queueStart).Milliseconds())
 		defer close(jobDone)
 
 		// Re-check snapshot validity at worker admission
@@ -816,6 +827,11 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 			return
 		}
 
+		if jobCtx.Err() != nil || reqCtx.Err() != nil {
+			turnErr = jobCtx.Err()
+			return
+		}
+
 		// Execution context bounded by 90s execution cap
 		execCtx, execCancel := context.WithTimeout(jobCtx, defaultMaxExecutionDuration)
 		defer execCancel()
@@ -826,20 +842,88 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 				turnErr = errors.New("streaming unsupported by response writer")
 				return
 			}
+			safeFlush := func() {
+				defer func() {
+					_ = recover()
+				}()
+				flusher.Flush()
+			}
+
+			var writeMu sync.Mutex
+			writeEvent := func(data []byte) error {
+				writeMu.Lock()
+				defer writeMu.Unlock()
+				if jobCtx.Err() != nil || reqCtx.Err() != nil {
+					return jobCtx.Err()
+				}
+				if _, err := fmt.Fprintf(w, "data: %s\n\n", string(data)); err != nil {
+					return err
+				}
+				safeFlush()
+				return nil
+			}
+			writeRaw := func(format string, args ...any) error {
+				writeMu.Lock()
+				defer writeMu.Unlock()
+				if jobCtx.Err() != nil || reqCtx.Err() != nil {
+					return jobCtx.Err()
+				}
+				if _, err := fmt.Fprintf(w, format, args...); err != nil {
+					return err
+				}
+				safeFlush()
+				return nil
+			}
 
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.Header().Set("Cache-Control", "no-cache")
 			w.Header().Set("Connection", "keep-alive")
 			w.Header().Set("X-Accel-Buffering", "no")
+			w.Header().Set("X-Request-ID", reqID)
 			w.WriteHeader(http.StatusOK)
-			flusher.Flush()
+			streamHeadersSent.Store(true)
+			safeFlush()
 
-			// Send first event: request_id preamble
-			_, _ = fmt.Fprintf(w, "event: request_id\ndata: %s\n\n", reqID)
-			flusher.Flush()
+			// Heartbeat ticker with explicit termination synchronization
+			stopHeartbeat := make(chan struct{})
+			heartbeatDone := make(chan struct{})
+			var stopHeartbeatOnce sync.Once
+			shutdownHeartbeat := func() {
+				stopHeartbeatOnce.Do(func() {
+					close(stopHeartbeat)
+					<-heartbeatDone
+				})
+			}
+			defer shutdownHeartbeat()
+
+			hbInterval := s.heartbeatInterval
+			if hbInterval <= 0 {
+				hbInterval = defaultHeartbeatInterval
+			}
+
+			go func() {
+				defer close(heartbeatDone)
+				ticker := time.NewTicker(hbInterval)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ticker.C:
+						if jobCtx.Err() != nil || reqCtx.Err() != nil {
+							return
+						}
+						_ = writeRaw(": heartbeat\n\n")
+					case <-stopHeartbeat:
+						return
+					case <-jobCtx.Done():
+						return
+					case <-reqCtx.Done():
+						return
+					}
+				}
+			}()
 
 			created := time.Now().Unix()
-			// Role chunk
+			// Role chunk is the first SSE frame
 			roleChunk := ChatCompletionChunk{
 				ID:      "chatcmpl-" + reqID,
 				Object:  "chat.completion.chunk",
@@ -848,31 +932,17 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 				Choices: []ChunkChoice{{Index: 0, Delta: ChunkDelta{Role: "assistant"}, FinishReason: nil}},
 			}
 			roleBytes, _ := json.Marshal(roleChunk)
-			_, _ = fmt.Fprintf(w, "data: %s\n\n", string(roleBytes))
-			flusher.Flush()
-
-			// Heartbeat ticker
-			stopHeartbeat := make(chan struct{})
-			defer close(stopHeartbeat)
-			go func() {
-				ticker := time.NewTicker(defaultHeartbeatInterval)
-				defer ticker.Stop()
-				for {
-					select {
-					case <-ticker.C:
-						_, _ = fmt.Fprintf(w, ": heartbeat\n\n")
-						flusher.Flush()
-					case <-stopHeartbeat:
-						return
-					case <-jobCtx.Done():
-						return
-					}
-				}
-			}()
+			if err := writeEvent(roleBytes); err != nil {
+				turnErr = err
+				return
+			}
 
 			var cumText strings.Builder
 			stopped := false
 			streamCb := func(delta string) error {
+				if jobCtx.Err() != nil || reqCtx.Err() != nil {
+					return jobCtx.Err()
+				}
 				if stopped {
 					return nil
 				}
@@ -894,8 +964,7 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 								Choices: []ChunkChoice{{Index: 0, Delta: ChunkDelta{Content: emitDelta}, FinishReason: nil}},
 							}
 							b, _ := json.Marshal(chunk)
-							_, _ = fmt.Fprintf(w, "data: %s\n\n", string(b))
-							flusher.Flush()
+							return writeEvent(b)
 						}
 						return nil
 					}
@@ -912,11 +981,7 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 				if mErr != nil {
 					return mErr
 				}
-				if _, wErr := fmt.Fprintf(w, "data: %s\n\n", string(b)); wErr != nil {
-					return wErr
-				}
-				flusher.Flush()
-				return nil
+				return writeEvent(b)
 			}
 
 			var actualUsage *AgyUsage
@@ -932,6 +997,12 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 				},
 			})
 			if streamErr != nil {
+				// If the stream ended because the client disconnected or context timed out/canceled,
+				// do NOT attempt to write error frames or flush to the response writer!
+				if jobCtx.Err() != nil || reqCtx.Err() != nil || errors.Is(streamErr, context.Canceled) {
+					turnErr = streamErr
+					return
+				}
 				// Send post-header error frame and close without finish/[DONE]
 				errEvent := APIErrorResponse{
 					Error: APIErrorBody{
@@ -941,8 +1012,7 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 					},
 				}
 				errBytes, _ := json.Marshal(errEvent)
-				_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", string(errBytes))
-				flusher.Flush()
+				_ = writeRaw("event: error\ndata: %s\n\n", string(errBytes))
 				turnErr = streamErr
 				return
 			}
@@ -957,7 +1027,10 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 				Choices: []ChunkChoice{{Index: 0, Delta: ChunkDelta{}, FinishReason: &stopStr}},
 			}
 			fBytes, _ := json.Marshal(finishChunk)
-			_, _ = fmt.Fprintf(w, "data: %s\n\n", string(fBytes))
+			if err := writeEvent(fBytes); err != nil {
+				turnErr = err
+				return
+			}
 
 			// Usage chunk before [DONE] if requested and available
 			if wantUsage && actualUsage != nil {
@@ -970,11 +1043,13 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 					Usage:   mapAgyUsageToOpenAI(actualUsage),
 				}
 				uBytes, _ := json.Marshal(usageChunk)
-				_, _ = fmt.Fprintf(w, "data: %s\n\n", string(uBytes))
+				if err := writeEvent(uBytes); err != nil {
+					turnErr = err
+					return
+				}
 			}
 
-			_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-			flusher.Flush()
+			_ = writeRaw("data: [DONE]\n\n")
 		} else {
 			var actualUsage *AgyUsage
 			resp, nonStreamErr := executeAgy(execCtx, prompt, "", AgyCallOptions{
@@ -1012,25 +1087,48 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 	// Await completion or timeout/cancellation
 	select {
 	case <-jobDone:
-		// Completed
+		// Completed normally or finished with error inside worker
 	case <-time.After(defaultQueueWaitTimeout):
-		// If job has not completed within 30s queue wait, check if it was still in queue
-		if queueWaitDuration == 0 {
+		select {
+		case <-jobStarted:
+			// Job is already running. Wait for it up to client disconnect/timeout,
+			// and if cancelled, wait for worker to exit cleanly before handler returns.
+			select {
+			case <-jobDone:
+			case <-reqCtx.Done():
+				<-jobDone
+			}
+		default:
+			// Job was still queued and never started.
+			// When worker eventually reaches this job, job.ctx.Err() will be checked and dropped.
 			writeAPIError(w, http.StatusServiceUnavailable, "api_error", "Queue wait timeout", "queue_wait_timeout", nil, true)
 			s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusServiceUnavailable, "queue_wait_timeout", startTime, req.Stream, &req.Model, int64(defaultQueueWaitTimeout/time.Millisecond), clientClass)
 			return
 		}
-		// If already running, wait for it up to reqCtx deadline
+	case <-reqCtx.Done():
 		select {
-		case <-jobDone:
-		case <-reqCtx.Done():
-			writeAPIError(w, http.StatusGatewayTimeout, "api_error", "Request duration exceeded", "request_timeout", nil, false)
-			s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusGatewayTimeout, "request_timeout", startTime, req.Stream, &req.Model, int64(queueWaitDuration/time.Millisecond), clientClass)
+		case <-jobStarted:
+			// Job already started running. Wait for worker to exit cleanly before handler returns!
+			<-jobDone
+		default:
+			// Job never started running.
+			writeAPIError(w, http.StatusGatewayTimeout, "api_error", "Request timeout", "request_timeout", nil, false)
+			s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusGatewayTimeout, "request_timeout", startTime, req.Stream, &req.Model, 0, clientClass)
 			return
 		}
-	case <-reqCtx.Done():
-		writeAPIError(w, http.StatusGatewayTimeout, "api_error", "Request timeout", "request_timeout", nil, false)
-		s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusGatewayTimeout, "request_timeout", startTime, req.Stream, &req.Model, 0, clientClass)
+	}
+
+	if reqCtx.Err() != nil {
+		status := http.StatusGatewayTimeout
+		code := "request_timeout"
+		if errors.Is(reqCtx.Err(), context.Canceled) {
+			status = 499
+			code = "client_closed_request"
+		}
+		if !streamHeadersSent.Load() {
+			writeAPIError(w, status, "api_error", "Request canceled or timed out", code, nil, false)
+		}
+		s.logOutcome(reqID, "POST", "/v1/chat/completions", status, code, startTime, req.Stream, &req.Model, queueWaitMS.Load(), clientClass)
 		return
 	}
 
@@ -1062,10 +1160,10 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 				code = ae.Type
 			}
 		}
-		if !req.Stream {
+		if !streamHeadersSent.Load() {
 			writeAPIError(w, status, "api_error", "Execution failed", code, nil, retry)
 		}
-		s.logOutcome(reqID, "POST", "/v1/chat/completions", status, code, startTime, req.Stream, &req.Model, int64(queueWaitDuration/time.Millisecond), clientClass)
+		s.logOutcome(reqID, "POST", "/v1/chat/completions", status, code, startTime, req.Stream, &req.Model, queueWaitMS.Load(), clientClass)
 		return
 	}
 
@@ -1092,7 +1190,7 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 		_ = json.NewEncoder(w).Encode(respObj)
 	}
 
-	s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusOK, "", startTime, req.Stream, &req.Model, int64(queueWaitDuration/time.Millisecond), clientClass)
+	s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusOK, "", startTime, req.Stream, &req.Model, queueWaitMS.Load(), clientClass)
 }
 
 func (s *OpenAICompatibleServer) logOutcome(reqID, method, route string, status int, code string, startTime time.Time, stream bool, model *string, queueWaitMS int64, clientClass string) {

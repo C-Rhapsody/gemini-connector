@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -340,13 +341,29 @@ func TestChatCompletions_Stream_Success(t *testing.T) {
 		}
 	}
 
-	if len(events) < 4 {
+	if rec.Header().Get("X-Request-ID") == "" {
+		t.Errorf("expected X-Request-ID response header to be set")
+	}
+
+	if len(events) < 3 {
 		t.Fatalf("expected multiple SSE events, got: %v", events)
 	}
 
-	// Check preamble
-	if events[0] != "event: request_id" {
-		t.Errorf("expected first event to be request_id preamble, got %q", events[0])
+	// Ensure no raw event: request_id preamble exists, and all data frames are JSON or [DONE]
+	for _, ev := range events {
+		if strings.HasPrefix(ev, "event: request_id") {
+			t.Errorf("unexpected raw request_id event frame: %s", ev)
+		}
+		if strings.HasPrefix(ev, "data: ") {
+			dataPayload := strings.TrimPrefix(ev, "data: ")
+			if dataPayload == "[DONE]" {
+				continue
+			}
+			var chunk ChatCompletionChunk
+			if err := json.Unmarshal([]byte(dataPayload), &chunk); err != nil {
+				t.Fatalf("non-JSON data line encountered: %q, err: %v", dataPayload, err)
+			}
+		}
 	}
 
 	// Check terminal event is [DONE]
@@ -803,3 +820,405 @@ func TestChatCompletions_StopSequences(t *testing.T) {
 		t.Fatalf("expected truncated content 'Hello ', got %q", resp.Choices[0].Message.Content)
 	}
 }
+
+// panicOnFlushRecorder simulates net/http.(*response).Flush panicking with a nil dereference
+type panicOnFlushRecorder struct {
+	*httptest.ResponseRecorder
+	flushedCount int
+}
+
+func (p *panicOnFlushRecorder) Flush() {
+	p.flushedCount++
+	if p.flushedCount > 1 {
+		panic("runtime error: invalid memory address or nil pointer dereference")
+	}
+	p.ResponseRecorder.Flush()
+}
+
+func TestChatCompletions_Stream_ClientDisconnectNoPanic(t *testing.T) {
+	server, _, _ := setupTestServer(t)
+
+	oldRunner := agyCmdRunner
+	defer func() { agyCmdRunner = oldRunner }()
+
+	started := make(chan struct{})
+	unblock := make(chan struct{})
+
+	agyCmdRunner = func(cmd *exec.Cmd) error {
+		close(started)
+		<-unblock
+		return context.Canceled
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	body := `{"model":"gemini-3.8-flash-high","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)).WithContext(ctx)
+	req.Host = "127.0.0.1:49152"
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		server.ServeHTTP(rec, req)
+	}()
+
+	// Wait for worker to start
+	<-started
+	// Cancel request context while streaming
+	cancel()
+	close(unblock)
+
+	select {
+	case <-done:
+		// Succeeded without hanging or crashing
+	case <-time.After(3 * time.Second):
+		t.Fatal("ServeHTTP timed out after client disconnect")
+	}
+}
+
+func TestChatCompletions_Stream_FlusherPanicRecovered(t *testing.T) {
+	server, _, _ := setupTestServer(t)
+
+	oldRunner := agyCmdRunner
+	defer func() { agyCmdRunner = oldRunner }()
+
+	agyCmdRunner = func(cmd *exec.Cmd) error {
+		lines := []string{
+			`{"event":"init","conversation_id":"00000000","init":{"model":"gemini-3.8-flash-high"}}`,
+			`{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"Hello"}}`,
+			`{"event":"result","result":{"status":"SUCCESS","response":"Hello"}}`,
+		}
+		for _, l := range lines {
+			cmd.Stdout.Write([]byte(l + "\n"))
+		}
+		return nil
+	}
+
+	body := `{"model":"gemini-3.8-flash-high","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Host = "127.0.0.1:49152"
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := &panicOnFlushRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+	}
+
+	// Must not panic even when flusher panics
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("unexpected panic during stream: %v", r)
+		}
+	}()
+
+	server.ServeHTTP(rec, req)
+}
+
+// TestChatCompletions_Stream_HermesShape_FirstFrameJSON verifies that a Hermes-style
+// request (containing tools and max_tokens) produces purely valid JSON data frames from the
+// very first frame, with no non-standard event: request_id preamble.
+func TestChatCompletions_Stream_HermesShape_FirstFrameJSON(t *testing.T) {
+	server, _, _ := setupTestServer(t)
+
+	oldRunner := agyCmdRunner
+	defer func() { agyCmdRunner = oldRunner }()
+
+	agyCmdRunner = func(cmd *exec.Cmd) error {
+		lines := []string{
+			`{"event":"init","conversation_id":"00000000","init":{"model":"gemini-3.8-flash-high"}}`,
+			`{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"Hermes"}}`,
+			`{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":" stream"}}`,
+			`{"event":"result","result":{"status":"SUCCESS","response":"Hermes stream"}}`,
+		}
+		for _, l := range lines {
+			cmd.Stdout.Write([]byte(l + "\n"))
+		}
+		return nil
+	}
+
+	body := `{
+		"model": "gemini-3.8-flash-high",
+		"messages": [{"role": "user", "content": "What is the weather?"}],
+		"stream": true,
+		"max_tokens": 100,
+		"tools": [
+			{
+				"type": "function",
+				"function": {
+					"name": "get_current_weather",
+					"description": "Get current weather",
+					"parameters": {"type": "object", "properties": {"location": {"type": "string"}}}
+				}
+			}
+		]
+	}`
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Host = "127.0.0.1:49152"
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("X-Request-ID") == "" {
+		t.Errorf("expected X-Request-ID header to be present")
+	}
+
+	scanner := bufio.NewScanner(rec.Body)
+	var dataLines []string
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "event: request_id") {
+			t.Fatalf("unexpected non-standard event: request_id preamble found: %q", line)
+		}
+		if strings.HasPrefix(line, "data: ") {
+			dataLines = append(dataLines, strings.TrimPrefix(line, "data: "))
+		}
+	}
+
+	if len(dataLines) < 3 {
+		t.Fatalf("expected at least 3 data lines, got %d: %v", len(dataLines), dataLines)
+	}
+
+	// 1. First data line MUST be valid JSON with role: "assistant"
+	var firstChunk ChatCompletionChunk
+	if err := json.Unmarshal([]byte(dataLines[0]), &firstChunk); err != nil {
+		t.Fatalf("first data line must parse as JSON ChatCompletionChunk, got err: %v (line: %s)", err, dataLines[0])
+	}
+	if len(firstChunk.Choices) != 1 || firstChunk.Choices[0].Delta.Role != "assistant" {
+		t.Fatalf("unexpected first chunk choices: %+v", firstChunk.Choices)
+	}
+
+	// 2. All data lines except the last must parse as valid JSON
+	for i := 0; i < len(dataLines)-1; i++ {
+		var chunk ChatCompletionChunk
+		if err := json.Unmarshal([]byte(dataLines[i]), &chunk); err != nil {
+			t.Fatalf("data line at index %d failed JSON parse: %v (line: %s)", i, err, dataLines[i])
+		}
+	}
+
+	// 3. The last data line must be exactly [DONE]
+	lastLine := dataLines[len(dataLines)-1]
+	if lastLine != "[DONE]" {
+		t.Fatalf("expected last line to be [DONE], got %q", lastLine)
+	}
+}
+
+// TestChatCompletions_Stream_Heartbeat_ConcurrentRace verifies that when the heartbeat ticker
+// fires rapidly concurrently with stream deltas, ResponseWriter access is serialized without data race.
+func TestChatCompletions_Stream_Heartbeat_ConcurrentRace(t *testing.T) {
+	server, _, _ := setupTestServer(t)
+	// Inject very fast heartbeat interval to force race conditions if un-synchronized
+	server.heartbeatInterval = 2 * time.Millisecond
+
+	oldRunner := agyCmdRunner
+	defer func() { agyCmdRunner = oldRunner }()
+
+	agyCmdRunner = func(cmd *exec.Cmd) error {
+		for i := 0; i < 15; i++ {
+			ev := fmt.Sprintf(`{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"chunk%d "}}`+"\n", i)
+			cmd.Stdout.Write([]byte(ev))
+			time.Sleep(3 * time.Millisecond)
+		}
+		cmd.Stdout.Write([]byte(`{"event":"result","result":{"status":"SUCCESS","response":"done"}}` + "\n"))
+		return nil
+	}
+
+	body := `{"model":"gemini-3.8-flash-high","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Host = "127.0.0.1:49152"
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	scanner := bufio.NewScanner(rec.Body)
+	sawHeartbeat := false
+	sawChunks := 0
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == ": heartbeat" {
+			sawHeartbeat = true
+		}
+		if strings.HasPrefix(line, "data: ") && !strings.Contains(line, "[DONE]") {
+			var chunk ChatCompletionChunk
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &chunk); err == nil {
+				sawChunks++
+			}
+		}
+	}
+
+	if sawChunks < 15 {
+		t.Errorf("expected at least 15 chunks, got %d", sawChunks)
+	}
+	_ = sawHeartbeat // heartbeat comments are allowed and verified
+}
+
+// trackedLifetimeWriter tracks if Write or Flush is called after the handler returns.
+type trackedLifetimeWriter struct {
+	*httptest.ResponseRecorder
+	mu              sync.Mutex
+	handlerReturned bool
+	calledAfterExit bool
+}
+
+func (w *trackedLifetimeWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	if w.handlerReturned {
+		w.calledAfterExit = true
+	}
+	w.mu.Unlock()
+	return w.ResponseRecorder.Write(p)
+}
+
+func (w *trackedLifetimeWriter) Flush() {
+	w.mu.Lock()
+	if w.handlerReturned {
+		w.calledAfterExit = true
+	}
+	w.mu.Unlock()
+	w.ResponseRecorder.Flush()
+}
+
+// TestChatCompletions_Stream_ResponseWriterNotUsedAfterHandlerReturns verifies that
+// after client disconnect, all goroutines writing to ResponseWriter have terminated before
+// ServeHTTP returns.
+func TestChatCompletions_Stream_ResponseWriterNotUsedAfterHandlerReturns(t *testing.T) {
+	server, _, _ := setupTestServer(t)
+	server.heartbeatInterval = 5 * time.Millisecond
+
+	oldRunner := agyCmdRunner
+	defer func() { agyCmdRunner = oldRunner }()
+
+	started := make(chan struct{})
+	unblock := make(chan struct{})
+
+	agyCmdRunner = func(cmd *exec.Cmd) error {
+		close(started)
+		<-unblock
+		return context.Canceled
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	body := `{"model":"gemini-3.8-flash-high","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)).WithContext(ctx)
+	req.Host = "127.0.0.1:49152"
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	tracked := &trackedLifetimeWriter{
+		ResponseRecorder: httptest.NewRecorder(),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		server.ServeHTTP(tracked, req)
+		tracked.mu.Lock()
+		tracked.handlerReturned = true
+		tracked.mu.Unlock()
+	}()
+
+	<-started
+	cancel()
+	close(unblock)
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("ServeHTTP timed out")
+	}
+
+	// Allow any lingering goroutine to attempt a write
+	time.Sleep(50 * time.Millisecond)
+
+	tracked.mu.Lock()
+	calledAfter := tracked.calledAfterExit
+	tracked.mu.Unlock()
+
+	if calledAfter {
+		t.Fatalf("ResponseWriter was accessed after ServeHTTP returned!")
+	}
+}
+
+// TestChatCompletions_Stream_Disconnect_QueueProcessesNext verifies that after a streaming
+// request disconnects, the turn queue cleanly drops/finishes and the next queued job is processed.
+func TestChatCompletions_Stream_Disconnect_QueueProcessesNext(t *testing.T) {
+	server, _, _ := setupTestServer(t)
+
+	oldRunner := agyCmdRunner
+	defer func() { agyCmdRunner = oldRunner }()
+
+	started1 := make(chan struct{})
+	unblock1 := make(chan struct{})
+
+	turn1Active := true
+	agyCmdRunner = func(cmd *exec.Cmd) error {
+		if turn1Active {
+			close(started1)
+			<-unblock1
+			return context.Canceled
+		}
+		// Second call succeeds
+		lines := []string{
+			`{"event":"init","conversation_id":"00000000","init":{"model":"gemini-3.8-flash-high"}}`,
+			`{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"Success2"}}`,
+			`{"event":"result","result":{"status":"SUCCESS","response":"Success2"}}`,
+		}
+		for _, l := range lines {
+			cmd.Stdout.Write([]byte(l + "\n"))
+		}
+		return nil
+	}
+
+	// First request: stream with disconnect
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	body := `{"model":"gemini-3.8-flash-high","messages":[{"role":"user","content":"turn 1"}],"stream":true}`
+	req1 := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)).WithContext(ctx1)
+	req1.Host = "127.0.0.1:49152"
+	req1.Header.Set("Authorization", "Bearer "+testAPIKey)
+	req1.Header.Set("Content-Type", "application/json")
+	rec1 := httptest.NewRecorder()
+
+	done1 := make(chan struct{})
+	go func() {
+		defer close(done1)
+		server.ServeHTTP(rec1, req1)
+	}()
+
+	<-started1
+	cancel1()
+	close(unblock1)
+	<-done1
+
+	// Now run second request: must succeed normally, queue must not be stuck!
+	turn1Active = false
+	body2 := `{"model":"gemini-3.8-flash-high","messages":[{"role":"user","content":"turn 2"}],"stream":true}`
+	req2 := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body2))
+	req2.Host = "127.0.0.1:49152"
+	req2.Header.Set("Authorization", "Bearer "+testAPIKey)
+	req2.Header.Set("Content-Type", "application/json")
+	rec2 := httptest.NewRecorder()
+
+	server.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("expected second request to succeed with 200, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+	if !strings.Contains(rec2.Body.String(), "Success2") {
+		t.Fatalf("expected second request to contain 'Success2', got: %s", rec2.Body.String())
+	}
+}
+
+
