@@ -371,9 +371,17 @@ func TestChatCompletions_QueueFull429(t *testing.T) {
 
 	// Block the worker by stubbing runner
 	oldRunner := agyCmdRunner
-	defer func() { agyCmdRunner = oldRunner }()
 	blockCh := make(chan struct{})
-	defer close(blockCh)
+	var blockOnce sync.Once
+	unblock := func() {
+		blockOnce.Do(func() {
+			close(blockCh)
+		})
+	}
+	defer func() {
+		unblock()
+		agyCmdRunner = oldRunner
+	}()
 	agyCmdRunner = func(cmd *exec.Cmd) error {
 		<-blockCh
 		return nil
@@ -404,6 +412,10 @@ func TestChatCompletions_QueueFull429(t *testing.T) {
 
 	// Give a moment for the 5th request to hit queue limit
 	time.Sleep(200 * time.Millisecond)
+
+	// Unblock workers and wait for all requests to finish
+	unblock()
+	wg.Wait()
 
 	mu.Lock()
 	has429 := false
