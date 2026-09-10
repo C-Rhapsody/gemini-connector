@@ -73,12 +73,26 @@ curl http://127.0.0.1:49152/v1/models \
 ---
 
 ### 3.2. `POST /v1/chat/completions`
-채팅 완성 요청을 처리합니다. 스트리밍(SSE) 및 논스트리밍(JSON)을 모두 지원합니다.
+채팅 완성 요청을 처리합니다. 스트리밍(SSE) 및 논스트리밍(JSON)을 모두 지원하며, Hermes Agent 등 OpenAI 호환 클라이언트와의 상호운용성을 제공합니다.
 
-#### 요청 필드
-- `model` (string, 필수): 사용할 모델 ID (예: `gemini-3.8-flash-high`)
-- `messages` (array, 필수): 역할(`system`, `user`, `assistant`)과 내용을 담은 메시지 배열
-- `stream` (bool, 선택): Server-Sent Events(SSE) 스트리밍 여부 (기본값: `false`)
+#### 필드 처리 방식 매트릭스 (Field Treatment Matrix)
+
+| 필드 | 처리 방식 | 설명 |
+|---|---|---|
+| `model` | **Mapped** | 필수. 카탈로그 검증 후 agy `--model`로 전달 |
+| `messages` | **Mapped** | `developer`, `system`, `user`, `assistant`, `tool` 역할 지원. JSON 배열로 직렬화하여 agy 프롬프트로 전달 |
+| `stream` | **Mapped** | `true` 시 agy `--output-format stream-json`을 사용하여 실시간 SSE 스트리밍 |
+| `response_format` | **Mapped** | `text`: 일반 텍스트<br>`json_object`: `{"type":"object"}` 스키마 매핑<br>`json_schema`: 내부 스키마를 임시 파일로 격리 저장하여 agy `--json-schema`로 안전 전달 후 자동 삭제 |
+| `stream_options.include_usage`<br>`include_usage` | **Mapped** | agy가 보고한 실제 토큰 사용량이 있을 경우 `[DONE]` 직전 usage 청크 전송. 측정값이 없으면 0을 날조하지 않고 생략 |
+| `stop` | **Mapped** | 단일 문자열 또는 배열. 일치하는 시퀀스 직전에서 논스트리밍/스트리밍 텍스트 절단 및 `finish_reason: "stop"` 반환 |
+| `max_tokens`<br>`max_completion_tokens` | **Normalized & Ignored** | 양수 정수 검증(0 이하 400 에러). 둘 다 있을 경우 `max_completion_tokens` 우선. **단, agy CLI에 출력 토큰 제한 옵션이 없어 upstream에 강제되지는 않음 (호환성 힌트로만 수용)** |
+| `tools`<br>`tool_choice` | **Compatibility Fallback** | Hermes 등 도구 호출 클라이언트의 400 에러를 방지하기 위해 요청은 수용하되 **Text-only Completion Fallback**으로 동작 (가짜 tool_calls 미생성). 대화 기록의 `role: "tool"` 및 `tool_call_id`는 온전히 수용됨 |
+| `functions`<br>`function_call` | **Normalized** | legacy 함수 호출을 `tools` / `tool_choice` 구조로 자동 정규화 후 동일한 Text-only Fallback 적용 |
+| `parallel_tool_calls` | **Ignored** | 호환성 수용 후 no-op |
+| `metadata`, `user` | **Ignored** | 호환성 수용 후 no-op. 감사 로그 및 프롬프트에 기록하지 않음 |
+| `logprobs`, `top_logprobs` | **Ignored** | 호환성 수용 후 no-op. 가짜 확률값을 생성하지 않음 |
+| `temperature`, `top_p`, `seed`<br>`presence_penalty`, `frequency_penalty` | **Ignored** | 호환성 수용 후 no-op |
+| `n` (`n > 1`) | **Rejected (400)** | `n > 1`은 지원되지 않으며 400 에러 반환 |
 
 #### 논스트리밍 요청 예시
 ```bash
@@ -90,11 +104,12 @@ curl http://127.0.0.1:49152/v1/chat/completions \
     "messages": [
       {"role": "system", "content": "You are a concise assistant."},
       {"role": "user", "content": "Hello!"}
-    ]
+    ],
+    "max_tokens": 100
   }'
 ```
 
-#### 논스트리밍 응답 예시
+#### 논스트리밍 응답 예시 (실제 토큰 usage 포함)
 ```json
 {
   "id": "chatcmpl-0123456789abcdef",
@@ -112,14 +127,18 @@ curl http://127.0.0.1:49152/v1/chat/completions \
     }
   ],
   "usage": {
-    "prompt_tokens": 0,
-    "completion_tokens": 0,
-    "total_tokens": 0
+    "prompt_tokens": 15612,
+    "completion_tokens": 102,
+    "total_tokens": 15714,
+    "completion_tokens_details": {
+      "reasoning_tokens": 101
+    }
   }
 }
 ```
+*(참고: 업스트림에서 실제 토큰 사용량이 제공되지 않는 경우 `usage` 필드는 가짜 0 토큰을 반환하지 않고 생략됩니다.)*
 
-#### 스트리밍 요청 예시
+#### 스트리밍 요청 예시 (`stream_options.include_usage`)
 ```bash
 curl -N http://127.0.0.1:49152/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -129,7 +148,10 @@ curl -N http://127.0.0.1:49152/v1/chat/completions \
     "messages": [
       {"role": "user", "content": "Count from 1 to 3"}
     ],
-    "stream": true
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    }
   }'
 ```
 
@@ -142,6 +164,8 @@ data: {"id":"chatcmpl-0123456789abcdef","object":"chat.completion.chunk","create
 data: {"id":"chatcmpl-0123456789abcdef","object":"chat.completion.chunk","created":1773302400,"model":"gemini-3.8-flash-high","choices":[{"index":0,"delta":{"content":"2, 3"},"finish_reason":null}]}
 
 data: {"id":"chatcmpl-0123456789abcdef","object":"chat.completion.chunk","created":1773302400,"model":"gemini-3.8-flash-high","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-0123456789abcdef","object":"chat.completion.chunk","created":1773302400,"model":"gemini-3.8-flash-high","choices":[],"usage":{"prompt_tokens":15612,"completion_tokens":102,"total_tokens":15714,"completion_tokens_details":{"reasoning_tokens":101}}}
 
 data: [DONE]
 ```

@@ -16,12 +16,14 @@ import (
 )
 
 type AgyResponse struct {
-	ConversationID  string  `json:"conversation_id"`
-	Status          string  `json:"status"`
-	Response        string  `json:"response"`
-	Error           string  `json:"error,omitempty"`
-	DurationSeconds float64 `json:"duration_seconds"`
-	NumTurns        int     `json:"num_turns"`
+	ConversationID   string          `json:"conversation_id"`
+	Status           string          `json:"status"`
+	Response         string          `json:"response"`
+	Error            string          `json:"error,omitempty"`
+	DurationSeconds  float64         `json:"duration_seconds"`
+	NumTurns         int             `json:"num_turns"`
+	Usage            *AgyUsage       `json:"usage,omitempty"`
+	StructuredOutput json.RawMessage `json:"structured_output,omitempty"`
 }
 
 type AgyUsage struct {
@@ -100,6 +102,7 @@ type ndjsonStreamWriter struct {
 	maxBytes   int64
 	maxLine    int64
 	sawSuccess bool
+	usage      *AgyUsage
 	err        error
 	mu         sync.Mutex
 }
@@ -131,27 +134,37 @@ func (w *ndjsonStreamWriter) Write(p []byte) (n int, err error) {
 		var ev struct {
 			Event      string `json:"event"`
 			StepUpdate *struct {
-				StepType  string `json:"step_type"`
-				TextDelta string `json:"text_delta"`
+				StepType  string    `json:"step_type"`
+				TextDelta string    `json:"text_delta"`
+				Usage     *AgyUsage `json:"usage,omitempty"`
 			} `json:"step_update"`
 			Result *struct {
-				Status string `json:"status"`
+				Status string    `json:"status"`
+				Usage  *AgyUsage `json:"usage,omitempty"`
 			} `json:"result"`
 		}
 		if jsonErr := json.Unmarshal(bytes.TrimSpace(line), &ev); jsonErr == nil {
-			if ev.Event == "step_update" && ev.StepUpdate != nil && ev.StepUpdate.TextDelta != "" {
-				w.totalBytes += int64(len(ev.StepUpdate.TextDelta))
-				if w.totalBytes > w.maxBytes {
-					w.err = fmt.Errorf("cumulative assistant output exceeds limit of %d bytes", w.maxBytes)
-					return len(p), w.err
+			if ev.Event == "step_update" && ev.StepUpdate != nil {
+				if ev.StepUpdate.Usage != nil {
+					w.usage = ev.StepUpdate.Usage
 				}
-				if w.callback != nil {
-					if cbErr := w.callback(ev.StepUpdate.TextDelta); cbErr != nil {
-						w.err = cbErr
+				if ev.StepUpdate.TextDelta != "" {
+					w.totalBytes += int64(len(ev.StepUpdate.TextDelta))
+					if w.totalBytes > w.maxBytes {
+						w.err = fmt.Errorf("cumulative assistant output exceeds limit of %d bytes", w.maxBytes)
 						return len(p), w.err
+					}
+					if w.callback != nil {
+						if cbErr := w.callback(ev.StepUpdate.TextDelta); cbErr != nil {
+							w.err = cbErr
+							return len(p), w.err
+						}
 					}
 				}
 			} else if ev.Event == "result" && ev.Result != nil {
+				if ev.Result.Usage != nil {
+					w.usage = ev.Result.Usage
+				}
 				if ev.Result.Status == "SUCCESS" {
 					w.sawSuccess = true
 				} else {
@@ -207,6 +220,10 @@ type AgyCallOptions struct {
 	StreamCallback func(chunk string) error
 	// Logger is the optional API logger instance.
 	Logger *APILogger
+	// JSONSchema is the JSON schema string to enforce via agy --json-schema.
+	JSONSchema string
+	// UsageCallback is called with the actual token usage from agy if available.
+	UsageCallback func(*AgyUsage)
 }
 
 // quotaBlockErr returns the rejection error for gated calls during an active
@@ -228,6 +245,21 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 	// the stored error text whose time fields show the remaining time.
 	if ae := quotaBlockErr(o.BypassQuotaGate); ae != nil {
 		return "", ae
+	}
+
+	var tempSchemaPath string
+	if o.Profile == ProfileAPI && o.JSONSchema != "" {
+		tmpFile, err := os.CreateTemp("", "agy_schema_*.json")
+		if err != nil {
+			return "", &AgyError{Type: "schema_error", Detail: "failed to create temporary schema file: " + err.Error()}
+		}
+		tempSchemaPath = tmpFile.Name()
+		defer os.Remove(tempSchemaPath)
+		if _, err := tmpFile.WriteString(o.JSONSchema); err != nil {
+			_ = tmpFile.Close()
+			return "", &AgyError{Type: "schema_error", Detail: "failed to write temporary schema file: " + err.Error()}
+		}
+		_ = tmpFile.Close()
 	}
 
 	maxAttempts := 2
@@ -268,6 +300,9 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 			}
 			if o.Model != "" {
 				args = append(args, "--model", o.Model)
+			}
+			if tempSchemaPath != "" {
+				args = append(args, "--json-schema", tempSchemaPath)
 			}
 			// Note: API calls are stateless and never inherit conversation ID or dangerous permissions.
 		} else {
@@ -371,6 +406,9 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 			if !streamWriter.sawSuccess {
 				return "", &AgyError{Type: "stream_incomplete", Detail: "stream ended without success result"}
 			}
+			if o.UsageCallback != nil && streamWriter.usage != nil {
+				o.UsageCallback(streamWriter.usage)
+			}
 			return "", nil
 		}
 
@@ -422,18 +460,26 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 			return "", &AgyError{Type: "error_status", Detail: detail}
 		}
 
-		if o.Profile == ProfileAPI && int64(len(result.Response)) > 4*1024*1024 {
+		respText := result.Response
+		if respText == "" && len(result.StructuredOutput) > 0 {
+			respText = string(result.StructuredOutput)
+		}
+
+		if o.Profile == ProfileAPI && int64(len(respText)) > 4*1024*1024 {
 			return "", &AgyError{Type: "output_too_large", Detail: "decoded assistant response exceeded 4 MiB limit"}
 		}
 
-		return result.Response, nil
+		if o.UsageCallback != nil && result.Usage != nil {
+			o.UsageCallback(result.Usage)
+		}
+
+		return respText, nil
 	}
 
 	return "", &AgyError{Type: "cli_failure", Detail: "agy execution attempts exhausted"}
 }
 
 var urlFetchFailurePattern = regexp.MustCompile(`Failed to fetch document content at (\S+)`)
-
 
 func extractUrlFetchFailure(detail string) string {
 	match := urlFetchFailurePattern.FindStringSubmatch(detail)

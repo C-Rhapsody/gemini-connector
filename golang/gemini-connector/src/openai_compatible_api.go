@@ -22,15 +22,15 @@ import (
 
 const (
 	defaultModelRefreshTTL      = 5 * time.Minute
-	defaultModelRefreshTimeout  = 5 * time.Second
+	defaultModelRefreshTimeout  = 20 * time.Second
 	defaultMaxRequestDuration   = 150 * time.Second
 	defaultMaxExecutionDuration = 90 * time.Second
 	defaultQueueWaitTimeout     = 30 * time.Second
-	defaultMaxBodyBytes         = 1024 * 1024       // 1 MiB
+	defaultMaxBodyBytes         = 1024 * 1024 // 1 MiB
 	defaultMaxMessages          = 128
-	defaultMaxMessageBytes      = 256 * 1024        // 256 KiB
-	defaultMaxAggregateBytes    = 768 * 1024        // 768 KiB
-	defaultMaxOutputBytes       = 4 * 1024 * 1024   // 4 MiB
+	defaultMaxMessageBytes      = 256 * 1024      // 256 KiB
+	defaultMaxAggregateBytes    = 768 * 1024      // 768 KiB
+	defaultMaxOutputBytes       = 4 * 1024 * 1024 // 4 MiB
 	defaultHeartbeatInterval    = 15 * time.Second
 )
 
@@ -97,8 +97,8 @@ func NewModelCatalog() *ModelCatalog {
 }
 
 func (c *ModelCatalog) defaultFetchAgyModels(ctx context.Context) ([]string, error) {
-	// Wait at most min(2000ms, ctx deadline) for the shared launch semaphore
-	acquireTimeout := 2 * time.Second
+	// Wait at most min(10000ms, ctx deadline) for the shared launch semaphore
+	acquireTimeout := 10 * time.Second
 	if dl, ok := ctx.Deadline(); ok {
 		rem := time.Until(dl)
 		if rem < acquireTimeout {
@@ -224,23 +224,185 @@ func (c *ModelCatalog) CheckModelSnapshotValid(modelID string) (exists bool, exp
 	return false, false
 }
 
+type ToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+type ToolCall struct {
+	Index    *int             `json:"index,omitempty"`
+	ID       string           `json:"id,omitempty"`
+	Type     string           `json:"type,omitempty"`
+	Function ToolCallFunction `json:"function"`
+}
+
 type ChatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role         string     `json:"role"`
+	Content      any        `json:"content"`
+	Name         string     `json:"name,omitempty"`
+	ToolCallID   string     `json:"tool_call_id,omitempty"`
+	ToolCalls    []ToolCall `json:"tool_calls,omitempty"`
+	FunctionCall any        `json:"function_call,omitempty"`
+}
+
+type FunctionDefinition struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
+}
+
+type ToolDefinition struct {
+	Type     string              `json:"type"`
+	Function *FunctionDefinition `json:"function,omitempty"`
+}
+
+type ResponseFormatJSONSchema struct {
+	Name        string          `json:"name,omitempty"`
+	Description string          `json:"description,omitempty"`
+	Schema      json.RawMessage `json:"schema,omitempty"`
+	Strict      *bool           `json:"strict,omitempty"`
+}
+
+type ResponseFormat struct {
+	Type       string                    `json:"type"`
+	JSONSchema *ResponseFormatJSONSchema `json:"json_schema,omitempty"`
+	Schema     json.RawMessage           `json:"schema,omitempty"`
+}
+
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
+type PromptTokensDetails struct {
+	CachedTokens int `json:"cached_tokens,omitempty"`
+}
+
+type CompletionTokensDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
+}
+
+type UsageInfo struct {
+	PromptTokens            int                      `json:"prompt_tokens"`
+	CompletionTokens        int                      `json:"completion_tokens"`
+	TotalTokens             int                      `json:"total_tokens"`
+	PromptTokensDetails     *PromptTokensDetails     `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
+}
+
+func mapAgyUsageToOpenAI(u *AgyUsage) *UsageInfo {
+	if u == nil {
+		return nil
+	}
+	ui := &UsageInfo{
+		PromptTokens:     u.InputTokens,
+		CompletionTokens: u.OutputTokens,
+		TotalTokens:      u.TotalTokens,
+	}
+	if u.CacheReadTokens > 0 {
+		ui.PromptTokensDetails = &PromptTokensDetails{
+			CachedTokens: u.CacheReadTokens,
+		}
+	}
+	if u.ThinkingTokens > 0 {
+		ui.CompletionTokensDetails = &CompletionTokensDetails{
+			ReasoningTokens: u.ThinkingTokens,
+		}
+	}
+	return ui
+}
+
+func parseStopSequences(stop any) []string {
+	if stop == nil {
+		return nil
+	}
+	switch s := stop.(type) {
+	case string:
+		if s != "" {
+			return []string{s}
+		}
+	case []any:
+		var res []string
+		for _, item := range s {
+			if str, ok := item.(string); ok && str != "" {
+				res = append(res, str)
+			}
+		}
+		return res
+	case []string:
+		return s
+	}
+	return nil
+}
+
+func applyStopSequences(text string, stopSeqs []string) (string, bool) {
+	if len(stopSeqs) == 0 {
+		return text, false
+	}
+	earliestIdx := -1
+	for _, seq := range stopSeqs {
+		idx := strings.Index(text, seq)
+		if idx != -1 {
+			if earliestIdx == -1 || idx < earliestIdx {
+				earliestIdx = idx
+			}
+		}
+	}
+	if earliestIdx != -1 {
+		return text[:earliestIdx], true
+	}
+	return text, false
+}
+
+func stringifyMessageContent(content any) string {
+	if content == nil {
+		return ""
+	}
+	switch v := content.(type) {
+	case string:
+		return v
+	case []any:
+		var sb strings.Builder
+		for _, part := range v {
+			if m, ok := part.(map[string]any); ok {
+				if t, ok := m["text"].(string); ok {
+					sb.WriteString(t)
+				}
+			}
+		}
+		return sb.String()
+	default:
+		b, err := json.Marshal(v)
+		if err != nil {
+			return ""
+		}
+		return string(b)
+	}
 }
 
 type ChatCompletionRequest struct {
-	Model               string        `json:"model"`
-	Messages            []ChatMessage `json:"messages"`
-	Stream              bool          `json:"stream"`
-	Temperature         *float64      `json:"temperature,omitempty"`
-	TopP                *float64      `json:"top_p,omitempty"`
-	Stop                any           `json:"stop,omitempty"`
-	PresencePenalty     *float64      `json:"presence_penalty,omitempty"`
-	FrequencyPenalty    *float64      `json:"frequency_penalty,omitempty"`
-	Seed                *int          `json:"seed,omitempty"`
-	User                *string       `json:"user,omitempty"`
-	MaxCompletionTokens *int          `json:"max_completion_tokens,omitempty"`
+	Model               string               `json:"model"`
+	Messages            []ChatMessage        `json:"messages"`
+	Stream              bool                 `json:"stream"`
+	Temperature         *float64             `json:"temperature,omitempty"`
+	TopP                *float64             `json:"top_p,omitempty"`
+	Stop                any                  `json:"stop,omitempty"`
+	PresencePenalty     *float64             `json:"presence_penalty,omitempty"`
+	FrequencyPenalty    *float64             `json:"frequency_penalty,omitempty"`
+	Seed                *int                 `json:"seed,omitempty"`
+	User                *string              `json:"user,omitempty"`
+	MaxTokens           *int                 `json:"max_tokens,omitempty"`
+	MaxCompletionTokens *int                 `json:"max_completion_tokens,omitempty"`
+	ResponseFormat      *ResponseFormat      `json:"response_format,omitempty"`
+	Tools               []ToolDefinition     `json:"tools,omitempty"`
+	ToolChoice          any                  `json:"tool_choice,omitempty"`
+	Functions           []FunctionDefinition `json:"functions,omitempty"`
+	FunctionCall        any                  `json:"function_call,omitempty"`
+	ParallelToolCalls   *bool                `json:"parallel_tool_calls,omitempty"`
+	StreamOptions       *StreamOptions       `json:"stream_options,omitempty"`
+	IncludeUsage        *bool                `json:"include_usage,omitempty"`
+	Metadata            any                  `json:"metadata,omitempty"`
+	Logprobs            *bool                `json:"logprobs,omitempty"`
+	TopLogprobs         *int                 `json:"top_logprobs,omitempty"`
 }
 
 type ChatCompletionChoice struct {
@@ -255,11 +417,13 @@ type ChatCompletionResponse struct {
 	Created int64                  `json:"created"`
 	Model   string                 `json:"model"`
 	Choices []ChatCompletionChoice `json:"choices"`
+	Usage   *UsageInfo             `json:"usage,omitempty"`
 }
 
 type ChunkDelta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role      string     `json:"role,omitempty"`
+	Content   string     `json:"content,omitempty"`
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 }
 
 type ChunkChoice struct {
@@ -274,17 +438,18 @@ type ChatCompletionChunk struct {
 	Created int64         `json:"created"`
 	Model   string        `json:"model"`
 	Choices []ChunkChoice `json:"choices"`
+	Usage   *UsageInfo    `json:"usage,omitempty"`
 }
 
 type OpenAICompatibleServer struct {
-	apiKeyHash   [32]byte
-	catalog      *ModelCatalog
-	turns        *TurnCoordinator
-	logger       *APILogger
-	draining     int32
-	activeJobs   sync.WaitGroup
-	rootCtx      context.Context
-	cancelRoot   context.CancelFunc
+	apiKeyHash [32]byte
+	catalog    *ModelCatalog
+	turns      *TurnCoordinator
+	logger     *APILogger
+	draining   int32
+	activeJobs sync.WaitGroup
+	rootCtx    context.Context
+	cancelRoot context.CancelFunc
 }
 
 func NewOpenAICompatibleServer(apiKey string, turns *TurnCoordinator, logger *APILogger) *OpenAICompatibleServer {
@@ -416,11 +581,7 @@ func (s *OpenAICompatibleServer) handleModels(w http.ResponseWriter, r *http.Req
 	s.logOutcome(reqID, "GET", "/v1/models", http.StatusOK, "", startTime, false, nil, 0, clientClass)
 }
 
-var rejectedFields = []string{
-	"max_tokens", "metadata", "stream_options", "include_usage",
-	"tools", "tool_choice", "functions", "function_call", "response_format",
-	"logprobs", "top_logprobs", "parallel_tool_calls",
-}
+var rejectedFields = []string{}
 
 func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r *http.Request, reqID string, startTime time.Time, clientClass string) {
 	// t0 starts immediately after successful authentication
@@ -454,11 +615,7 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 
 	for _, field := range rejectedFields {
 		if _, ok := rawMap[field]; ok {
-			msg := fmt.Sprintf("Field %q is not supported", field)
-			if field == "max_tokens" {
-				msg = "max_tokens is not supported; use max_completion_tokens"
-			}
-			writeAPIError(w, http.StatusBadRequest, "invalid_request_error", msg, "unsupported_field", strPtr(field), false)
+			writeAPIError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Field %q is not supported", field), "unsupported_field", strPtr(field), false)
 			s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "unsupported_field", startTime, false, nil, 0, clientClass)
 			return
 		}
@@ -473,11 +630,83 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 		}
 	}
 
+	var effectiveMaxCompletionTokens *int
+
+	// Validate max_tokens if present in raw JSON
+	if rawMaxTokens, ok := rawMap["max_tokens"]; ok {
+		var mt int
+		if err := json.Unmarshal(rawMaxTokens, &mt); err != nil || mt <= 0 {
+			writeAPIError(w, http.StatusBadRequest, "invalid_request_error", "max_tokens must be a positive integer", "invalid_value", strPtr("max_tokens"), false)
+			s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "invalid_value", startTime, false, nil, 0, clientClass)
+			return
+		}
+		effectiveMaxCompletionTokens = &mt
+	}
+
+	// Validate max_completion_tokens if present in raw JSON
+	if rawMCT, ok := rawMap["max_completion_tokens"]; ok {
+		var mct int
+		if err := json.Unmarshal(rawMCT, &mct); err != nil || mct <= 0 {
+			writeAPIError(w, http.StatusBadRequest, "invalid_request_error", "max_completion_tokens must be a positive integer", "invalid_value", strPtr("max_completion_tokens"), false)
+			s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "invalid_value", startTime, false, nil, 0, clientClass)
+			return
+		}
+		// Modern max_completion_tokens takes precedence if both provided
+		effectiveMaxCompletionTokens = &mct
+	}
+	_ = effectiveMaxCompletionTokens
+
 	var req ChatCompletionRequest
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", "Failed to decode completion request", "invalid_request", nil, false)
 		s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "invalid_request", startTime, false, nil, 0, clientClass)
 		return
+	}
+
+	// Normalize legacy functions to tools
+	if len(req.Functions) > 0 && len(req.Tools) == 0 {
+		for _, fn := range req.Functions {
+			fnCopy := fn
+			req.Tools = append(req.Tools, ToolDefinition{
+				Type:     "function",
+				Function: &fnCopy,
+			})
+		}
+	}
+	if req.FunctionCall != nil && req.ToolChoice == nil {
+		req.ToolChoice = req.FunctionCall
+	}
+
+	// Validate response_format and extract schema if requested
+	var schemaToPass string
+	if req.ResponseFormat != nil {
+		switch req.ResponseFormat.Type {
+		case "", "text":
+			// plain text
+		case "json_object":
+			schemaToPass = `{"type":"object"}`
+		case "json_schema":
+			if req.ResponseFormat.JSONSchema != nil && len(req.ResponseFormat.JSONSchema.Schema) > 0 {
+				schemaToPass = strings.TrimSpace(string(req.ResponseFormat.JSONSchema.Schema))
+			} else if len(req.ResponseFormat.Schema) > 0 {
+				schemaToPass = strings.TrimSpace(string(req.ResponseFormat.Schema))
+			} else {
+				schemaToPass = `{"type":"object"}`
+			}
+		default:
+			writeAPIError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Unsupported response_format type %q", req.ResponseFormat.Type), "unsupported_response_format_type", strPtr("response_format.type"), false)
+			s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "unsupported_response_format_type", startTime, req.Stream, &req.Model, 0, clientClass)
+			return
+		}
+	}
+
+	if schemaToPass != "" {
+		var jsTest any
+		if err := json.Unmarshal([]byte(schemaToPass), &jsTest); err != nil {
+			writeAPIError(w, http.StatusBadRequest, "invalid_request_error", "response_format schema is not valid JSON", "invalid_response_format_schema", strPtr("response_format"), false)
+			s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "invalid_response_format_schema", startTime, req.Stream, &req.Model, 0, clientClass)
+			return
+		}
 	}
 
 	// Model validation
@@ -514,13 +743,14 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 	totalMsgBytes := 0
 	for idx, msg := range req.Messages {
 		switch msg.Role {
-		case "developer", "system", "user", "assistant":
+		case "developer", "system", "user", "assistant", "tool":
 		default:
 			writeAPIError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Unsupported role %q at messages[%d]", msg.Role, idx), "invalid_role", strPtr("role"), false)
 			s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "invalid_role", startTime, req.Stream, &req.Model, 0, clientClass)
 			return
 		}
-		msgLen := len(msg.Content)
+		msgStr := stringifyMessageContent(msg.Content)
+		msgLen := len(msgStr)
 		if msgLen > defaultMaxMessageBytes {
 			writeAPIError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Message at index %d exceeds maximum %d bytes", idx, defaultMaxMessageBytes), "message_too_large", strPtr("content"), false)
 			s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "message_too_large", startTime, req.Stream, &req.Model, 0, clientClass)
@@ -550,6 +780,14 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 	}
 	prompt := string(promptBytes)
 
+	stopSeqs := parseStopSequences(req.Stop)
+	wantUsage := false
+	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
+		wantUsage = true
+	} else if req.IncludeUsage != nil && *req.IncludeUsage {
+		wantUsage = true
+	}
+
 	// Prepare queue admission
 	queueStart := time.Now()
 	var queueWaitDuration time.Duration
@@ -557,6 +795,7 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 	jobDone := make(chan struct{})
 	var turnErr error
 	var turnResp string
+	var turnUsage *AgyUsage
 
 	s.activeJobs.Add(1)
 	defer s.activeJobs.Done()
@@ -631,7 +870,37 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 				}
 			}()
 
+			var cumText strings.Builder
+			stopped := false
 			streamCb := func(delta string) error {
+				if stopped {
+					return nil
+				}
+				prevLen := cumText.Len()
+				cumText.WriteString(delta)
+				curStr := cumText.String()
+
+				if len(stopSeqs) > 0 {
+					truncated, hitStop := applyStopSequences(curStr, stopSeqs)
+					if hitStop {
+						stopped = true
+						if len(truncated) > prevLen {
+							emitDelta := truncated[prevLen:]
+							chunk := ChatCompletionChunk{
+								ID:      "chatcmpl-" + reqID,
+								Object:  "chat.completion.chunk",
+								Created: created,
+								Model:   req.Model,
+								Choices: []ChunkChoice{{Index: 0, Delta: ChunkDelta{Content: emitDelta}, FinishReason: nil}},
+							}
+							b, _ := json.Marshal(chunk)
+							_, _ = fmt.Fprintf(w, "data: %s\n\n", string(b))
+							flusher.Flush()
+						}
+						return nil
+					}
+				}
+
 				chunk := ChatCompletionChunk{
 					ID:      "chatcmpl-" + reqID,
 					Object:  "chat.completion.chunk",
@@ -650,12 +919,17 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 				return nil
 			}
 
+			var actualUsage *AgyUsage
 			_, streamErr := executeAgy(execCtx, prompt, "", AgyCallOptions{
 				Profile:        ProfileAPI,
 				Model:          req.Model,
 				Stream:         true,
 				StreamCallback: streamCb,
 				Logger:         s.logger,
+				JSONSchema:     schemaToPass,
+				UsageCallback: func(u *AgyUsage) {
+					actualUsage = u
+				},
 			})
 			if streamErr != nil {
 				// Send post-header error frame and close without finish/[DONE]
@@ -673,7 +947,7 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 				return
 			}
 
-			// Terminal finish chunk + [DONE]
+			// Terminal finish chunk
 			stopStr := "stop"
 			finishChunk := ChatCompletionChunk{
 				ID:      "chatcmpl-" + reqID,
@@ -684,17 +958,43 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 			}
 			fBytes, _ := json.Marshal(finishChunk)
 			_, _ = fmt.Fprintf(w, "data: %s\n\n", string(fBytes))
+
+			// Usage chunk before [DONE] if requested and available
+			if wantUsage && actualUsage != nil {
+				usageChunk := ChatCompletionChunk{
+					ID:      "chatcmpl-" + reqID,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   req.Model,
+					Choices: []ChunkChoice{},
+					Usage:   mapAgyUsageToOpenAI(actualUsage),
+				}
+				uBytes, _ := json.Marshal(usageChunk)
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", string(uBytes))
+			}
+
 			_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
 			flusher.Flush()
 		} else {
+			var actualUsage *AgyUsage
 			resp, nonStreamErr := executeAgy(execCtx, prompt, "", AgyCallOptions{
-				Profile: ProfileAPI,
-				Model:   req.Model,
-				Stream:  false,
-				Logger:  s.logger,
+				Profile:    ProfileAPI,
+				Model:      req.Model,
+				Stream:     false,
+				Logger:     s.logger,
+				JSONSchema: schemaToPass,
+				UsageCallback: func(u *AgyUsage) {
+					actualUsage = u
+				},
 			})
+			if len(stopSeqs) > 0 && nonStreamErr == nil {
+				resp, _ = applyStopSequences(resp, stopSeqs)
+			}
 			turnResp = resp
 			turnErr = nonStreamErr
+			if nonStreamErr == nil {
+				turnUsage = actualUsage
+			}
 		}
 	})
 
@@ -785,6 +1085,7 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 					FinishReason: "stop",
 				},
 			},
+			Usage: mapAgyUsageToOpenAI(turnUsage),
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
