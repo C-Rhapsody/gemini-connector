@@ -25,6 +25,8 @@ type Config struct {
 	TeamsChatID              string
 	AgyConversationID        string
 	CronAdminTelegramUserIDs []string
+	TelegramRichMessages     bool
+	TelegramRichMathEscape   string
 
 	mu                sync.Mutex
 	envPath           string
@@ -186,6 +188,11 @@ func loadConfig(envFlag string) (*Config, error) {
 		}
 	}
 
+	richEnabled, richEscape, err := parseTelegramRichConfig(chatID)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Config{
 		ActiveMessengers:         activeMessengers,
 		TelegramBotToken:         token,
@@ -196,6 +203,38 @@ func loadConfig(envFlag string) (*Config, error) {
 		TeamsChatID:              teamsChatID,
 		AgyConversationID:        convID,
 		CronAdminTelegramUserIDs: cronAdmins,
+		TelegramRichMessages:     richEnabled,
+		TelegramRichMathEscape:   richEscape,
 		envPath:                  envPath,
 	}, nil
+}
+
+// parseTelegramRichConfig parses and validates opt-in Telegram Rich Message settings.
+// When enabled, a non-zero chatID and a valid math escape profile ("raw" or "numeric") are required.
+func parseTelegramRichConfig(chatID int64) (bool, string, error) {
+	raw := strings.TrimSpace(os.Getenv("TELEGRAM_RICH_MESSAGES"))
+	if raw == "" {
+		return false, "", nil
+	}
+	enabled, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, "", fmt.Errorf("invalid TELEGRAM_RICH_MESSAGES value %q: %w", raw, err)
+	}
+	if !enabled {
+		return false, "", nil
+	}
+
+	if chatID == 0 {
+		return false, "", fmt.Errorf("TELEGRAM_RICH_MESSAGES requires a non-zero TELEGRAM_CHAT_ID")
+	}
+
+	escape := strings.TrimSpace(os.Getenv("TELEGRAM_RICH_MATH_ESCAPE"))
+	switch escape {
+	case "raw", "numeric":
+		return true, escape, nil
+	case "":
+		return false, "", fmt.Errorf("TELEGRAM_RICH_MATH_ESCAPE is required when TELEGRAM_RICH_MESSAGES is enabled (must be 'raw' or 'numeric')")
+	default:
+		return false, "", fmt.Errorf("invalid TELEGRAM_RICH_MATH_ESCAPE %q: must be 'raw' or 'numeric'", escape)
+	}
 }

@@ -55,3 +55,97 @@ func TestUpdateEnvKey_CustomPath(t *testing.T) {
 		t.Fatalf("file = %q, want %q", got, want)
 	}
 }
+
+func TestParseTelegramRichConfig(t *testing.T) {
+	setEnv := func(k, v string) func() {
+		old, exists := os.LookupEnv(k)
+		if v == "" {
+			os.Unsetenv(k)
+		} else {
+			os.Setenv(k, v)
+		}
+		return func() {
+			if exists {
+				os.Setenv(k, old)
+			} else {
+				os.Unsetenv(k)
+			}
+		}
+	}
+
+	t.Run("absent TELEGRAM_RICH_MESSAGES defaults to false", func(t *testing.T) {
+		defer setEnv("TELEGRAM_RICH_MESSAGES", "")()
+		defer setEnv("TELEGRAM_RICH_MATH_ESCAPE", "")()
+		enabled, escape, err := parseTelegramRichConfig(12345)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if enabled || escape != "" {
+			t.Fatalf("expected false, empty; got %v, %q", enabled, escape)
+		}
+	})
+
+	t.Run("explicit false without escape succeeds", func(t *testing.T) {
+		defer setEnv("TELEGRAM_RICH_MESSAGES", "false")()
+		defer setEnv("TELEGRAM_RICH_MATH_ESCAPE", "")()
+		enabled, escape, err := parseTelegramRichConfig(12345)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if enabled || escape != "" {
+			t.Fatalf("expected false, empty; got %v, %q", enabled, escape)
+		}
+	})
+
+	t.Run("explicit true with valid raw escape", func(t *testing.T) {
+		defer setEnv("TELEGRAM_RICH_MESSAGES", "true")()
+		defer setEnv("TELEGRAM_RICH_MATH_ESCAPE", "raw")()
+		enabled, escape, err := parseTelegramRichConfig(12345)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !enabled || escape != "raw" {
+			t.Fatalf("expected true, raw; got %v, %q", enabled, escape)
+		}
+	})
+
+	t.Run("explicit true with valid numeric escape", func(t *testing.T) {
+		defer setEnv("TELEGRAM_RICH_MESSAGES", "true")()
+		defer setEnv("TELEGRAM_RICH_MATH_ESCAPE", "numeric")()
+		enabled, escape, err := parseTelegramRichConfig(12345)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !enabled || escape != "numeric" {
+			t.Fatalf("expected true, numeric; got %v, %q", enabled, escape)
+		}
+	})
+
+	t.Run("explicit true with invalid escape fails closed", func(t *testing.T) {
+		defer setEnv("TELEGRAM_RICH_MESSAGES", "true")()
+		defer setEnv("TELEGRAM_RICH_MATH_ESCAPE", "invalid_escape")()
+		_, _, err := parseTelegramRichConfig(12345)
+		if err == nil {
+			t.Fatal("expected error for invalid escape value, got nil")
+		}
+	})
+
+	t.Run("explicit true with missing escape fails closed", func(t *testing.T) {
+		defer setEnv("TELEGRAM_RICH_MESSAGES", "true")()
+		defer setEnv("TELEGRAM_RICH_MATH_ESCAPE", "")()
+		_, _, err := parseTelegramRichConfig(12345)
+		if err == nil {
+			t.Fatal("expected error for missing escape value, got nil")
+		}
+	})
+
+	t.Run("explicit true with zero chat ID fails closed", func(t *testing.T) {
+		defer setEnv("TELEGRAM_RICH_MESSAGES", "true")()
+		defer setEnv("TELEGRAM_RICH_MATH_ESCAPE", "raw")()
+		_, _, err := parseTelegramRichConfig(0)
+		if err == nil {
+			t.Fatal("expected error for zero chat ID, got nil")
+		}
+	})
+}
+
