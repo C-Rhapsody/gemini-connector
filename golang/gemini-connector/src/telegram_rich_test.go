@@ -599,6 +599,282 @@ func TestClassifyRichError(t *testing.T) {
 	}
 }
 
+func TestTelegramAdapter_Send_RichIntegration(t *testing.T) {
+	now := time.Now()
+	aiOpt := SendOptions{
+		AttachAfter:      now,
+		Plain:            false,
+		ReplyToMessageID: 101,
+	}
+
+	t.Run("eligible AI text uses one Rich request and does not call sendOneFn", func(t *testing.T) {
+		var richCalled int
+		var sendOneCalled int
+
+		adapter := &TelegramAdapter{
+			chatID: 12345,
+			richConfig: TelegramRichConfig{
+				Enabled:    true,
+				ChatID:     12345,
+				MathEscape: "raw",
+			},
+			makeRequestFn: func(endpoint string, params tgbotapi.Params) (*tgbotapi.APIResponse, error) {
+				if endpoint == "sendRichMessage" {
+					richCalled++
+					return &tgbotapi.APIResponse{
+						Ok:     true,
+						Result: []byte(`{"message_id": 999, "chat": {"id": 12345}}`),
+					}, nil
+				}
+				return &tgbotapi.APIResponse{Ok: false}, errors.New("unexpected endpoint")
+			},
+			sendOneFn: func(chatID int64, text string, parseMode string, replyToID int) error {
+				sendOneCalled++
+				return nil
+			},
+			collectDeliverablesFn: func(after time.Time, exclude exclusionSet) []deliverable {
+				return nil
+			},
+		}
+
+		err := adapter.Send("12345", "Here is \\(x = 1\\) math.", aiOpt)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if richCalled != 1 {
+			t.Errorf("expected 1 rich request, got %d", richCalled)
+		}
+		if sendOneCalled != 0 {
+			t.Errorf("expected sendOneFn NOT to be called, got %d", sendOneCalled)
+		}
+	})
+
+	t.Run("commands with zero AttachAfter use existing path", func(t *testing.T) {
+		var richCalled int
+		var sendOneCalled int
+
+		adapter := &TelegramAdapter{
+			chatID: 12345,
+			richConfig: TelegramRichConfig{
+				Enabled:    true,
+				ChatID:     12345,
+				MathEscape: "raw",
+			},
+			makeRequestFn: func(endpoint string, params tgbotapi.Params) (*tgbotapi.APIResponse, error) {
+				richCalled++
+				return &tgbotapi.APIResponse{Ok: true, Result: []byte(`{"message_id": 999}`)}, nil
+			},
+			sendOneFn: func(chatID int64, text string, parseMode string, replyToID int) error {
+				sendOneCalled++
+				return nil
+			},
+		}
+
+		cmdOpt := SendOptions{
+			AttachAfter: time.Time{}, // zero AttachAfter
+			Plain:       false,
+		}
+		err := adapter.Send("12345", "Command reply \\(x = 1\\)", cmdOpt)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if richCalled != 0 {
+			t.Errorf("expected 0 rich requests for command reply, got %d", richCalled)
+		}
+		if sendOneCalled == 0 {
+			t.Errorf("expected sendOneFn to be called for command reply")
+		}
+	})
+
+	t.Run("Plain:true bypasses Rich", func(t *testing.T) {
+		var richCalled int
+		var sendOneCalled int
+
+		adapter := &TelegramAdapter{
+			chatID: 12345,
+			richConfig: TelegramRichConfig{
+				Enabled:    true,
+				ChatID:     12345,
+				MathEscape: "raw",
+			},
+			makeRequestFn: func(endpoint string, params tgbotapi.Params) (*tgbotapi.APIResponse, error) {
+				richCalled++
+				return &tgbotapi.APIResponse{Ok: true}, nil
+			},
+			sendOneFn: func(chatID int64, text string, parseMode string, replyToID int) error {
+				sendOneCalled++
+				return nil
+			},
+		}
+
+		plainOpt := aiOpt
+		plainOpt.Plain = true
+		adapter.collectDeliverablesFn = func(after time.Time, exclude exclusionSet) []deliverable { return nil }
+		err := adapter.Send("12345", "Plain text \\(x = 1\\)", plainOpt)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if richCalled != 0 {
+			t.Errorf("expected 0 rich requests when Plain:true, got %d", richCalled)
+		}
+		if sendOneCalled == 0 {
+			t.Errorf("expected sendOneFn to be called when Plain:true")
+		}
+	})
+
+	t.Run("over-limit text uses the existing HTML/plain chunk path", func(t *testing.T) {
+		var richCalled int
+		var sendOneCalled int
+
+		adapter := &TelegramAdapter{
+			chatID: 12345,
+			richConfig: TelegramRichConfig{
+				Enabled:    true,
+				ChatID:     12345,
+				MathEscape: "raw",
+			},
+			makeRequestFn: func(endpoint string, params tgbotapi.Params) (*tgbotapi.APIResponse, error) {
+				richCalled++
+				return &tgbotapi.APIResponse{Ok: true}, nil
+			},
+			sendOneFn: func(chatID int64, text string, parseMode string, replyToID int) error {
+				sendOneCalled++
+				return nil
+			},
+			collectDeliverablesFn: func(after time.Time, exclude exclusionSet) []deliverable { return nil },
+		}
+
+		longText := strings.Repeat("a", 4500)
+		err := adapter.Send("12345", longText, aiOpt)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if richCalled != 0 {
+			t.Errorf("expected 0 rich requests for over-limit text, got %d", richCalled)
+		}
+		if sendOneCalled < 2 {
+			t.Errorf("expected multiple chunks via sendOneFn, got %d", sendOneCalled)
+		}
+	})
+
+	t.Run("definitive Rich 4xx invokes the existing HTML/plain path once", func(t *testing.T) {
+		var richCalled int
+		var sendOneCalled int
+
+		adapter := &TelegramAdapter{
+			chatID: 12345,
+			richConfig: TelegramRichConfig{
+				Enabled:    true,
+				ChatID:     12345,
+				MathEscape: "raw",
+			},
+			makeRequestFn: func(endpoint string, params tgbotapi.Params) (*tgbotapi.APIResponse, error) {
+				richCalled++
+				return &tgbotapi.APIResponse{
+					Ok:          false,
+					ErrorCode:   400,
+					Description: "Bad Request: can't parse rich_message",
+				}, &tgbotapi.Error{Code: 400, Message: "Bad Request: can't parse rich_message"}
+			},
+			sendOneFn: func(chatID int64, text string, parseMode string, replyToID int) error {
+				sendOneCalled++
+				return nil
+			},
+			collectDeliverablesFn: func(after time.Time, exclude exclusionSet) []deliverable { return nil },
+		}
+
+		err := adapter.Send("12345", "Here is \\(x = 1\\) math.", aiOpt)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if richCalled != 1 {
+			t.Errorf("expected 1 rich attempt, got %d", richCalled)
+		}
+		if sendOneCalled != 1 {
+			t.Errorf("expected 1 fallback sendOne call, got %d", sendOneCalled)
+		}
+	})
+
+	t.Run("uncertain Rich errors return without a second text send", func(t *testing.T) {
+		var richCalled int
+		var sendOneCalled int
+
+		adapter := &TelegramAdapter{
+			chatID: 12345,
+			richConfig: TelegramRichConfig{
+				Enabled:    true,
+				ChatID:     12345,
+				MathEscape: "raw",
+			},
+			makeRequestFn: func(endpoint string, params tgbotapi.Params) (*tgbotapi.APIResponse, error) {
+				richCalled++
+				return nil, errors.New("connection reset by peer")
+			},
+			sendOneFn: func(chatID int64, text string, parseMode string, replyToID int) error {
+				sendOneCalled++
+				return nil
+			},
+			collectDeliverablesFn: func(after time.Time, exclude exclusionSet) []deliverable { return nil },
+		}
+
+		err := adapter.Send("12345", "Here is \\(x = 1\\) math.", aiOpt)
+		if err == nil {
+			t.Fatal("expected error for uncertain transport failure, got nil")
+		}
+		if richCalled != 1 {
+			t.Errorf("expected 1 rich attempt, got %d", richCalled)
+		}
+		if sendOneCalled != 0 {
+			t.Errorf("expected sendOne NOT to be called on delivery-uncertain error, got %d", sendOneCalled)
+		}
+	})
+
+	t.Run("attachments still run after a successful Rich text send and are not changed", func(t *testing.T) {
+		var richCalled int
+		var attachmentSent []string
+
+		adapter := &TelegramAdapter{
+			chatID: 12345,
+			richConfig: TelegramRichConfig{
+				Enabled:    true,
+				ChatID:     12345,
+				MathEscape: "raw",
+			},
+			makeRequestFn: func(endpoint string, params tgbotapi.Params) (*tgbotapi.APIResponse, error) {
+				richCalled++
+				return &tgbotapi.APIResponse{
+					Ok:     true,
+					Result: []byte(`{"message_id": 999, "chat": {"id": 12345}}`),
+				}, nil
+			},
+			sendOneFn: func(chatID int64, text string, parseMode string, replyToID int) error {
+				return nil
+			},
+			sendAttachmentFn: func(chatID int64, path string, replyToID int) error {
+				attachmentSent = append(attachmentSent, path)
+				return nil
+			},
+			collectDeliverablesFn: func(after time.Time, exclude exclusionSet) []deliverable {
+				return []deliverable{
+					{path: "/tmp/chart.png", deletable: false},
+				}
+			},
+		}
+
+		err := adapter.Send("12345", "Here is \\(x = 1\\) with chart.", aiOpt)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if richCalled != 1 {
+			t.Errorf("expected 1 rich request, got %d", richCalled)
+		}
+		if len(attachmentSent) != 1 || attachmentSent[0] != "/tmp/chart.png" {
+			t.Errorf("expected attachment to be sent, got %v", attachmentSent)
+		}
+	})
+}
+
+
 
 
 

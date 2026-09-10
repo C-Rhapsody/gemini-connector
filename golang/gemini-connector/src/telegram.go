@@ -43,13 +43,20 @@ type TelegramAdapter struct {
 	richDisabledLatch     uint32
 }
 
-func NewTelegramAdapter(token string, chatID int64, msgs *Messages, convID func() string, proxyURL string) *TelegramAdapter {
+func NewTelegramAdapter(token string, chatID int64, msgs *Messages, convID func() string, proxyURL string, richCfg ...TelegramRichConfig) *TelegramAdapter {
+	var rich TelegramRichConfig
+	if len(richCfg) > 0 {
+		rich = richCfg[0]
+	} else {
+		rich = TelegramRichConfig{ChatID: chatID}
+	}
 	return &TelegramAdapter{
 		token:       token,
 		chatID:      chatID,
 		msgs:        msgs,
 		convID:      convID,
 		proxyURL:    strings.TrimSpace(proxyURL),
+		richConfig:  rich,
 		albumBuffer: make(map[string][]*tgbotapi.Message),
 		albumTimer:  make(map[string]*time.Timer),
 		msgChan:     make(chan InboundEvent, 100),
@@ -302,7 +309,28 @@ func (t *TelegramAdapter) Send(chatID string, text string, opts ...SendOptions) 
 	}
 
 	if text != "" {
-		for _, chunk := range splitTelegramChunks(text, 4000) {
+		richSent := false
+		if t.richEligible(id, text, opt) {
+			richHTML, err := renderRichHTML(text, t.richConfig.MathEscape)
+			if err == nil && isRichHTMLWithinLimit(richHTML) {
+				richMsg := &inputRichMessage{HTML: &richHTML}
+				_, richErr := t.sendRichMessage(id, richMsg, opt.ReplyToMessageID)
+				if richErr == nil {
+					richSent = true
+				} else {
+					action := t.classifyRichError(richErr)
+					if action == richActionFallback {
+						log.Printf("Telegram Rich send rejected definitively (%v); falling back to ordinary message", richErr)
+					} else {
+						log.Printf("Telegram Rich send delivery uncertain: %v (no alternate send)", richErr)
+						return richErr
+					}
+				}
+			}
+		}
+
+		if !richSent {
+			for _, chunk := range splitTelegramChunks(text, 4000) {
 			if opt.Plain {
 				if err := t.sendOne(id, chunk, "", opt.ReplyToMessageID); err != nil {
 					log.Printf("Telegram plain send failed: %v", err)
@@ -323,6 +351,7 @@ func (t *TelegramAdapter) Send(chatID string, text string, opts ...SendOptions) 
 			}
 		}
 	}
+}
 
 	for _, a := range attachments {
 		if err := t.sendAttachmentFile(id, a.path, opt.ReplyToMessageID); err != nil {

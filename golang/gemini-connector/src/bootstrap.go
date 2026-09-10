@@ -67,7 +67,18 @@ func Bootstrap(opts BootstrapOptions) (*Application, error) {
 	for _, name := range cfg.ActiveMessengers {
 		switch name {
 		case "telegram":
-			adapters["telegram"] = NewTelegramAdapter(cfg.TelegramBotToken, cfg.TelegramChatID, msgs, cfg.ConversationID, opts.TelegramProxy)
+			adapters["telegram"] = NewTelegramAdapter(
+				cfg.TelegramBotToken,
+				cfg.TelegramChatID,
+				msgs,
+				cfg.ConversationID,
+				opts.TelegramProxy,
+				TelegramRichConfig{
+					Enabled:    cfg.TelegramRichMessages,
+					MathEscape: cfg.TelegramRichMathEscape,
+					ChatID:     cfg.TelegramChatID,
+				},
+			)
 		case "teams":
 			adapters["teams"] = NewTeamsAdapter(cfg.TeamsTenantID, cfg.TeamsAppID, cfg.TeamsAppSecret, cfg.TeamsChatID, msgs)
 		default:
