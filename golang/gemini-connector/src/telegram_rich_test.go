@@ -235,3 +235,164 @@ func TestRichEligible(t *testing.T) {
 	})
 }
 
+func TestTokenizeLaTeX(t *testing.T) {
+	t.Run("inline parenthesis formula", func(t *testing.T) {
+		in := "The equation is \\(E = mc^2\\) inline."
+		masked, tokens := tokenizeLaTeX(in)
+		if len(tokens) != 1 {
+			t.Fatalf("expected 1 token, got %d", len(tokens))
+		}
+		if tokens[0].Kind != MathInline || tokens[0].Formula != "E = mc^2" {
+			t.Errorf("unexpected token: %+v", tokens[0])
+		}
+		if !strings.Contains(masked, tokens[0].Placeholder) {
+			t.Errorf("masked string %q does not contain placeholder %q", masked, tokens[0].Placeholder)
+		}
+	})
+
+	t.Run("block bracket formula", func(t *testing.T) {
+		in := "Block math:\n\\[\\int_0^1 x dx = \\frac{1}{2}\\]\ndone."
+		masked, tokens := tokenizeLaTeX(in)
+		if len(tokens) != 1 {
+			t.Fatalf("expected 1 token, got %d", len(tokens))
+		}
+		if tokens[0].Kind != MathBlock || tokens[0].Formula != "\\int_0^1 x dx = \\frac{1}{2}" {
+			t.Errorf("unexpected token: %+v", tokens[0])
+		}
+		if !strings.Contains(masked, tokens[0].Placeholder) {
+			t.Errorf("masked string %q does not contain placeholder %q", masked, tokens[0].Placeholder)
+		}
+	})
+
+	t.Run("block double dollar formula and multiline", func(t *testing.T) {
+		in := "Matrix:\n$$\n\\begin{matrix}\n1 & 0 \\\\\n0 & 1\n\\end{matrix}\n$$\nEnd."
+		_, tokens := tokenizeLaTeX(in)
+		if len(tokens) != 1 {
+			t.Fatalf("expected 1 token, got %d", len(tokens))
+		}
+		if tokens[0].Kind != MathBlock || !strings.Contains(tokens[0].Formula, "\\begin{matrix}") {
+			t.Errorf("unexpected token: %+v", tokens[0])
+		}
+	})
+
+	t.Run("bare dollar currency is not math", func(t *testing.T) {
+		in := "Item costs $100 and tax is $10. Total: $110."
+		masked, tokens := tokenizeLaTeX(in)
+		if len(tokens) != 0 {
+			t.Fatalf("expected 0 tokens for bare dollars, got %d: %+v", len(tokens), tokens)
+		}
+		if masked != in {
+			t.Errorf("masked text should match input exactly, got %q", masked)
+		}
+	})
+
+	t.Run("fenced backtick code block is not math", func(t *testing.T) {
+		in := "Here is code:\n```latex\n\\(x + y\\)\n\\[z\\]\n$$\\alpha$$\n```\nend."
+		masked, tokens := tokenizeLaTeX(in)
+		if len(tokens) != 0 {
+			t.Fatalf("expected 0 tokens inside fenced code, got %d", len(tokens))
+		}
+		if masked != in {
+			t.Errorf("masked code should match input exactly")
+		}
+	})
+
+	t.Run("fenced tilde code block is not math", func(t *testing.T) {
+		in := "Here is code:\n~~~latex\n\\(x + y\\)\n~~~\nend."
+		_, tokens := tokenizeLaTeX(in)
+		if len(tokens) != 0 {
+			t.Fatalf("expected 0 tokens inside tilde code, got %d", len(tokens))
+		}
+	})
+
+	t.Run("indented code block is not math", func(t *testing.T) {
+		in := "Normal paragraph:\n\n    \\(x + y\\) in indented code\n    $$block$$\n\nAfter code."
+		_, tokens := tokenizeLaTeX(in)
+		if len(tokens) != 0 {
+			t.Fatalf("expected 0 tokens inside indented code, got %d", len(tokens))
+		}
+	})
+
+	t.Run("inline code with single backticks is not math", func(t *testing.T) {
+		in := "Use `\\(x + y\\)` or `$$z$$` for formulas."
+		masked, tokens := tokenizeLaTeX(in)
+		if len(tokens) != 0 {
+			t.Fatalf("expected 0 tokens inside inline code, got %d", len(tokens))
+		}
+		if masked != in {
+			t.Errorf("masked text should match input")
+		}
+	})
+
+	t.Run("inline code with variable length double backticks", func(t *testing.T) {
+		in := "Use `` `\\(x\\)` `` as code."
+		_, tokens := tokenizeLaTeX(in)
+		if len(tokens) != 0 {
+			t.Fatalf("expected 0 tokens inside variable backticks code, got %d", len(tokens))
+		}
+	})
+
+	t.Run("raw HTML pre and code tags are not math", func(t *testing.T) {
+		in := "<pre>\\(x + y\\)</pre> and <code>$$z$$</code>"
+		_, tokens := tokenizeLaTeX(in)
+		if len(tokens) != 0 {
+			t.Fatalf("expected 0 tokens inside raw HTML, got %d", len(tokens))
+		}
+	})
+
+	t.Run("two formulas in one line", func(t *testing.T) {
+		in := "First \\(a + b\\) and second \\(c + d\\)."
+		masked, tokens := tokenizeLaTeX(in)
+		if len(tokens) != 2 {
+			t.Fatalf("expected 2 tokens, got %d", len(tokens))
+		}
+		if tokens[0].Formula != "a + b" || tokens[1].Formula != "c + d" {
+			t.Errorf("unexpected token formulas: %+v", tokens)
+		}
+		if tokens[0].Placeholder == tokens[1].Placeholder {
+			t.Errorf("placeholders must be unique: %q vs %q", tokens[0].Placeholder, tokens[1].Placeholder)
+		}
+		if !strings.Contains(masked, tokens[0].Placeholder) || !strings.Contains(masked, tokens[1].Placeholder) {
+			t.Errorf("masked missing placeholder")
+		}
+	})
+
+	t.Run("escaped delimiters do not trigger math", func(t *testing.T) {
+		in := `Escaped \\(not math\\) and normal \(math\)`
+		_, tokens := tokenizeLaTeX(in)
+		if len(tokens) != 1 {
+			t.Fatalf("expected 1 token for normal math only, got %d: %+v", len(tokens), tokens)
+		}
+		if tokens[0].Formula != "math" {
+			t.Errorf("expected token formula 'math', got %q", tokens[0].Formula)
+		}
+	})
+
+	t.Run("unbalanced delimiters remain literal and are never dropped", func(t *testing.T) {
+		in := "An unmatched \\(opening without close, and an unmatched \\[block too."
+		masked, tokens := tokenizeLaTeX(in)
+		if len(tokens) != 0 {
+			t.Fatalf("expected 0 tokens for unmatched delimiters, got %d", len(tokens))
+		}
+		if masked != in {
+			t.Errorf("unmatched text should be preserved verbatim, got %q", masked)
+		}
+	})
+
+	t.Run("placeholder does not collide with common text", func(t *testing.T) {
+		in := "Text contains TGMATH and TGMATH0123. Math is \\(x = 1\\)."
+		masked, tokens := tokenizeLaTeX(in)
+		if len(tokens) != 1 {
+			t.Fatalf("expected 1 token, got %d", len(tokens))
+		}
+		if !strings.HasPrefix(tokens[0].Placeholder, "TGMATH") {
+			t.Errorf("expected placeholder to start with TGMATH")
+		}
+		// Make sure the placeholder is distinct from the text
+		if strings.Count(masked, tokens[0].Placeholder) != 1 {
+			t.Errorf("placeholder must appear exactly once in masked text")
+		}
+	})
+}
+
+

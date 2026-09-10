@@ -1,11 +1,14 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -132,4 +135,293 @@ func (t *TelegramAdapter) richEligible(targetChatID int64, text string, opt Send
 	}
 	return true
 }
+
+// MathKind represents the classification of a LaTeX formula.
+type MathKind int
+
+const (
+	MathInline MathKind = iota // \( ... \)
+	MathBlock                 // \[ ... \] or $$ ... $$
+)
+
+// MathToken records an extracted math formula and its nonce placeholder.
+type MathToken struct {
+	Kind        MathKind
+	Raw         string
+	Formula     string
+	Placeholder string
+}
+
+func generateNonce() string {
+	var b [8]byte
+	_, err := rand.Read(b[:])
+	if err != nil {
+		return fmt.Sprintf("%016x", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// tokenizeLaTeX scans markdown text, preserves code blocks and bare dollars as literal,
+// and extracts valid \(...\), \[...\], and $$...$$ formulas into MathTokens with nonce placeholders.
+func tokenizeLaTeX(s string) (string, []MathToken) {
+	nonce := generateNonce()
+	var tokens []MathToken
+	var sb strings.Builder
+
+	n := len(s)
+	i := 0
+	atLineStart := true
+	prevWasEmptyLine := true
+	inIndentedCode := false
+
+	for i < n {
+		// 1. Check for fenced code block (``` or ~~~) at line start (up to 3 leading spaces)
+		if atLineStart {
+			leadSpaces := 0
+			for i+leadSpaces < n && s[i+leadSpaces] == ' ' && leadSpaces < 3 {
+				leadSpaces++
+			}
+			idx := i + leadSpaces
+			if idx < n && (s[idx] == '`' || s[idx] == '~') {
+				fenceChar := s[idx]
+				fenceLen := 0
+				for idx+fenceLen < n && s[idx+fenceLen] == fenceChar {
+					fenceLen++
+				}
+				if fenceLen >= 3 {
+					fenceEnd := idx + fenceLen
+					lineEnd := strings.IndexByte(s[fenceEnd:], '\n')
+					var contentStart int
+					if lineEnd == -1 {
+						sb.WriteString(s[i:])
+						break
+					}
+					contentStart = fenceEnd + lineEnd + 1
+					closeIdx := -1
+					searchPos := contentStart
+					for searchPos < n {
+						lSpaces := 0
+						for searchPos+lSpaces < n && s[searchPos+lSpaces] == ' ' && lSpaces < 3 {
+							lSpaces++
+						}
+						cPos := searchPos + lSpaces
+						if cPos < n && s[cPos] == fenceChar {
+							cLen := 0
+							for cPos+cLen < n && s[cPos+cLen] == fenceChar {
+								cLen++
+							}
+							if cLen >= fenceLen {
+								nextNL := strings.IndexByte(s[cPos+cLen:], '\n')
+								if nextNL == -1 {
+									closeIdx = n
+								} else {
+									closeIdx = cPos + cLen + nextNL + 1
+								}
+								break
+							}
+						}
+						nextNL := strings.IndexByte(s[searchPos:], '\n')
+						if nextNL == -1 {
+							break
+						}
+						searchPos += nextNL + 1
+					}
+					if closeIdx != -1 {
+						sb.WriteString(s[i:closeIdx])
+						i = closeIdx
+						atLineStart = true
+						prevWasEmptyLine = false
+						continue
+					} else {
+						sb.WriteString(s[i:])
+						break
+					}
+				}
+			}
+
+			// 2. Check for indented code block (4 spaces or 1 tab) after empty line or continuing
+			isIndented := false
+			if prevWasEmptyLine || inIndentedCode {
+				if i+4 <= n && s[i:i+4] == "    " {
+					isIndented = true
+				} else if i < n && s[i] == '\t' {
+					isIndented = true
+				}
+			}
+			if isIndented {
+				inIndentedCode = true
+				nextNL := strings.IndexByte(s[i:], '\n')
+				if nextNL == -1 {
+					sb.WriteString(s[i:])
+					break
+				}
+				sb.WriteString(s[i : i+nextNL+1])
+				i += nextNL + 1
+				atLineStart = true
+				prevWasEmptyLine = false
+				continue
+			}
+			inIndentedCode = false
+		}
+
+		// 3. Check for inline code (` or `` etc.)
+		if s[i] == '`' {
+			runLen := 0
+			for i+runLen < n && s[i+runLen] == '`' {
+				runLen++
+			}
+			target := strings.Repeat("`", runLen)
+			closePos := strings.Index(s[i+runLen:], target)
+			if closePos != -1 {
+				end := i + runLen + closePos + runLen
+				sb.WriteString(s[i:end])
+				i = end
+				atLineStart = false
+				prevWasEmptyLine = false
+				continue
+			}
+		}
+
+		// 4. Check for raw HTML tags <pre> or <code>
+		if s[i] == '<' && i+5 <= n {
+			lower5 := strings.ToLower(s[i : i+5])
+			if lower5 == "<pre>" || lower5 == "<pre " {
+				closePos := strings.Index(strings.ToLower(s[i+5:]), "</pre>")
+				if closePos != -1 {
+					end := i + 5 + closePos + 6
+					sb.WriteString(s[i:end])
+					i = end
+					atLineStart = false
+					prevWasEmptyLine = false
+					continue
+				}
+			} else if lower5 == "<code>" || lower5 == "<code" {
+				closePos := strings.Index(strings.ToLower(s[i+5:]), "</code>")
+				if closePos != -1 {
+					end := i + 5 + closePos + 7
+					sb.WriteString(s[i:end])
+					i = end
+					atLineStart = false
+					prevWasEmptyLine = false
+					continue
+				}
+			}
+		}
+
+		// 5. Check for LaTeX math delimiters (not escaped by an odd number of backslashes)
+		bsCount := 0
+		k := i - 1
+		for k >= 0 && s[k] == '\\' {
+			bsCount++
+			k--
+		}
+		isEscaped := (bsCount % 2) != 0
+
+		if !isEscaped {
+			if i+2 <= n && s[i:i+2] == "$$" {
+				closePos := strings.Index(s[i+2:], "$$")
+				if closePos != -1 {
+					raw := s[i : i+2+closePos+2]
+					formula := s[i+2 : i+2+closePos]
+					placeholder := fmt.Sprintf("TGMATH%sN%dX", nonce, len(tokens))
+					tokens = append(tokens, MathToken{
+						Kind:        MathBlock,
+						Raw:         raw,
+						Formula:     formula,
+						Placeholder: placeholder,
+					})
+					sb.WriteString(placeholder)
+					i += len(raw)
+					atLineStart = false
+					prevWasEmptyLine = false
+					continue
+				}
+			} else if i+2 <= n && s[i:i+2] == "\\(" {
+				searchStart := i + 2
+				closePos := -1
+				for p := searchStart; p+2 <= n; p++ {
+					if s[p:p+2] == "\\)" {
+						bs := 0
+						q := p - 1
+						for q >= searchStart && s[q] == '\\' {
+							bs++
+							q--
+						}
+						if bs%2 == 0 {
+							closePos = p
+							break
+						}
+					}
+				}
+				if closePos != -1 {
+					raw := s[i : closePos+2]
+					formula := s[i+2 : closePos]
+					placeholder := fmt.Sprintf("TGMATH%sN%dX", nonce, len(tokens))
+					tokens = append(tokens, MathToken{
+						Kind:        MathInline,
+						Raw:         raw,
+						Formula:     formula,
+						Placeholder: placeholder,
+					})
+					sb.WriteString(placeholder)
+					i += len(raw)
+					atLineStart = false
+					prevWasEmptyLine = false
+					continue
+				}
+			} else if i+2 <= n && s[i:i+2] == "\\[" {
+				searchStart := i + 2
+				closePos := -1
+				for p := searchStart; p+2 <= n; p++ {
+					if s[p:p+2] == "\\]" {
+						bs := 0
+						q := p - 1
+						for q >= searchStart && s[q] == '\\' {
+							bs++
+							q--
+						}
+						if bs%2 == 0 {
+							closePos = p
+							break
+						}
+					}
+				}
+				if closePos != -1 {
+					raw := s[i : closePos+2]
+					formula := s[i+2 : closePos]
+					placeholder := fmt.Sprintf("TGMATH%sN%dX", nonce, len(tokens))
+					tokens = append(tokens, MathToken{
+						Kind:        MathBlock,
+						Raw:         raw,
+						Formula:     formula,
+						Placeholder: placeholder,
+					})
+					sb.WriteString(placeholder)
+					i += len(raw)
+					atLineStart = false
+					prevWasEmptyLine = false
+					continue
+				}
+			}
+		}
+
+		ch := s[i]
+		sb.WriteByte(ch)
+		if ch == '\n' {
+			atLineStart = true
+			if i > 0 && s[i-1] == '\n' {
+				prevWasEmptyLine = true
+			} else {
+				prevWasEmptyLine = false
+			}
+		} else if ch != ' ' && ch != '\t' && ch != '\r' {
+			atLineStart = false
+			prevWasEmptyLine = false
+		}
+		i++
+	}
+
+	return sb.String(), tokens
+}
+
 
