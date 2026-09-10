@@ -38,6 +38,7 @@ type TelegramAdapter struct {
 	sendOneFn             func(chatID int64, text string, parseMode string, replyToID int) error
 	sendAttachmentFn      func(chatID int64, path string, replyToID int) error
 	collectDeliverablesFn func(after time.Time, exclude exclusionSet) []deliverable
+	makeRequestFn         telegramMakeRequest
 }
 
 func NewTelegramAdapter(token string, chatID int64, msgs *Messages, convID func() string, proxyURL string) *TelegramAdapter {
@@ -65,6 +66,9 @@ func (t *TelegramAdapter) Init() error {
 		return fmt.Errorf("bot init error: %s", redactToken(err.Error(), t.token))
 	}
 	t.bot = bot
+	if t.makeRequestFn == nil {
+		t.makeRequestFn = t.bot.MakeRequest
+	}
 	log.Printf("Bot Authorized as: %s", bot.Self.UserName)
 
 	commands := []tgbotapi.BotCommand{
