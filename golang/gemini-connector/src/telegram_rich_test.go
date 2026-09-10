@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -508,6 +509,96 @@ func TestRenderRichHTML(t *testing.T) {
 		}
 	})
 }
+
+func TestClassifyRichError(t *testing.T) {
+	cases := []struct {
+		name       string
+		err        error
+		wantAction richErrorAction
+		wantLatch  bool
+	}{
+		{
+			name:       "nil error",
+			err:        nil,
+			wantAction: richActionNone,
+			wantLatch:  false,
+		},
+		{
+			name:       "definitive 400 bad request",
+			err:        &tgbotapi.Error{Code: 400, Message: "Bad Request: can't parse rich_message"},
+			wantAction: richActionFallback,
+			wantLatch:  false,
+		},
+		{
+			name:       "definitive 404 unknown method triggers latch",
+			err:        &tgbotapi.Error{Code: 404, Message: "Not Found: method not found"},
+			wantAction: richActionFallback,
+			wantLatch:  true,
+		},
+		{
+			name:       "definitive 404 chat not found does not trigger latch",
+			err:        &tgbotapi.Error{Code: 404, Message: "Not Found: chat not found"},
+			wantAction: richActionFallback,
+			wantLatch:  false,
+		},
+		{
+			name:       "rate limit 429 is delivery-uncertain (no fallback)",
+			err:        &tgbotapi.Error{Code: 429, Message: "Too Many Requests: retry after 10"},
+			wantAction: richActionNone,
+			wantLatch:  false,
+		},
+		{
+			name:       "server error 500 is delivery-uncertain (no fallback)",
+			err:        &tgbotapi.Error{Code: 500, Message: "Internal Server Error"},
+			wantAction: richActionNone,
+			wantLatch:  false,
+		},
+		{
+			name:       "server error 502 bad gateway is delivery-uncertain",
+			err:        &tgbotapi.Error{Code: 502, Message: "Bad Gateway"},
+			wantAction: richActionNone,
+			wantLatch:  false,
+		},
+		{
+			name:       "transport error timeout is delivery-uncertain",
+			err:        errors.New("context deadline exceeded"),
+			wantAction: richActionNone,
+			wantLatch:  false,
+		},
+		{
+			name:       "decode error is delivery-uncertain",
+			err:        errors.New("failed to decode rich message response: unexpected EOF"),
+			wantAction: richActionNone,
+			wantLatch:  false,
+		},
+		{
+			name:       "zero code API error is delivery-uncertain",
+			err:        &tgbotapi.Error{Code: 0, Message: "unknown error"},
+			wantAction: richActionNone,
+			wantLatch:  false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &TelegramAdapter{
+				chatID: 12345,
+				richConfig: TelegramRichConfig{
+					Enabled: true,
+					ChatID:  12345,
+				},
+			}
+			action := a.classifyRichError(tc.err)
+			if action != tc.wantAction {
+				t.Errorf("got action %v, want %v", action, tc.wantAction)
+			}
+			if a.isRichProcessDisabled() != tc.wantLatch {
+				t.Errorf("got latch %v, want %v", a.isRichProcessDisabled(), tc.wantLatch)
+			}
+		})
+	}
+}
+
 
 
 

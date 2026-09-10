@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -484,6 +485,67 @@ func renderRichHTML(s string, mathEscape string) (string, error) {
 
 	return html, nil
 }
+
+// richErrorAction dictates the fallback behavior after a sendRichMessage attempt.
+type richErrorAction int
+
+const (
+	// richActionNone means no alternate send is permitted (success, or delivery-uncertain errors like timeout/429/5xx).
+	richActionNone richErrorAction = iota
+	// richActionFallback indicates a definitive Telegram API 4xx rejection (excluding 429), allowing a single HTML/plain fallback.
+	richActionFallback
+)
+
+// classifyRichError evaluates errors from sendRichMessage according to the strict fallback contract:
+// - Definitive 4xx (except 429) allows fallback.
+// - 404 with method-not-found description sets the process-wide disable latch.
+// - Delivery-uncertain errors (transport, timeout, decode, 429, 5xx, zero-code) return richActionNone with NO alternate send.
+func (t *TelegramAdapter) classifyRichError(err error) richErrorAction {
+	if err == nil {
+		return richActionNone
+	}
+
+	var apiErr *tgbotapi.Error
+	if !errors.As(err, &apiErr) {
+		// Transport error, timeout, decode failure, connection reset -> delivery uncertain
+		return richActionNone
+	}
+
+	code := apiErr.Code
+	if code == 0 {
+		// Zero-code response is not definitive
+		return richActionNone
+	}
+
+	// 429 Too Many Requests -> delivery uncertain, do not retry immediately with second format
+	if code == 429 {
+		return richActionNone
+	}
+
+	// 5xx Server Error -> delivery uncertain
+	if code >= 500 {
+		return richActionNone
+	}
+
+	// Check 404 for unknown method (e.g. "Not Found: method not found")
+	if code == 404 {
+		desc := strings.ToLower(apiErr.Message)
+		if strings.Contains(desc, "method") {
+			if !t.isRichProcessDisabled() {
+				t.disableRichProcess()
+				log.Printf("Telegram Rich Messages disabled process-wide: Telegram Bot API rejected method (404 %s)", apiErr.Message)
+			}
+		}
+	}
+
+	// Definitive 4xx rejection (400 <= code < 500, code != 429)
+	if code >= 400 && code < 500 {
+		return richActionFallback
+	}
+
+	return richActionNone
+}
+
 
 
 
