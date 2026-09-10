@@ -39,6 +39,8 @@ type TelegramAdapter struct {
 	sendAttachmentFn      func(chatID int64, path string, replyToID int) error
 	collectDeliverablesFn func(after time.Time, exclude exclusionSet) []deliverable
 	makeRequestFn         telegramMakeRequest
+	richConfig            TelegramRichConfig
+	richDisabledLatch     uint32
 }
 
 func NewTelegramAdapter(token string, chatID int64, msgs *Messages, convID func() string, proxyURL string) *TelegramAdapter {

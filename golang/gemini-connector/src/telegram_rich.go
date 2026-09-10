@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
+	"sync/atomic"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -65,3 +67,69 @@ func (t *TelegramAdapter) sendRichMessage(chatID int64, richMsg *inputRichMessag
 	}
 	return &res, nil
 }
+
+// TelegramRichConfig defines the configuration for opt-in Telegram Rich Messages.
+type TelegramRichConfig struct {
+	Enabled    bool
+	MathEscape string
+	ChatID     int64
+}
+
+// maxRichHTMLUTF16Units is the conservative prefilter threshold for post-restoration Rich HTML.
+const maxRichHTMLUTF16Units = 4000
+
+// utf16Units counts the number of UTF-16 code units in a string.
+// BMP characters count as 1, supplementary characters (surrogate pairs) count as 2.
+func utf16Units(s string) int {
+	count := 0
+	for _, r := range s {
+		if r > 0xFFFF {
+			count += 2
+		} else {
+			count++
+		}
+	}
+	return count
+}
+
+// isRichHTMLWithinLimit checks if the post-restoration Rich HTML candidate is within the UTF-16 length limit.
+func isRichHTMLWithinLimit(richHTML string) bool {
+	return utf16Units(richHTML) <= maxRichHTMLUTF16Units
+}
+
+// isRichProcessDisabled returns true if the Rich feature has been disabled process-wide (e.g. 404 unknown method).
+func (t *TelegramAdapter) isRichProcessDisabled() bool {
+	return atomic.LoadUint32(&t.richDisabledLatch) == 1
+}
+
+// disableRichProcess disables Rich delivery process-wide.
+func (t *TelegramAdapter) disableRichProcess() {
+	atomic.StoreUint32(&t.richDisabledLatch, 1)
+}
+
+// richEligible checks whether an outbound message meets all criteria to attempt Rich delivery.
+func (t *TelegramAdapter) richEligible(targetChatID int64, text string, opt SendOptions) bool {
+	if !t.richConfig.Enabled {
+		return false
+	}
+	if t.richConfig.ChatID == 0 {
+		return false
+	}
+	if targetChatID != t.richConfig.ChatID {
+		return false
+	}
+	if opt.Plain {
+		return false
+	}
+	if opt.AttachAfter.IsZero() {
+		return false
+	}
+	if strings.TrimSpace(text) == "" {
+		return false
+	}
+	if t.isRichProcessDisabled() {
+		return false
+	}
+	return true
+}
+
