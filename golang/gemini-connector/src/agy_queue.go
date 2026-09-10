@@ -2,7 +2,22 @@ package main
 
 import (
 	"context"
+	"errors"
 	"sync"
+)
+
+type JobOrigin int
+
+const (
+	OriginTelegram JobOrigin = iota
+	OriginCron
+	OriginAPI
+)
+
+const maxAPIAdmitted = 4
+
+var (
+	ErrAPIQueueFull = errors.New("api queue is full")
 )
 
 // turnJob is a unit of sequential agy work. Each job carries its own
@@ -16,6 +31,7 @@ type turnJob struct {
 	cancel context.CancelFunc
 	run    func(ctx context.Context)
 	onDrop func()
+	origin JobOrigin
 }
 
 // agyTurnQueue serializes agy work (AI turns, conversation resets, cron
@@ -58,16 +74,49 @@ func (q *agyTurnQueue) Enqueue(run func(ctx context.Context)) int {
 // EnqueueManaged behaves like Enqueue but invokes onDrop synchronously when
 // the job is discarded by StopActive before it ever starts.
 func (q *agyTurnQueue) EnqueueManaged(run func(ctx context.Context), onDrop func()) int {
+	return q.EnqueueWithOrigin(run, onDrop, OriginTelegram)
+}
+
+func (q *agyTurnQueue) EnqueueWithOrigin(run func(ctx context.Context), onDrop func(), origin JobOrigin) int {
 	ctx, cancel := context.WithCancel(context.Background())
 	q.mu.Lock()
 	ahead := len(q.jobs)
 	if q.cur != nil {
 		ahead++
 	}
-	q.jobs = append(q.jobs, turnJob{ctx: ctx, cancel: cancel, run: run, onDrop: onDrop})
+	q.jobs = append(q.jobs, turnJob{ctx: ctx, cancel: cancel, run: run, onDrop: onDrop, origin: origin})
 	q.mu.Unlock()
 	q.signal()
 	return ahead
+}
+
+// EnqueueAPI enqueues an API job bounded by maxAPIAdmitted. If the API admission
+// limit is reached, it returns ErrAPIQueueFull immediately.
+func (q *agyTurnQueue) EnqueueAPI(parentCtx context.Context, run func(ctx context.Context)) (int, error) {
+	q.mu.Lock()
+	apiCount := 0
+	if q.cur != nil && q.cur.origin == OriginAPI {
+		apiCount++
+	}
+	for _, j := range q.jobs {
+		if j.origin == OriginAPI {
+			apiCount++
+		}
+	}
+	if apiCount >= maxAPIAdmitted {
+		q.mu.Unlock()
+		return 0, ErrAPIQueueFull
+	}
+
+	ctx, cancel := context.WithCancel(parentCtx)
+	ahead := len(q.jobs)
+	if q.cur != nil {
+		ahead++
+	}
+	q.jobs = append(q.jobs, turnJob{ctx: ctx, cancel: cancel, run: run, origin: OriginAPI})
+	q.mu.Unlock()
+	q.signal()
+	return ahead, nil
 }
 
 // worker claims and executes queued jobs one at a time until the queue
@@ -82,6 +131,17 @@ func (q *agyTurnQueue) worker() {
 		}
 		job := q.jobs[0]
 		q.jobs = q.jobs[1:]
+
+		// If the job's context expired or was canceled before starting, skip running it.
+		if job.ctx.Err() != nil {
+			q.mu.Unlock()
+			job.cancel()
+			if job.onDrop != nil {
+				job.onDrop()
+			}
+			continue
+		}
+
 		q.cur = &job
 		q.mu.Unlock()
 
@@ -94,31 +154,52 @@ func (q *agyTurnQueue) worker() {
 	}
 }
 
-// StopActive cancels the currently running job (if any) and drops every job
-// that was queued before this call, invoking their onDrop hooks synchronously.
-// Jobs enqueued afterwards are kept and will run once the cancelled job
-// unwinds. It reports whether a job was actively running and how many queued
-// jobs were dropped.
+// StopActive cancels the currently running non-API job (if any) and drops every
+// non-API job queued before this call, invoking their onDrop hooks synchronously.
+// API-origin jobs are preserved and neither canceled nor counted in dropped.
 func (q *agyTurnQueue) StopActive() (active bool, dropped int) {
 	q.mu.Lock()
-	active = q.cur != nil
+	active = q.cur != nil && q.cur.origin != OriginAPI
 	if active {
 		q.cur.cancel()
 	}
-	dropped = len(q.jobs)
+
+	var surviving []turnJob
 	var hooks []func()
 	for _, job := range q.jobs {
-		job.cancel()
-		if job.onDrop != nil {
-			hooks = append(hooks, job.onDrop)
+		if job.origin == OriginAPI {
+			surviving = append(surviving, job)
+		} else {
+			job.cancel()
+			dropped++
+			if job.onDrop != nil {
+				hooks = append(hooks, job.onDrop)
+			}
 		}
 	}
-	q.jobs = nil
+	q.jobs = surviving
 	q.mu.Unlock()
 	for _, h := range hooks {
 		h()
 	}
 	return active, dropped
+}
+
+// StopAll cancels all running and queued jobs regardless of origin, used for
+// connector shutdown.
+func (q *agyTurnQueue) StopAll() {
+	q.mu.Lock()
+	if q.cur != nil {
+		q.cur.cancel()
+	}
+	for _, job := range q.jobs {
+		job.cancel()
+		if job.onDrop != nil {
+			job.onDrop()
+		}
+	}
+	q.jobs = nil
+	q.mu.Unlock()
 }
 
 // Busy reports whether a job is running or queued.

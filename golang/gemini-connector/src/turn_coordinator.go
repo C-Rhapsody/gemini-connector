@@ -26,10 +26,20 @@ func (c *TurnCoordinator) SubmitManaged(run func(ctx context.Context), onDrop fu
 	return c.q.EnqueueManaged(run, onDrop)
 }
 
+// SubmitAPI enqueues an API turn subject to the API admission limit.
+func (c *TurnCoordinator) SubmitAPI(ctx context.Context, run func(ctx context.Context)) (int, error) {
+	return c.q.EnqueueAPI(ctx, run)
+}
+
 // StopActive cancels the running turn and drops queued ones. See
 // agyTurnQueue.StopActive for the exact contract.
 func (c *TurnCoordinator) StopActive() (active bool, dropped int) {
 	return c.q.StopActive()
+}
+
+// StopAll cancels all running and queued turns for connector shutdown.
+func (c *TurnCoordinator) StopAll() {
+	c.q.StopAll()
 }
 
 // Busy reports whether a turn is running or queued.

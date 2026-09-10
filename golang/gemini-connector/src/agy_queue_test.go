@@ -237,3 +237,132 @@ func TestMessagesApplyDefaults(t *testing.T) {
 		t.Fatalf("empty help must fall back to default, got %q", m.CommandStartHelp)
 	}
 }
+
+func TestAgyTurnQueue_APIAdmissionLimit(t *testing.T) {
+	q := newAgyTurnQueue()
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	// Enqueue 1 running API job
+	_, err := q.EnqueueAPI(context.Background(), func(ctx context.Context) {
+		close(started)
+		<-release
+	})
+	if err != nil {
+		t.Fatalf("unexpected error enqueuing first API job: %v", err)
+	}
+	<-started
+
+	// Enqueue 3 more waiting API jobs (total 4 admitted)
+	for i := 0; i < 3; i++ {
+		_, err := q.EnqueueAPI(context.Background(), func(ctx context.Context) {})
+		if err != nil {
+			t.Fatalf("unexpected error enqueuing API job %d: %v", i+2, err)
+		}
+	}
+
+	// 5th API job must be rejected immediately
+	_, err = q.EnqueueAPI(context.Background(), func(ctx context.Context) {})
+	if err != ErrAPIQueueFull {
+		t.Fatalf("expected ErrAPIQueueFull for 5th API job, got: %v", err)
+	}
+
+	close(release)
+	waitQueueIdle(t, q)
+}
+
+func TestAgyTurnQueue_StopActivePreservesAPI(t *testing.T) {
+	q := newAgyTurnQueue()
+	apiStarted := make(chan struct{})
+	apiRelease := make(chan struct{})
+	var apiRan, tgRan bool
+	var mu sync.Mutex
+
+	// Running API job
+	_, err := q.EnqueueAPI(context.Background(), func(ctx context.Context) {
+		close(apiStarted)
+		select {
+		case <-apiRelease:
+			mu.Lock()
+			apiRan = true
+			mu.Unlock()
+		case <-ctx.Done():
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-apiStarted
+
+	// Queued API job
+	_, err = q.EnqueueAPI(context.Background(), func(ctx context.Context) {
+		mu.Lock()
+		apiRan = true
+		mu.Unlock()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Queued Telegram job
+	tgDropped := false
+	q.EnqueueManaged(func(ctx context.Context) {
+		mu.Lock()
+		tgRan = true
+		mu.Unlock()
+	}, func() {
+		mu.Lock()
+		tgDropped = true
+		mu.Unlock()
+	})
+
+	// StopActive should NOT stop the API job and should only drop the Telegram job
+	active, dropped := q.StopActive()
+	if active {
+		t.Fatalf("expected active=false because running job is API, got active=true")
+	}
+	if dropped != 1 {
+		t.Fatalf("expected dropped=1 (the Telegram job), got dropped=%d", dropped)
+	}
+
+	close(apiRelease)
+	waitQueueIdle(t, q)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !apiRan {
+		t.Errorf("API jobs should have executed despite StopActive")
+	}
+	if tgRan {
+		t.Errorf("Telegram job should have been dropped, not run")
+	}
+	if !tgDropped {
+		t.Errorf("Telegram job onDrop hook should have fired")
+	}
+}
+
+func TestAgyTurnQueue_StopAll(t *testing.T) {
+	q := newAgyTurnQueue()
+	started := make(chan struct{})
+	apiCanceled := false
+	var mu sync.Mutex
+
+	_, _ = q.EnqueueAPI(context.Background(), func(ctx context.Context) {
+		close(started)
+		<-ctx.Done()
+		mu.Lock()
+		apiCanceled = true
+		mu.Unlock()
+	})
+	<-started
+
+	q.StopAll()
+	waitQueueIdle(t, q)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !apiCanceled {
+		t.Errorf("StopAll should have canceled running API job")
+	}
+}
+

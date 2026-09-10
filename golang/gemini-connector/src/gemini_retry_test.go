@@ -215,9 +215,10 @@ func TestExecuteAgy_SalvagedResponseOnStreamLag(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	now := time.Now().UTC().Format(time.RFC3339)
 	transcript := strings.Join([]string{
-		`{"step_index":0,"type":"USER_INPUT","status":"DONE","created_at":"2026-09-10T00:00:00Z","content":"what is the price?"}`,
-		`{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-09-10T00:00:01Z","content":"The price is 100 USD."}`,
+		`{"step_index":0,"type":"USER_INPUT","status":"DONE","created_at":"` + now + `","content":"what is the price?"}`,
+		`{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"` + now + `","content":"The price is 100 USD."}`,
 	}, "\n") + "\n"
 
 	if err := os.WriteFile(filepath.Join(logDir, "transcript.jsonl"), []byte(transcript), 0644); err != nil {

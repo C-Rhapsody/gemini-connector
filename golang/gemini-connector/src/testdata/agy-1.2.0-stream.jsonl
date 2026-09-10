@@ -1,0 +1,5 @@
+{"event":"init","conversation_id":"00000000-0000-0000-0000-000000000000","init":{"model":"gemini-3.8-flash-low"}}
+{"event":"step_update","step_update":{"conversation_id":"00000000-0000-0000-0000-000000000000","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"Hello"}}
+{"event":"step_update","step_update":{"conversation_id":"00000000-0000-0000-0000-000000000000","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":" world!"}}
+{"event":"step_update","step_update":{"conversation_id":"00000000-0000-0000-0000-000000000000","step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"\n"}}
+{"event":"result","result":{"conversation_id":"00000000-0000-0000-0000-000000000000","status":"SUCCESS","response":"Hello world!\n","duration_seconds":1.0,"num_turns":1}}

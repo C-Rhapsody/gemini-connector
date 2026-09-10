@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -57,7 +58,111 @@ const (
 	ProfileScheduled
 	// ProfileBootstrap creates or replays into a fresh conversation.
 	ProfileBootstrap
+	// ProfileAPI runs stateless OpenAI-compatible completions with sandbox restrictions
+	// and no dangerous permissions.
+	ProfileAPI
 )
+
+// agyLaunchSem is the shared AGY-launch mutex ensuring that at most one AGY
+// process (chat turn, model discovery, cron planning) runs at any time.
+var agyLaunchSem = make(chan struct{}, 1)
+
+func init() {
+	agyLaunchSem <- struct{}{}
+}
+
+func acquireAgyLaunch(ctx context.Context, timeout time.Duration) bool {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-agyLaunchSem:
+		return true
+	case <-timer.C:
+		return false
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func releaseAgyLaunch() {
+	select {
+	case agyLaunchSem <- struct{}{}:
+	default:
+	}
+}
+
+// ndjsonStreamWriter parses streaming NDJSON events from agy --output-format stream-json
+// in real time as chunks arrive.
+type ndjsonStreamWriter struct {
+	callback   func(delta string) error
+	buf        bytes.Buffer
+	totalBytes int64
+	maxBytes   int64
+	maxLine    int64
+	sawSuccess bool
+	err        error
+	mu         sync.Mutex
+}
+
+func (w *ndjsonStreamWriter) Write(p []byte) (n int, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.err != nil {
+		return 0, w.err
+	}
+
+	w.buf.Write(p)
+	for {
+		line, readErr := w.buf.ReadBytes('\n')
+		if readErr != nil {
+			// Partial line; put it back into w.buf
+			w.buf.Write(line)
+			if int64(w.buf.Len()) > w.maxLine {
+				w.err = fmt.Errorf("stream line exceeds maximum size %d bytes", w.maxLine)
+				return len(p), w.err
+			}
+			break
+		}
+		if int64(len(line)) > w.maxLine {
+			w.err = fmt.Errorf("stream line exceeds maximum size %d bytes", w.maxLine)
+			return len(p), w.err
+		}
+
+		var ev struct {
+			Event      string `json:"event"`
+			StepUpdate *struct {
+				StepType  string `json:"step_type"`
+				TextDelta string `json:"text_delta"`
+			} `json:"step_update"`
+			Result *struct {
+				Status string `json:"status"`
+			} `json:"result"`
+		}
+		if jsonErr := json.Unmarshal(bytes.TrimSpace(line), &ev); jsonErr == nil {
+			if ev.Event == "step_update" && ev.StepUpdate != nil && ev.StepUpdate.TextDelta != "" {
+				w.totalBytes += int64(len(ev.StepUpdate.TextDelta))
+				if w.totalBytes > w.maxBytes {
+					w.err = fmt.Errorf("cumulative assistant output exceeds limit of %d bytes", w.maxBytes)
+					return len(p), w.err
+				}
+				if w.callback != nil {
+					if cbErr := w.callback(ev.StepUpdate.TextDelta); cbErr != nil {
+						w.err = cbErr
+						return len(p), w.err
+					}
+				}
+			} else if ev.Event == "result" && ev.Result != nil {
+				if ev.Result.Status == "SUCCESS" {
+					w.sawSuccess = true
+				} else {
+					w.err = fmt.Errorf("upstream result status: %s", ev.Result.Status)
+					return len(p), w.err
+				}
+			}
+		}
+	}
+	return len(p), nil
+}
 
 // agyInvoker indirection lets controller-level tests stub interactive turns.
 var agyInvoker = executeAgy
@@ -94,6 +199,14 @@ type AgyCallOptions struct {
 	BypassQuotaGate bool
 	// DisableRetry turns off automatic retry on transient stream errors.
 	DisableRetry bool
+	// Model selects the exact model (e.g. gemini-3.8-flash-high).
+	Model string
+	// Stream enables stream-json output format and streaming callback.
+	Stream bool
+	// StreamCallback is called for each text_delta during streaming.
+	StreamCallback func(chunk string) error
+	// Logger is the optional API logger instance.
+	Logger *APILogger
 }
 
 // quotaBlockErr returns the rejection error for gated calls during an active
@@ -118,7 +231,7 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 	}
 
 	maxAttempts := 2
-	if o.DisableRetry {
+	if o.DisableRetry || o.Profile == ProfileAPI {
 		maxAttempts = 1
 	}
 
@@ -131,23 +244,44 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 			}
 			log.Printf("Retrying agy CLI execution (attempt %d/%d) for message: %s", attempt, maxAttempts, truncateString(prompt, 50))
 		} else {
-			log.Printf("Triggering agy CLI for message (via Stdin): %s", truncateString(prompt, 50))
+			if o.Profile != ProfileAPI {
+				log.Printf("Triggering agy CLI for message (via Stdin): %s", truncateString(prompt, 50))
+			}
 		}
 
 		// Turn start marker for transcript salvage: brain steps created from this
 		// point on belong to the turn we are about to spawn.
 		turnStart := time.Now()
 
-		args := []string{
-			"--output-format", "json",
-			"--dangerously-skip-permissions",
-			"--print-timeout", "5m",
-		}
-		if o.Profile == ProfilePlanner {
-			args = append(args, "--mode", "plan", "--sandbox", "--disable-slash-commands")
-		}
-		if conversationID != "" {
-			args = append(args, "--conversation", conversationID)
+		var args []string
+		if o.Profile == ProfileAPI {
+			args = []string{
+				"--mode", "plan",
+				"--sandbox",
+				"--disable-slash-commands",
+				"--print-timeout", "90s",
+			}
+			if o.Stream {
+				args = append(args, "--output-format", "stream-json")
+			} else {
+				args = append(args, "--output-format", "json")
+			}
+			if o.Model != "" {
+				args = append(args, "--model", o.Model)
+			}
+			// Note: API calls are stateless and never inherit conversation ID or dangerous permissions.
+		} else {
+			args = []string{
+				"--output-format", "json",
+				"--dangerously-skip-permissions",
+				"--print-timeout", "5m",
+			}
+			if o.Profile == ProfilePlanner {
+				args = append(args, "--mode", "plan", "--sandbox", "--disable-slash-commands")
+			}
+			if conversationID != "" {
+				args = append(args, "--conversation", conversationID)
+			}
 		}
 
 		cmd := exec.CommandContext(ctx, "agy", args...)
@@ -162,20 +296,50 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 		cmd.WaitDelay = 10 * time.Second
 		cmd.Stdin = strings.NewReader(prompt)
 
-		var stdout, stderr bytes.Buffer
-		cmd.Stdout = &stdout
+		var stdout bytes.Buffer
+		var streamWriter *ndjsonStreamWriter
+		if o.Profile == ProfileAPI && o.Stream {
+			streamWriter = &ndjsonStreamWriter{
+				callback: o.StreamCallback,
+				maxBytes: 4 * 1024 * 1024,
+				maxLine:  4 * 1024 * 1024,
+			}
+			cmd.Stdout = streamWriter
+		} else {
+			cmd.Stdout = &stdout
+		}
+		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 
 		if projectRoot := findProjectRoot(); projectRoot != "" {
 			cmd.Dir = projectRoot
 		}
 
-		if err := agyCmdRunner(cmd); err != nil {
+		if !acquireAgyLaunch(ctx, 30*time.Second) {
+			return "", &AgyError{Type: "launch_timeout", Detail: "timed out waiting for agy launch lock"}
+		}
+		cmdErr := agyCmdRunner(cmd)
+		releaseAgyLaunch()
+
+		if cmdErr != nil {
 			stderrMsg := strings.TrimSpace(stderr.String())
-			log.Printf("agy CLI execution error: %v\nStderr: %s", err, stderrMsg)
+			if o.Profile != ProfileAPI {
+				log.Printf("agy CLI execution error: %v\nStderr: %s", cmdErr, stderrMsg)
+			}
+
+			if o.Profile == ProfileAPI {
+				detail := stderrMsg
+				if detail == "" {
+					detail = cmdErr.Error()
+				}
+				if len(detail) > 200 {
+					detail = detail[len(detail)-200:]
+				}
+				return "", &AgyError{Type: "cli_failure", Err: cmdErr, Detail: detail}
+			}
 
 			if strings.Contains(stderrMsg, "authentication required") {
-				return "", &AgyError{Type: "authentication_required", Err: err, Detail: stderrMsg}
+				return "", &AgyError{Type: "authentication_required", Err: cmdErr, Detail: stderrMsg}
 			}
 
 			// agy occasionally reports an error (or process terminates early)
@@ -197,16 +361,32 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 			if len(detail) > 200 {
 				detail = detail[len(detail)-200:]
 			}
-			return "", &AgyError{Type: "cli_failure", Err: err, Detail: detail}
+			return "", &AgyError{Type: "cli_failure", Err: cmdErr, Detail: detail}
+		}
+
+		if o.Profile == ProfileAPI && o.Stream {
+			if streamWriter.err != nil {
+				return "", &AgyError{Type: "stream_error", Detail: streamWriter.err.Error()}
+			}
+			if !streamWriter.sawSuccess {
+				return "", &AgyError{Type: "stream_incomplete", Detail: "stream ended without success result"}
+			}
+			return "", nil
 		}
 
 		stdoutBytes := stdout.Bytes()
+		if o.Profile == ProfileAPI && int64(len(stdoutBytes)) > 8*1024*1024 {
+			return "", &AgyError{Type: "output_too_large", Detail: "raw JSON stdout exceeded 8 MiB limit"}
+		}
+
 		var result AgyResponse
 		if err := json.Unmarshal(stdoutBytes, &result); err != nil {
-			log.Printf("Failed to parse agy JSON response: %v\nStdout: %s", err, string(stdoutBytes))
-			if attempt < maxAttempts && (isTransientAgyStreamError(stderr.String()) || isTransientAgyStreamError(string(stdoutBytes))) && ctx.Err() == nil {
-				log.Printf("Transient agy error in JSON response; retrying...")
-				continue
+			if o.Profile != ProfileAPI {
+				log.Printf("Failed to parse agy JSON response: %v\nStdout: %s", err, string(stdoutBytes))
+				if attempt < maxAttempts && (isTransientAgyStreamError(stderr.String()) || isTransientAgyStreamError(string(stdoutBytes))) && ctx.Err() == nil {
+					log.Printf("Transient agy error in JSON response; retrying...")
+					continue
+				}
 			}
 			return "", &AgyError{Type: "json_parse_fail", Err: err, Detail: string(stdoutBytes)}
 		}
@@ -216,6 +396,10 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 			if detail == "" {
 				detail = "agy returned status: " + result.Status
 			}
+			if o.Profile == ProfileAPI {
+				return "", &AgyError{Type: "error_status", Detail: detail}
+			}
+
 			log.Printf("agy returned non-success status: %s, error: %s", result.Status, detail)
 
 			// agy occasionally reports ERROR because an intermediate tool failed
@@ -236,6 +420,10 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 			}
 
 			return "", &AgyError{Type: "error_status", Detail: detail}
+		}
+
+		if o.Profile == ProfileAPI && int64(len(result.Response)) > 4*1024*1024 {
+			return "", &AgyError{Type: "output_too_large", Detail: "decoded assistant response exceeded 4 MiB limit"}
 		}
 
 		return result.Response, nil
