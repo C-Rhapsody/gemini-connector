@@ -162,6 +162,79 @@ func generateNonce() string {
 	return hex.EncodeToString(b[:])
 }
 
+// findClosingMathDelimiter scans s starting at start for closeDelim ("\\)", "\\]", or "$$").
+// It ignores delimiters occurring inside inline code (`...`), raw HTML tags (<pre>, <code>),
+// and for inline math ("\\)") it stops on blank lines (paragraph breaks).
+func findClosingMathDelimiter(s string, start int, openDelim string, closeDelim string) int {
+	n := len(s)
+	p := start
+	delimLen := len(closeDelim)
+
+	for p < n {
+		// 1. Paragraph break: inline math \(...\) cannot cross blank lines
+		if openDelim == "\\(" && s[p] == '\n' {
+			k := p + 1
+			for k < n && (s[k] == ' ' || s[k] == '\t' || s[k] == '\r') {
+				k++
+			}
+			if k < n && s[k] == '\n' {
+				return -1
+			}
+		}
+
+		// 2. Inline code: skip backtick runs
+		if s[p] == '`' {
+			runLen := 0
+			for p+runLen < n && s[p+runLen] == '`' {
+				runLen++
+			}
+			target := strings.Repeat("`", runLen)
+			closeIdx := strings.Index(s[p+runLen:], target)
+			if closeIdx != -1 {
+				p = p + runLen + closeIdx + runLen
+				continue
+			}
+			p += runLen
+			continue
+		}
+
+		// 3. Raw HTML tags <pre> or <code>
+		if s[p] == '<' && p+5 <= n {
+			lower5 := strings.ToLower(s[p : p+5])
+			if lower5 == "<pre>" || lower5 == "<pre " {
+				closePos := strings.Index(strings.ToLower(s[p+5:]), "</pre>")
+				if closePos != -1 {
+					p = p + 5 + closePos + 6
+					continue
+				}
+			} else if lower5 == "<code>" || lower5 == "<code" {
+				closePos := strings.Index(strings.ToLower(s[p+5:]), "</code>")
+				if closePos != -1 {
+					p = p + 5 + closePos + 7
+					continue
+				}
+			}
+		}
+
+		// 4. Check for close delimiter
+		if p+delimLen <= n && s[p:p+delimLen] == closeDelim {
+			bs := 0
+			q := p - 1
+			for q >= start && s[q] == '\\' {
+				bs++
+				q--
+			}
+			if bs%2 == 0 {
+				return p
+			}
+		}
+
+		p++
+	}
+
+	return -1
+}
+
 // tokenizeLaTeX scans markdown text, preserves code blocks and bare dollars as literal,
 // and extracts valid \(...\), \[...\], and $$...$$ formulas into MathTokens with nonce placeholders.
 func tokenizeLaTeX(s string) (string, []MathToken) {
@@ -320,10 +393,10 @@ func tokenizeLaTeX(s string) (string, []MathToken) {
 
 		if !isEscaped {
 			if i+2 <= n && s[i:i+2] == "$$" {
-				closePos := strings.Index(s[i+2:], "$$")
+				closePos := findClosingMathDelimiter(s, i+2, "$$", "$$")
 				if closePos != -1 {
-					raw := s[i : i+2+closePos+2]
-					formula := s[i+2 : i+2+closePos]
+					raw := s[i : closePos+2]
+					formula := s[i+2 : closePos]
 					placeholder := fmt.Sprintf("TGMATH%sN%dX", nonce, len(tokens))
 					tokens = append(tokens, MathToken{
 						Kind:        MathBlock,
@@ -338,22 +411,7 @@ func tokenizeLaTeX(s string) (string, []MathToken) {
 					continue
 				}
 			} else if i+2 <= n && s[i:i+2] == "\\(" {
-				searchStart := i + 2
-				closePos := -1
-				for p := searchStart; p+2 <= n; p++ {
-					if s[p:p+2] == "\\)" {
-						bs := 0
-						q := p - 1
-						for q >= searchStart && s[q] == '\\' {
-							bs++
-							q--
-						}
-						if bs%2 == 0 {
-							closePos = p
-							break
-						}
-					}
-				}
+				closePos := findClosingMathDelimiter(s, i+2, "\\(", "\\)")
 				if closePos != -1 {
 					raw := s[i : closePos+2]
 					formula := s[i+2 : closePos]
@@ -371,22 +429,7 @@ func tokenizeLaTeX(s string) (string, []MathToken) {
 					continue
 				}
 			} else if i+2 <= n && s[i:i+2] == "\\[" {
-				searchStart := i + 2
-				closePos := -1
-				for p := searchStart; p+2 <= n; p++ {
-					if s[p:p+2] == "\\]" {
-						bs := 0
-						q := p - 1
-						for q >= searchStart && s[q] == '\\' {
-							bs++
-							q--
-						}
-						if bs%2 == 0 {
-							closePos = p
-							break
-						}
-					}
-				}
+				closePos := findClosingMathDelimiter(s, i+2, "\\[", "\\]")
 				if closePos != -1 {
 					raw := s[i : closePos+2]
 					formula := s[i+2 : closePos]

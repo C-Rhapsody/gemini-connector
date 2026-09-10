@@ -874,6 +874,183 @@ func TestTelegramAdapter_Send_RichIntegration(t *testing.T) {
 	})
 }
 
+func TestRichWire_Regression(t *testing.T) {
+	t.Run("reply_parameters omitted when replyToID is zero", func(t *testing.T) {
+		var capturedParams tgbotapi.Params
+		adapter := &TelegramAdapter{
+			chatID: 12345,
+			makeRequestFn: func(endpoint string, params tgbotapi.Params) (*tgbotapi.APIResponse, error) {
+				capturedParams = params
+				return &tgbotapi.APIResponse{
+					Ok:     true,
+					Result: []byte(`{"message_id": 100, "chat": {"id": 12345}}`),
+				}, nil
+			},
+		}
+
+		html := "Test"
+		_, err := adapter.sendRichMessage(12345, &inputRichMessage{HTML: &html}, 0)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if _, exists := capturedParams["reply_parameters"]; exists {
+			t.Errorf("reply_parameters must not be present when replyToID is 0")
+		}
+		if _, exists := capturedParams["reply_markup"]; exists {
+			t.Errorf("reply_markup must never be present in AI Rich message")
+		}
+	})
+
+	t.Run("non-BMP text in HTML and formula preserved cleanly", func(t *testing.T) {
+		var capturedParams tgbotapi.Params
+		adapter := &TelegramAdapter{
+			chatID: 12345,
+			makeRequestFn: func(endpoint string, params tgbotapi.Params) (*tgbotapi.APIResponse, error) {
+				capturedParams = params
+				return &tgbotapi.APIResponse{
+					Ok:     true,
+					Result: []byte(`{"message_id": 101, "chat": {"id": 12345}}`),
+				}, nil
+			},
+		}
+
+		html := "Rocket 🚀 <tg-math>\\mathbb{F}_q</tg-math>"
+		res, err := adapter.sendRichMessage(12345, &inputRichMessage{HTML: &html}, 50)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if res.MessageID != 101 {
+			t.Errorf("expected message_id 101, got %d", res.MessageID)
+		}
+
+		rawRich := capturedParams["rich_message"]
+		var decoded struct {
+			HTML *string `json:"html"`
+		}
+		if err := json.Unmarshal([]byte(rawRich), &decoded); err != nil {
+			t.Fatalf("failed to decode JSON: %v", err)
+		}
+		if decoded.HTML == nil || *decoded.HTML != html {
+			t.Errorf("expected HTML %q, got %+v", html, decoded.HTML)
+		}
+	})
+
+	t.Run("carrier is strictly HTML only", func(t *testing.T) {
+		html := "Simple"
+		msg := &inputRichMessage{HTML: &html}
+		b, err := json.Marshal(msg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw := string(b)
+		if !strings.Contains(raw, `"html"`) {
+			t.Errorf("expected 'html' in %s", raw)
+		}
+		if strings.Contains(raw, "markdown") || strings.Contains(raw, "blocks") {
+			t.Errorf("markdown and blocks must be omitted, got %s", raw)
+		}
+	})
+
+	t.Run("reply_parameters populated when replyToID is non-zero", func(t *testing.T) {
+		var capturedParams tgbotapi.Params
+		adapter := &TelegramAdapter{
+			chatID: 12345,
+			makeRequestFn: func(endpoint string, params tgbotapi.Params) (*tgbotapi.APIResponse, error) {
+				capturedParams = params
+				return &tgbotapi.APIResponse{
+					Ok:     true,
+					Result: []byte(`{"message_id": 105, "chat": {"id": 12345}}`),
+				}, nil
+			},
+		}
+
+		html := "Test"
+		_, err := adapter.sendRichMessage(12345, &inputRichMessage{HTML: &html}, 42)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		rawReply, exists := capturedParams["reply_parameters"]
+		if !exists {
+			t.Fatalf("reply_parameters must exist when replyToID is non-zero")
+		}
+		var rp replyParameters
+		if err := json.Unmarshal([]byte(rawReply), &rp); err != nil {
+			t.Fatalf("failed to parse reply_parameters: %v", err)
+		}
+		if rp.MessageID != 42 {
+			t.Errorf("expected message_id 42, got %d", rp.MessageID)
+		}
+	})
+}
+
+func TestRichCorpus_Regression(t *testing.T) {
+	t.Run("formulas with underscore and ampersand in numeric profile", func(t *testing.T) {
+		in := "Check matrix: \\[A \\& B_i < C_j > D_k & E\\]"
+		got, err := renderRichHTML(in, "numeric")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := "<tg-math-block>A \\&#38; B_i &#60; C_j &#62; D_k &#38; E</tg-math-block>"
+		if !strings.Contains(got, want) {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+
+	t.Run("currency with bare dollars beside formulas", func(t *testing.T) {
+		in := "Price is $50. Formula: \\(x = 50\\) and $10 discount."
+		got, err := renderRichHTML(in, "raw")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(got, "$50") || !strings.Contains(got, "$10") {
+			t.Errorf("bare currency lost in output: %q", got)
+		}
+		if !strings.Contains(got, "<tg-math>x = 50</tg-math>") {
+			t.Errorf("formula missing in output: %q", got)
+		}
+	})
+
+	t.Run("formulas in nested list and blockquote contexts", func(t *testing.T) {
+		in := "> > Nested quote with \\(x = 1\\)\n- item 1\n  - subitem with \\[y = 2\\]"
+		got, err := renderRichHTML(in, "raw")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(got, "<tg-math>x = 1</tg-math>") {
+			t.Errorf("inline formula missing in quote: %q", got)
+		}
+		if !strings.Contains(got, "<tg-math-block>y = 2</tg-math-block>") {
+			t.Errorf("block formula missing in subitem: %q", got)
+		}
+	})
+
+	t.Run("code blocks containing math delimiters remain literal", func(t *testing.T) {
+		in := "```\n\\(not math\\)\n\\[not block\\]\n$$not math$$\n```\n`\\(inline code\\)`"
+		got, err := renderRichHTML(in, "raw")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if strings.Contains(got, "<tg-math") {
+			t.Errorf("code blocks must never contain tg-math tags: %q", got)
+		}
+	})
+
+	t.Run("unbalanced delimiters with complex markdown", func(t *testing.T) {
+		in := "**bold** \\(unbalanced text `code \\(not math\\)`"
+		got, err := renderRichHTML(in, "raw")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if strings.Contains(got, "<tg-math>") {
+			t.Errorf("unbalanced text must not generate <tg-math>: %q", got)
+		}
+		if !strings.Contains(got, "<b>bold</b>") {
+			t.Errorf("markdown formatting lost: %q", got)
+		}
+	})
+}
+
+
 
 
 
