@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -209,10 +210,31 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 		return
 	}
 
-	// Render messages into role-preserving structured prompt
-	prompt, err := RenderPromptWithTools(req.Messages, req.Tools, req.ToolChoice)
-	if err != nil {
-		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Failed to render prompt: %v", err), "invalid_prompt", nil, false)
+	convID := s.getConversationID()
+	if convID == "" {
+		writeAPIError(w, http.StatusInternalServerError, "server_error", "Missing AGY_CONVERSATION_ID configuration", "missing_conversation_id", nil, false)
+		s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusInternalServerError, "missing_conversation_id", startTime, req.Stream, &req.Model, 0, clientClass)
+		return
+	}
+
+	systemMsgs, priorTranscriptMsgs, currentTurnMsgs := ExtractCurrentTurn(req.Messages)
+	historyHash := ComputeHistoryHash(priorTranscriptMsgs)
+
+	var prompt string
+	var renderErr error
+	var isResumeTurn bool
+
+	if len(priorTranscriptMsgs) > 0 && s.syncTracker != nil && s.syncTracker.IsSessionSynced(convID) {
+		isResumeTurn = true
+		prompt, renderErr = RenderTurnPromptWithTools(systemMsgs, currentTurnMsgs, req.Tools, req.ToolChoice)
+	} else if len(priorTranscriptMsgs) > 0 {
+		prompt, _, _, renderErr = CompactPromptWithTools(req.Messages, req.Tools, req.ToolChoice, DefaultCompactionBudget)
+	} else {
+		prompt, renderErr = RenderPromptWithTools(req.Messages, req.Tools, req.ToolChoice)
+	}
+
+	if renderErr != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Failed to render prompt: %v", renderErr), "invalid_prompt", nil, false)
 		s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "invalid_prompt", startTime, req.Stream, &req.Model, 0, clientClass)
 		return
 	}
@@ -427,7 +449,7 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 			}
 
 			var actualUsage *AgyUsage
-			_, streamErr := s.executor.Execute(execCtx, prompt, "", AgyCallOptions{
+			_, streamErr := s.executor.Execute(execCtx, prompt, convID, AgyCallOptions{
 				Profile:                   ProfileAPI,
 				Model:                     req.Model,
 				Stream:                    true,
@@ -439,6 +461,33 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 					actualUsage = u
 				},
 			})
+			if streamErr != nil && isResumeTurn && !streamHeadersSent.Load() {
+				var ae *AgyError
+				if errors.As(streamErr, &ae) && ae.Type == "session_resume_failed" {
+					log.Printf("[Compaction Fallback] session resume failed for %s, falling back to structured compaction", reqID)
+					if s.syncTracker != nil {
+						s.syncTracker.ResetSession(convID)
+					}
+					fallbackPrompt, _, _, fbErr := CompactPromptWithTools(req.Messages, req.Tools, req.ToolChoice, DefaultCompactionBudget)
+					if fbErr == nil {
+						_, streamErr = s.executor.Execute(execCtx, fallbackPrompt, convID, AgyCallOptions{
+							Profile:                   ProfileAPI,
+							Model:                     req.Model,
+							Stream:                    true,
+							StreamCallback:            streamCb,
+							Logger:                    s.logger,
+							JSONSchema:                schemaToPass,
+							StructuredOutputRequested: schemaToPass != "" || req.ResponseFormat != nil || hasTools,
+							UsageCallback: func(u *AgyUsage) {
+								actualUsage = u
+							},
+						})
+					}
+				}
+			}
+			if streamErr == nil && s.syncTracker != nil {
+				s.syncTracker.MarkSessionSynced(convID, historyHash, len(req.Messages))
+			}
 			if streamErr != nil {
 				// If the stream ended because the client disconnected or context timed out/canceled,
 				// do NOT attempt to write error frames or flush to the response writer!
@@ -633,7 +682,7 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 			_ = writeRaw("data: [DONE]\n\n")
 		} else {
 			var actualUsage *AgyUsage
-			resp, nonStreamErr := s.executor.Execute(execCtx, prompt, "", AgyCallOptions{
+			resp, nonStreamErr := s.executor.Execute(execCtx, prompt, convID, AgyCallOptions{
 				Profile:                   ProfileAPI,
 				Model:                     req.Model,
 				Stream:                    false,
@@ -644,6 +693,32 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 					actualUsage = u
 				},
 			})
+			if nonStreamErr != nil && isResumeTurn {
+				var ae *AgyError
+				if errors.As(nonStreamErr, &ae) && ae.Type == "session_resume_failed" {
+					log.Printf("[Compaction Fallback] session resume failed for %s, falling back to structured compaction", reqID)
+					if s.syncTracker != nil {
+						s.syncTracker.ResetSession(convID)
+					}
+					fallbackPrompt, _, _, fbErr := CompactPromptWithTools(req.Messages, req.Tools, req.ToolChoice, DefaultCompactionBudget)
+					if fbErr == nil {
+						resp, nonStreamErr = s.executor.Execute(execCtx, fallbackPrompt, convID, AgyCallOptions{
+							Profile:                   ProfileAPI,
+							Model:                     req.Model,
+							Stream:                    false,
+							Logger:                    s.logger,
+							JSONSchema:                schemaToPass,
+							StructuredOutputRequested: schemaToPass != "" || req.ResponseFormat != nil || hasTools,
+							UsageCallback: func(u *AgyUsage) {
+								actualUsage = u
+							},
+						})
+					}
+				}
+			}
+			if nonStreamErr == nil && s.syncTracker != nil {
+				s.syncTracker.MarkSessionSynced(convID, historyHash, len(req.Messages))
+			}
 			if len(stopSeqs) > 0 && nonStreamErr == nil && !hasTools {
 				resp, _ = applyStopSequences(resp, stopSeqs)
 			}

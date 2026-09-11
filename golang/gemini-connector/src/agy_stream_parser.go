@@ -50,6 +50,7 @@ type ndjsonStreamWriter struct {
 	maxLine            int64
 	sawSuccess         bool
 	sawNativeToolStep  bool
+	conversationID     string
 	usage              *AgyUsage
 	err                error
 	mu                 sync.Mutex
@@ -81,13 +82,15 @@ func (w *ndjsonStreamWriter) Write(p []byte) (n int, err error) {
 		}
 
 		var ev struct {
-			Event      string `json:"event"`
-			StepUpdate *struct {
+			Event          string `json:"event"`
+			ConversationID string `json:"conversation_id"`
+			StepUpdate     *struct {
 				StepType  string    `json:"step_type"`
 				TextDelta string    `json:"text_delta"`
 				Usage     *AgyUsage `json:"usage,omitempty"`
 			} `json:"step_update"`
 			Result *struct {
+				ConversationID   string          `json:"conversation_id"`
 				Status           string          `json:"status"`
 				Response         string          `json:"response"`
 				StructuredOutput json.RawMessage `json:"structured_output,omitempty"`
@@ -96,6 +99,9 @@ func (w *ndjsonStreamWriter) Write(p []byte) (n int, err error) {
 			} `json:"result"`
 		}
 		if jsonErr := json.Unmarshal(bytes.TrimSpace(line), &ev); jsonErr == nil {
+			if ev.ConversationID != "" {
+				w.conversationID = ev.ConversationID
+			}
 			if ev.Event == "step_update" && ev.StepUpdate != nil {
 				if ev.StepUpdate.Usage != nil {
 					w.usage = ev.StepUpdate.Usage
@@ -123,6 +129,9 @@ func (w *ndjsonStreamWriter) Write(p []byte) (n int, err error) {
 					w.emittedDeltasCount++
 				}
 			} else if ev.Event == "result" && ev.Result != nil {
+				if ev.Result.ConversationID != "" {
+					w.conversationID = ev.Result.ConversationID
+				}
 				if ev.Result.Usage != nil {
 					w.usage = ev.Result.Usage
 				}

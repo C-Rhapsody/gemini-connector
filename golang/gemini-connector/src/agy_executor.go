@@ -97,6 +97,10 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 	}
 
 	maxAttempts := 2
+	if o.Profile == ProfileAPI && conversationID == "" {
+		return "", &AgyError{Type: "missing_conversation_id", Detail: "ProfileAPI requires a non-empty conversation ID"}
+	}
+
 	if o.DisableRetry || o.Profile == ProfileAPI {
 		maxAttempts = 1
 	}
@@ -120,8 +124,8 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 		turnStart := time.Now()
 
 		// Interactive and API turns share the same execution policy. The only
-		// protocol-specific argument is stream-json for API streaming; API turns
-		// remain stateless and therefore do not inherit a conversation ID.
+		// protocol-specific argument is stream-json for API streaming.
+		// Both share the configured AGY conversation session.
 		outputFormat := "json"
 		if o.Profile == ProfileAPI && o.Stream {
 			outputFormat = "stream-json"
@@ -140,7 +144,7 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 		if o.Profile == ProfilePlanner {
 			args = append(args, "--mode", "plan", "--sandbox", "--disable-slash-commands")
 		}
-		if o.Profile != ProfileAPI && conversationID != "" {
+		if conversationID != "" {
 			args = append(args, "--conversation", conversationID)
 		}
 
@@ -234,6 +238,15 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 			if !streamWriter.sawSuccess {
 				return "", &AgyError{Type: "stream_incomplete", Detail: "stream ended without success result"}
 			}
+			if conversationID != "" {
+				stderrStr := stderr.String()
+				if strings.Contains(stderrStr, "not found") && strings.Contains(stderrStr, "conversation") {
+					return "", &AgyError{
+						Type:   "session_resume_failed",
+						Detail: "AGY conversation resume failed: session not found",
+					}
+				}
+			}
 			if o.UsageCallback != nil && streamWriter.usage != nil {
 				o.UsageCallback(streamWriter.usage)
 			}
@@ -255,6 +268,16 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 				}
 			}
 			return "", &AgyError{Type: "json_parse_fail", Err: err, Detail: string(stdoutBytes)}
+		}
+
+		if conversationID != "" {
+			stderrStr := stderr.String()
+			if strings.Contains(stderrStr, "not found") && strings.Contains(stderrStr, "conversation") {
+				return "", &AgyError{
+					Type:   "session_resume_failed",
+					Detail: "AGY conversation resume failed: session not found",
+				}
+			}
 		}
 
 		if result.Status != "SUCCESS" {

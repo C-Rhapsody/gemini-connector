@@ -165,7 +165,7 @@ func main() {
 	var httpServer *http.Server
 	if *openaiApiPtr {
 		apiLogger := NewAPILogger(logDir)
-		apiServer = NewOpenAICompatibleServer(effectiveAPIKey, app.turns, apiLogger)
+		apiServer = NewOpenAICompatibleServer(effectiveAPIKey, app.turns, apiLogger, app.cfg.ConversationID)
 		httpServer = &http.Server{
 			Handler:           apiServer,
 			ReadHeaderTimeout: 10 * time.Second,

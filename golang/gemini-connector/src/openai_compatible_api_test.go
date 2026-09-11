@@ -25,7 +25,8 @@ func setupTestServer(t *testing.T) (*OpenAICompatibleServer, *TurnCoordinator, *
 	dir := t.TempDir()
 	logger := NewAPILogger(dir)
 	turns := NewTurnCoordinator()
-	server := NewOpenAICompatibleServer(testAPIKey, turns, logger)
+	server := NewOpenAICompatibleServer(testAPIKey, turns, logger, func() string { return "test-session-conv-id" })
+	server.syncTracker = NewSessionSyncTracker(filepath.Join(dir, "session_sync.json"))
 
 	// Inject stub models
 	server.catalog.fetcher = func(ctx context.Context) ([]string, error) {
@@ -1466,11 +1467,16 @@ func TestChatCompletions_MultiTurnRolePreservation_Regression(t *testing.T) {
 	args := capturedArgs
 	mu.Unlock()
 
-	// 1. Verify --conversation is NOT in args (statelessness)
-	for _, arg := range args {
-		if arg == "--conversation" {
-			t.Fatalf("expected stateless execution without --conversation, but found in args: %v", args)
+	// 1. Verify --conversation is present with configured session ID
+	hasConv := false
+	for i, arg := range args {
+		if arg == "--conversation" && i+1 < len(args) && args[i+1] == "test-session-conv-id" {
+			hasConv = true
+			break
 		}
+	}
+	if !hasConv {
+		t.Fatalf("expected --conversation test-session-conv-id in args, got: %v", args)
 	}
 
 	// 2. RED Check: AGY stdin MUST NOT be a raw JSON array of req.Messages
@@ -1584,6 +1590,9 @@ func TestChatCompletions_Stream_UsesSameRenderer(t *testing.T) {
 	nonStreamStdin := lastCapturedStdin
 	mu.Unlock()
 
+	// Reset sync tracker so stream request tests the same bootstrap rendering conditions
+	server.syncTracker.ResetSession("test-session-conv-id")
+
 	// 2. Stream request
 	bodyStream, _ := json.Marshal(map[string]any{
 		"model":    "gemini-3.8-flash-high",
@@ -1660,10 +1669,15 @@ func TestChatCompletions_Stateless_NoStateLeak(t *testing.T) {
 	if !strings.Contains(stdin1, "UNIQUE_TOPIC_ALPHA_12345") {
 		t.Fatal("expected request 1 to contain ALPHA")
 	}
-	for _, a := range args1 {
-		if a == "--conversation" {
-			t.Fatal("request 1 should not have --conversation")
+	hasConv1 := false
+	for i, a := range args1 {
+		if a == "--conversation" && i+1 < len(args1) && args1[i+1] == "test-session-conv-id" {
+			hasConv1 = true
+			break
 		}
+	}
+	if !hasConv1 {
+		t.Fatal("request 1 should have --conversation test-session-conv-id")
 	}
 
 	// Request 2: Unique Topic B
@@ -1674,10 +1688,15 @@ func TestChatCompletions_Stateless_NoStateLeak(t *testing.T) {
 	if strings.Contains(stdin2, "UNIQUE_TOPIC_ALPHA_12345") {
 		t.Fatalf("STATE LEAK: request 2 stdin contained data from request 1:\n%s", stdin2)
 	}
-	for _, a := range args2 {
-		if a == "--conversation" {
-			t.Fatal("request 2 should not have --conversation")
+	hasConv2 := false
+	for i, a := range args2 {
+		if a == "--conversation" && i+1 < len(args2) && args2[i+1] == "test-session-conv-id" {
+			hasConv2 = true
+			break
 		}
+	}
+	if !hasConv2 {
+		t.Fatal("request 2 should have --conversation test-session-conv-id")
 	}
 }
 

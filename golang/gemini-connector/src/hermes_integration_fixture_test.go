@@ -271,4 +271,14 @@ func TestProfileAPI_ArgvInvariants(t *testing.T) {
 	if hasPrintTimeout90s {
 		t.Errorf("ProfileAPI invocation must not contain --print-timeout 90s: %v", observedArgs)
 	}
+	hasConversation := false
+	for i, arg := range observedArgs {
+		if arg == "--conversation" && i+1 < len(observedArgs) && observedArgs[i+1] == "test-session-conv-id" {
+			hasConversation = true
+			break
+		}
+	}
+	if !hasConversation {
+		t.Errorf("ProfileAPI invocation must contain --conversation test-session-conv-id: %v", observedArgs)
+	}
 }

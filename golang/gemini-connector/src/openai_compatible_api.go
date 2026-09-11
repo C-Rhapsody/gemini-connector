@@ -493,21 +493,38 @@ type OpenAICompatibleServer struct {
 	rootCtx           context.Context
 	cancelRoot        context.CancelFunc
 	heartbeatInterval time.Duration
+	convIDProvider    func() string
+	syncTracker       *SessionSyncTracker
 }
 
-func NewOpenAICompatibleServer(apiKey string, turns *TurnCoordinator, logger *APILogger) *OpenAICompatibleServer {
+func NewOpenAICompatibleServer(apiKey string, turns *TurnCoordinator, logger *APILogger, convIDProvider ...func() string) *OpenAICompatibleServer {
 	ctx, cancel := context.WithCancel(context.Background())
 	executor := newAgyExecutor()
 	s := &OpenAICompatibleServer{
-		apiKeyHash: sha256.Sum256([]byte(apiKey)),
-		catalog:    NewModelCatalog(),
-		turns:      turns,
-		logger:     logger,
-		executor:   executor,
-		rootCtx:    ctx,
-		cancelRoot: cancel,
+		apiKeyHash:  sha256.Sum256([]byte(apiKey)),
+		catalog:     NewModelCatalog(),
+		turns:       turns,
+		logger:      logger,
+		executor:    executor,
+		rootCtx:     ctx,
+		cancelRoot:  cancel,
+		syncTracker: NewSessionSyncTracker(""),
+	}
+	if len(convIDProvider) > 0 && convIDProvider[0] != nil {
+		s.convIDProvider = convIDProvider[0]
 	}
 	return s
+}
+
+func (s *OpenAICompatibleServer) getConversationID() string {
+	if s.convIDProvider != nil {
+		return s.convIDProvider()
+	}
+	return ""
+}
+
+func (s *OpenAICompatibleServer) SetConversationIDProvider(provider func() string) {
+	s.convIDProvider = provider
 }
 
 func (s *OpenAICompatibleServer) Drain() {

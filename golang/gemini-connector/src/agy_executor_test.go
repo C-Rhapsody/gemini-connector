@@ -24,7 +24,7 @@ func TestProfileAPI_UsesInteractiveCLICommandAndWorkingDirectory(t *testing.T) {
 	}
 
 	for _, profile := range []AgyProfile{ProfileInteractive, ProfileAPI} {
-		if _, err := executeAgy(context.Background(), "test prompt", "", AgyCallOptions{Profile: profile}); err != nil {
+		if _, err := executeAgy(context.Background(), "test prompt", "shared-test-conv-id", AgyCallOptions{Profile: profile}); err != nil {
 			t.Fatalf("profile %v execution failed: %v", profile, err)
 		}
 	}
@@ -43,6 +43,7 @@ func TestProfileAPI_UsesInteractiveCLICommandAndWorkingDirectory(t *testing.T) {
 		"--output-format", "json",
 		"--dangerously-skip-permissions",
 		"--print-timeout", "5m",
+		"--conversation", "shared-test-conv-id",
 	}
 	if !reflect.DeepEqual(apiArgs, wantArgs) {
 		t.Fatalf("unexpected shared AGY arguments: got %v want %v", apiArgs, wantArgs)
@@ -94,7 +95,7 @@ func TestAgyProfiles_ArgvAndDirPolicies(t *testing.T) {
 		t.Fatalf("ProfileInteractive args mismatch: got %v want %v", interactiveArgs, wantInteractiveArgs)
 	}
 
-	// 2. ProfileAPI non-streaming (stateless: conversation ID ignored, model and schema supported)
+	// 2. ProfileAPI non-streaming (shares conversation ID, model and schema supported)
 	observed = nil
 	if _, err := executeAgy(context.Background(), "test prompt", "conv-123", AgyCallOptions{
 		Profile:    ProfileAPI,
@@ -108,8 +109,8 @@ func TestAgyProfiles_ArgvAndDirPolicies(t *testing.T) {
 	}
 	apiCmd := observed[0]
 	apiArgs := apiCmd.Args[1:]
-	// Should have output-format json, dangerously-skip-permissions, print-timeout 5m, model, json-schema
-	if len(apiArgs) != 9 {
+	// Should have output-format json, dangerously-skip-permissions, print-timeout 5m, model, json-schema, conversation
+	if len(apiArgs) != 11 {
 		t.Fatalf("ProfileAPI args length unexpected: got %d, args=%v", len(apiArgs), apiArgs)
 	}
 	baseAPIArgs := apiArgs[:5]
@@ -127,13 +128,16 @@ func TestAgyProfiles_ArgvAndDirPolicies(t *testing.T) {
 	if apiArgs[7] != "--json-schema" || apiArgs[8] == "" {
 		t.Fatalf("ProfileAPI json-schema arg mismatch: %v", apiArgs[7:])
 	}
+	if apiArgs[9] != "--conversation" || apiArgs[10] != "conv-123" {
+		t.Fatalf("ProfileAPI conversation arg mismatch: %v", apiArgs[9:])
+	}
 	if apiCmd.Dir != interactiveCmd.Dir {
 		t.Fatalf("ProfileAPI cmd.Dir (%q) != ProfileInteractive cmd.Dir (%q)", apiCmd.Dir, interactiveCmd.Dir)
 	}
 
-	// 3. ProfileAPI streaming
+	// 3. ProfileAPI streaming (shares conversation ID)
 	observed = nil
-	if _, err := executeAgy(context.Background(), "test prompt", "", AgyCallOptions{
+	if _, err := executeAgy(context.Background(), "test prompt", "conv-stream-123", AgyCallOptions{
 		Profile: ProfileAPI,
 		Stream:  true,
 	}); err != nil {
@@ -148,6 +152,7 @@ func TestAgyProfiles_ArgvAndDirPolicies(t *testing.T) {
 		"--output-format", "stream-json",
 		"--dangerously-skip-permissions",
 		"--print-timeout", "5m",
+		"--conversation", "conv-stream-123",
 	}
 	if !reflect.DeepEqual(apiStreamArgs, wantAPIStreamArgs) {
 		t.Fatalf("ProfileAPI stream args mismatch: got %v want %v", apiStreamArgs, wantAPIStreamArgs)
