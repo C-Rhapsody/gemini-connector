@@ -414,12 +414,13 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 
 			var actualUsage *AgyUsage
 			_, streamErr := s.executor.Execute(execCtx, prompt, "", AgyCallOptions{
-				Profile:        ProfileAPI,
-				Model:          req.Model,
-				Stream:         true,
-				StreamCallback: streamCb,
-				Logger:         s.logger,
-				JSONSchema:     schemaToPass,
+				Profile:                   ProfileAPI,
+				Model:                     req.Model,
+				Stream:                    true,
+				StreamCallback:            streamCb,
+				Logger:                    s.logger,
+				JSONSchema:                schemaToPass,
+				StructuredOutputRequested: schemaToPass != "" || req.ResponseFormat != nil,
 				UsageCallback: func(u *AgyUsage) {
 					actualUsage = u
 				},
@@ -447,12 +448,20 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 
 			// Terminal finish chunk
 			stopStr := "stop"
+			var ext *GeminiConnectorExtension
+			if cumText.Len() == 0 {
+				ext = &GeminiConnectorExtension{
+					State:     "success_no_text",
+					Retryable: false,
+				}
+			}
 			finishChunk := ChatCompletionChunk{
-				ID:      "chatcmpl-" + reqID,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   req.Model,
-				Choices: []ChunkChoice{{Index: 0, Delta: ChunkDelta{}, FinishReason: &stopStr}},
+				ID:               "chatcmpl-" + reqID,
+				Object:           "chat.completion.chunk",
+				Created:          created,
+				Model:            req.Model,
+				Choices:          []ChunkChoice{{Index: 0, Delta: ChunkDelta{}, FinishReason: &stopStr}},
+				XGeminiConnector: ext,
 			}
 			fBytes, _ := json.Marshal(finishChunk)
 			if err := writeEvent(fBytes); err != nil {
@@ -481,11 +490,12 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 		} else {
 			var actualUsage *AgyUsage
 			resp, nonStreamErr := s.executor.Execute(execCtx, prompt, "", AgyCallOptions{
-				Profile:    ProfileAPI,
-				Model:      req.Model,
-				Stream:     false,
-				Logger:     s.logger,
-				JSONSchema: schemaToPass,
+				Profile:                   ProfileAPI,
+				Model:                     req.Model,
+				Stream:                    false,
+				Logger:                    s.logger,
+				JSONSchema:                schemaToPass,
+				StructuredOutputRequested: schemaToPass != "" || req.ResponseFormat != nil,
 				UsageCallback: func(u *AgyUsage) {
 					actualUsage = u
 				},
@@ -596,6 +606,15 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 	}
 
 	if !req.Stream {
+		var contentVal any = turnResp
+		var ext *GeminiConnectorExtension
+		if turnResp == "" {
+			contentVal = nil
+			ext = &GeminiConnectorExtension{
+				State:     "success_no_text",
+				Retryable: false,
+			}
+		}
 		respObj := ChatCompletionResponse{
 			ID:      "chatcmpl-" + reqID,
 			Object:  "chat.completion",
@@ -606,12 +625,13 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 					Index: 0,
 					Message: ChatMessage{
 						Role:    "assistant",
-						Content: turnResp,
+						Content: contentVal,
 					},
 					FinishReason: "stop",
 				},
 			},
-			Usage: mapAgyUsageToOpenAI(turnUsage),
+			Usage:            mapAgyUsageToOpenAI(turnUsage),
+			XGeminiConnector: ext,
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)

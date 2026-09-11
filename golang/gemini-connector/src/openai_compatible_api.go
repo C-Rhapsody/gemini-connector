@@ -408,13 +408,56 @@ type ChatCompletionChoice struct {
 	FinishReason string      `json:"finish_reason"`
 }
 
+type GeminiConnectorExtension struct {
+	State     string `json:"state"`
+	Retryable bool   `json:"retryable"`
+}
+
+type ToolActivityState string
+
+const (
+	ToolActivityUnknown  ToolActivityState = "unknown"
+	ToolActivityObserved ToolActivityState = "observed"
+)
+
+func classifyToolActivity(metadata any) ToolActivityState {
+	if metadata == nil {
+		return ToolActivityUnknown
+	}
+	switch m := metadata.(type) {
+	case map[string]any:
+		if len(m) == 0 {
+			return ToolActivityUnknown
+		}
+		if tools, ok := m["tools"]; ok && tools != nil {
+			if slice, ok := tools.([]any); ok && len(slice) > 0 {
+				return ToolActivityObserved
+			}
+		}
+		if toolCalls, ok := m["tool_calls"]; ok && toolCalls != nil {
+			if slice, ok := toolCalls.([]any); ok && len(slice) > 0 {
+				return ToolActivityObserved
+			}
+		}
+		if executed, ok := m["tools_executed"]; ok && executed != nil {
+			if b, ok := executed.(bool); ok && b {
+				return ToolActivityObserved
+			}
+		}
+		return ToolActivityUnknown
+	default:
+		return ToolActivityUnknown
+	}
+}
+
 type ChatCompletionResponse struct {
-	ID      string                 `json:"id"`
-	Object  string                 `json:"object"`
-	Created int64                  `json:"created"`
-	Model   string                 `json:"model"`
-	Choices []ChatCompletionChoice `json:"choices"`
-	Usage   *UsageInfo             `json:"usage,omitempty"`
+	ID               string                    `json:"id"`
+	Object           string                    `json:"object"`
+	Created          int64                     `json:"created"`
+	Model            string                    `json:"model"`
+	Choices          []ChatCompletionChoice    `json:"choices"`
+	Usage            *UsageInfo                `json:"usage,omitempty"`
+	XGeminiConnector *GeminiConnectorExtension `json:"x_gemini_connector,omitempty"`
 }
 
 type ChunkDelta struct {
@@ -430,12 +473,13 @@ type ChunkChoice struct {
 }
 
 type ChatCompletionChunk struct {
-	ID      string        `json:"id"`
-	Object  string        `json:"object"`
-	Created int64         `json:"created"`
-	Model   string        `json:"model"`
-	Choices []ChunkChoice `json:"choices"`
-	Usage   *UsageInfo    `json:"usage,omitempty"`
+	ID               string                    `json:"id"`
+	Object           string                    `json:"object"`
+	Created          int64                     `json:"created"`
+	Model            string                    `json:"model"`
+	Choices          []ChunkChoice             `json:"choices"`
+	Usage            *UsageInfo                `json:"usage,omitempty"`
+	XGeminiConnector *GeminiConnectorExtension `json:"x_gemini_connector,omitempty"`
 }
 
 type OpenAICompatibleServer struct {

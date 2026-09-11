@@ -66,6 +66,8 @@ type AgyCallOptions struct {
 	JSONSchema string
 	// UsageCallback is called with the actual token usage from agy if available.
 	UsageCallback func(*AgyUsage)
+	// StructuredOutputRequested is set when structured output / JSON schema was requested.
+	StructuredOutputRequested bool
 }
 
 func executeAgy(ctx context.Context, prompt string, conversationID string, opts ...AgyCallOptions) (string, error) {
