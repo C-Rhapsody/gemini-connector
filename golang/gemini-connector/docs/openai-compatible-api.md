@@ -176,6 +176,12 @@ data: [DONE]
 
 ## 4. 큐 및 자원 보호 (Resource Protection)
 
+- **요청 크기 및 메시지 개수 제한 (Resource & DoS Protection)**:
+  - `messages 최대 개수`: **1024** (초과 시 `400 invalid_request_error`, `messages_too_many`)
+  - `개별 message content 최대 크기`: **256 KiB** (초과 시 `400 invalid_request_error`, `message_too_large`)
+  - `전체 messages content 최대 크기`: **768 KiB** (초과 시 `400 invalid_request_error`, `messages_aggregate_too_large`)
+  - `전체 request body 최대 크기`: **1 MiB** (초과 시 `400 invalid_request_error`, `request_too_large`)
+  - *(주의: messages 최대 1024개는 Gemini upstream의 공식 제한이 아니라, `gemini-connector` 프로세스의 메모리 안정성 및 과도한 페이로드 방지를 위한 bounded defensive operating limit입니다.)*
 - **API 큐 최대 수용 한도 (`N=4`)**:
   - 텔레그램 봇 작업과의 충돌 및 과부하를 방지하기 위해 최대 4개의 대기/실행 API 작업만 허용합니다.
   - 대기열 초과 시 `429 Too Many Requests`를 반환합니다.

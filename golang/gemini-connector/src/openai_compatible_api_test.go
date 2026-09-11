@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -1221,4 +1222,161 @@ func TestChatCompletions_Stream_Disconnect_QueueProcessesNext(t *testing.T) {
 	}
 }
 
+// TestChatCompletions_MessagesCountLimit tests the defensive operating limit on messages count:
+// 1023 -> not messages_too_many (succeeds)
+// 1024 -> not messages_too_many (succeeds)
+// 1025 -> HTTP 400 messages_too_many
+func TestChatCompletions_MessagesCountLimit(t *testing.T) {
+	server, _, _ := setupTestServer(t)
 
+	oldRunner := agyCmdRunner
+	defer func() { agyCmdRunner = oldRunner }()
+	agyCmdRunner = func(cmd *exec.Cmd) error {
+		resp := AgyResponse{
+			Status:   "SUCCESS",
+			Response: "ok",
+		}
+		b, _ := json.Marshal(resp)
+		cmd.Stdout.Write(b)
+		return nil
+	}
+
+	postMessages := func(count int) *httptest.ResponseRecorder {
+		msgs := make([]ChatMessage, count)
+		for i := 0; i < count; i++ {
+			role := "user"
+			if i%2 == 1 {
+				role = "assistant"
+			}
+			msgs[i] = ChatMessage{
+				Role:    role,
+				Content: "m",
+			}
+		}
+		reqBody := ChatCompletionRequest{
+			Model:    "gemini-3.8-flash-high",
+			Messages: msgs,
+		}
+		b, err := json.Marshal(reqBody)
+		if err != nil {
+			t.Fatalf("marshal error: %v", err)
+		}
+
+		req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(b))
+		req.Host = "127.0.0.1:49152"
+		req.Header.Set("Authorization", "Bearer "+testAPIKey)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 1. 1023 messages -> NOT rejected with messages_too_many (must succeed with 200)
+	rec1023 := postMessages(1023)
+	if rec1023.Code != http.StatusOK {
+		t.Fatalf("expected 1023 messages to succeed with 200, got %d: %s", rec1023.Code, rec1023.Body.String())
+	}
+
+	// 2. 1024 messages -> NOT rejected with messages_too_many (must succeed with 200)
+	rec1024 := postMessages(1024)
+	if rec1024.Code != http.StatusOK {
+		t.Fatalf("expected 1024 messages to succeed with 200, got %d: %s", rec1024.Code, rec1024.Body.String())
+	}
+
+	// 3. 1025 messages -> rejected with HTTP 400 and messages_too_many
+	rec1025 := postMessages(1025)
+	if rec1025.Code != http.StatusBadRequest {
+		t.Fatalf("expected 1025 messages to return 400, got %d: %s", rec1025.Code, rec1025.Body.String())
+	}
+
+	var errResp APIErrorResponse
+	if err := json.Unmarshal(rec1025.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("failed to unmarshal error response: %v", err)
+	}
+
+	if errResp.Error.Type != "invalid_request_error" {
+		t.Errorf("expected error.type invalid_request_error, got %q", errResp.Error.Type)
+	}
+	if errResp.Error.Code != "messages_too_many" {
+		t.Errorf("expected error.code messages_too_many, got %q", errResp.Error.Code)
+	}
+	if errResp.Error.Param == nil || *errResp.Error.Param != "messages" {
+		t.Errorf("expected error.param 'messages', got %v", errResp.Error.Param)
+	}
+	expectedMsg := "messages count exceeds maximum 1024"
+	if errResp.Error.Message != expectedMsg {
+		t.Errorf("expected error.message %q, got %q", expectedMsg, errResp.Error.Message)
+	}
+}
+
+// TestChatCompletions_ByteLimits verifies that body, message, and aggregate byte limits are preserved:
+// - body 1 MiB limit
+// - individual message 256 KiB limit
+// - aggregate message content 768 KiB limit
+func TestChatCompletions_ByteLimits(t *testing.T) {
+	server, _, _ := setupTestServer(t)
+
+	postRaw := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+		req.Host = "127.0.0.1:49152"
+		req.Header.Set("Authorization", "Bearer "+testAPIKey)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 1. Single message exceeds defaultMaxMessageBytes (256 KiB)
+	hugeMessage := strings.Repeat("x", 256*1024+1)
+	reqObj1 := map[string]any{
+		"model": "gemini-3.8-flash-high",
+		"messages": []map[string]any{
+			{"role": "user", "content": hugeMessage},
+		},
+	}
+	b1, _ := json.Marshal(reqObj1)
+	rec1 := postRaw(string(b1))
+	if rec1.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for message > 256 KiB, got %d", rec1.Code)
+	}
+	var errResp1 APIErrorResponse
+	_ = json.Unmarshal(rec1.Body.Bytes(), &errResp1)
+	if errResp1.Error.Code != "message_too_large" {
+		t.Errorf("expected code message_too_large, got %q", errResp1.Error.Code)
+	}
+
+	// 2. Aggregate messages exceed defaultMaxAggregateBytes (768 KiB)
+	// 4 messages of 200 KiB each = 800 KiB > 768 KiB
+	msg200k := strings.Repeat("y", 200*1024)
+	reqObj2 := map[string]any{
+		"model": "gemini-3.8-flash-high",
+		"messages": []map[string]any{
+			{"role": "user", "content": msg200k},
+			{"role": "assistant", "content": msg200k},
+			{"role": "user", "content": msg200k},
+			{"role": "assistant", "content": msg200k},
+		},
+	}
+	b2, _ := json.Marshal(reqObj2)
+	rec2 := postRaw(string(b2))
+	if rec2.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for aggregate > 768 KiB, got %d", rec2.Code)
+	}
+	var errResp2 APIErrorResponse
+	_ = json.Unmarshal(rec2.Body.Bytes(), &errResp2)
+	if errResp2.Error.Code != "messages_aggregate_too_large" {
+		t.Errorf("expected code messages_aggregate_too_large, got %q", errResp2.Error.Code)
+	}
+
+	// 3. Request body exceeds defaultMaxBodyBytes (1 MiB)
+	hugeBody := `{"model":"gemini-3.8-flash-high","messages":[{"role":"user","content":"hi"}],"padding":"` + strings.Repeat("z", 1024*1024) + `"}`
+	rec3 := postRaw(hugeBody)
+	if rec3.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for body > 1 MiB, got %d", rec3.Code)
+	}
+	var errResp3 APIErrorResponse
+	_ = json.Unmarshal(rec3.Body.Bytes(), &errResp3)
+	if errResp3.Error.Code != "request_too_large" {
+		t.Errorf("expected code request_too_large, got %q", errResp3.Error.Code)
+	}
+}

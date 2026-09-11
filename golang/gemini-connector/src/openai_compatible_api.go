@@ -27,7 +27,7 @@ const (
 	defaultMaxExecutionDuration = 90 * time.Second
 	defaultQueueWaitTimeout     = 30 * time.Second
 	defaultMaxBodyBytes         = 1024 * 1024 // 1 MiB
-	defaultMaxMessages          = 128
+	defaultMaxMessages          = 1024
 	defaultMaxMessageBytes      = 256 * 1024      // 256 KiB
 	defaultMaxAggregateBytes    = 768 * 1024      // 768 KiB
 	defaultMaxOutputBytes       = 4 * 1024 * 1024 // 4 MiB
@@ -442,12 +442,12 @@ type ChatCompletionChunk struct {
 }
 
 type OpenAICompatibleServer struct {
-	apiKeyHash [32]byte
-	catalog    *ModelCatalog
-	turns      *TurnCoordinator
-	logger     *APILogger
-	draining   int32
-	activeJobs sync.WaitGroup
+	apiKeyHash        [32]byte
+	catalog           *ModelCatalog
+	turns             *TurnCoordinator
+	logger            *APILogger
+	draining          int32
+	activeJobs        sync.WaitGroup
 	rootCtx           context.Context
 	cancelRoot        context.CancelFunc
 	heartbeatInterval time.Duration
