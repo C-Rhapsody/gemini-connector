@@ -86,8 +86,8 @@ curl http://127.0.0.1:49152/v1/models \
 | `stream_options.include_usage`<br>`include_usage` | **Mapped** | agy가 보고한 실제 토큰 사용량이 있을 경우 `[DONE]` 직전 usage 청크 전송. 측정값이 없으면 0을 날조하지 않고 생략 |
 | `stop` | **Mapped** | 단일 문자열 또는 배열. 일치하는 시퀀스 직전에서 논스트리밍/스트리밍 텍스트 절단 및 `finish_reason: "stop"` 반환 |
 | `max_tokens`<br>`max_completion_tokens` | **Normalized & Ignored** | 양수 정수 검증(0 이하 400 에러). 둘 다 있을 경우 `max_completion_tokens` 우선. **단, agy CLI에 출력 토큰 제한 옵션이 없어 upstream에 강제되지는 않음 (호환성 힌트로만 수용)** |
-| `tools`<br>`tool_choice` | **Compatibility Fallback** | Hermes 등 도구 호출 클라이언트의 400 에러를 방지하기 위해 요청은 수용하되 **Text-only Completion Fallback**으로 동작 (가짜 tool_calls 미생성). 대화 기록의 `role: "tool"` 및 `tool_call_id`는 온전히 수용됨 |
-| `functions`<br>`function_call` | **Normalized** | legacy 함수 호출을 `tools` / `tool_choice` 구조로 자동 정규화 후 동일한 Text-only Fallback 적용 |
+| `tools`<br>`tool_choice` | **Mapped (Protocol Translation Bridge)** | Hermes 등 클라이언트의 도구 스키마를 프롬프트에 주입하고, AGY의 구조화된 출력을 OpenAI 표준 `tool_calls`로 변환. 대화 기록의 `role: "tool"` 및 `tool_call_id` 왕복 지원. `tool_choice` ("auto", "none", "required", 특정 함수 지정) 정책 강제 |
+| `functions`<br>`function_call` | **Normalized** | legacy 함수 호출을 `tools` / `tool_choice` 구조로 자동 정규화 후 동일한 도구 호출 프로토콜 변환 적용 |
 | `parallel_tool_calls` | **Ignored** | 호환성 수용 후 no-op |
 | `metadata`, `user` | **Ignored** | 호환성 수용 후 no-op. 감사 로그 및 프롬프트에 기록하지 않음 |
 | `logprobs`, `top_logprobs` | **Ignored** | 호환성 수용 후 no-op. 가짜 확률값을 생성하지 않음 |
@@ -170,7 +170,50 @@ data: {"id":"chatcmpl-0123456789abcdef","object":"chat.completion.chunk","create
 data: [DONE]
 ```
 
-*(참고: 스트리밍 시 모든 `data:` 프레임은 순수 JSON `ChatCompletionChunk` 또는 `[DONE]`만 전송됩니다. Request ID는 HTTP 응답 헤더 `X-Request-ID`로 전달되며 비표준 raw preamble은 사용하지 않습니다. 장시간 응답 유지를 위한 keepalive는 SSE comment (`: heartbeat\n\n`)로만 전송되어 JSON 파서에 영향을 주지 않습니다.)*
+---
+
+### 3.3. Hermes 도구 호출 아키텍처 및 프로토콜 변환 (Tool Calling Architecture)
+
+`gemini-connector`는 Hermes Agent 등 외부 에이전트 루프와의 안전하고 일관된 연동을 위해 다음 아키텍처 원칙을 강제합니다:
+
+```text
+Hermes Agent
+  ├─ Hermes tool schema 보유
+  ├─ tool_calls 로컬 실행
+  ├─ role=tool 결과 생성
+  └─ 최종 Agent Loop 소유
+        │
+        ▼ (OpenAI Chat Completions Protocol)
+gemini-connector (Protocol Bridge)
+  ├─ Hermes messages/tools → AGY 프롬프트 변환 (<HERMES_TOOLS>)
+  ├─ AGY Discriminated Union JSON envelope 파싱
+  ├─ AGY tool intent → OpenAI tool_calls 변환
+  └─ Native tool containment 감시 (직접 도구 미실행)
+        │
+        ▼ (CLI stdin/stdout)
+Antigravity CLI (agy)
+  └─ Reasoning Brain (사고, 도구 선택, 인자 생성)
+```
+
+1. **소유권 및 역할 분리 (Ownership)**:
+   - **AGY (Antigravity CLI)**: 순수 추론 엔진(Reasoning Brain)으로서 사고, 도구 선택, 인자 생성을 수행합니다.
+   - **Hermes**: 클라이언트 도구 스키마를 소유하며, 생성된 `tool_calls`를 직접 실행하고, `role=tool` 메시지를 생성하여 에이전트 루프를 주도합니다.
+   - **gemini-connector**: 도구를 직접 실행하지 않는 순수 번역 브리지(Translation Bridge)로서, 프로토콜 변환과 정형 봉투(Envelope) 검증만을 담당합니다.
+
+2. **구조화된 봉투 규격 (Discriminated Union Envelope)**:
+   - 도구 사용 요청 시 AGY는 반드시 다음 JSON 봉투 중 하나로 응답하도록 강제됩니다:
+     - 도구 호출: `{"type": "tool_call", "calls": [{"id": "...", "name": "...", "arguments": {...}}]}`
+     - 최종 텍스트: `{"type": "final", "content": "..."}`
+   - **단순 텍스트 `<tool_call>` 미변환**: 모델이 단순 텍스트로 출력하는 `<tool_call>` 문자열은 유효한 구조화 봉투가 아니므로 절대 도구 호출로 변환되지 않고 오류로 처리됩니다.
+
+3. **스트리밍 및 논스트리밍 일관성**:
+   - 논스트리밍: `finish_reason: "tool_calls"`, `content: null`, `tool_calls` 배열 반환.
+   - 스트리밍: 표준 인덱스 기반 `tool_calls` 델타 생성 (call ID, function name, arguments 전달). 인자가 여러 청크로 분할되어도 클라이언트가 온전히 재조립 가능. 마지막 청크는 `finish_reason: "tool_calls"`, 정상 스트림은 `[DONE]`으로 종료. 도구 호출 스트림 중에는 도구 의도가 `content` 텍스트로 절대 유출되지 않음.
+   - `role=tool` 왕복: Hermes가 도구를 실행한 후 전달하는 `role: "tool"` 메시지와 `tool_call_id`가 다음 턴의 대화 기록으로 온전히 보존되어 AGY에 전달됩니다.
+
+4. **보안 및 네이티브 격리 (Containment & Security)**:
+   - **Argv 불변조건**: ProfileAPI 호출은 항상 `--sandbox`를 유지하며, `--dangerously-skip-permissions` 플래그는 절대 사용하지 않습니다.
+   - **소프트 격리 한계 (Soft Containment Boundary)**: AGY CLI (v1.2.1 기준)에 공식적인 `--disable-tools` 플래그가 없으므로 커넥터 레벨의 감시 기반 소프트 격리가 적용됩니다. AGY가 클라이언트 대신 네이티브 도구를 자체 실행하려 할 경우 `native_tool_containment_violation` 에러를 발생시키며, `success_no_text`나 비정상 `[DONE]`으로 덮어쓰지 않습니다.
 
 ---
 

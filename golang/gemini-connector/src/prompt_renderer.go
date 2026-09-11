@@ -141,15 +141,88 @@ func renderSingleMessage(header string, msg ChatMessage) string {
 	return strings.TrimRight(sb.String(), "\n")
 }
 
+// renderHermesTools formats Hermes client tool definitions and structured output instructions.
+func renderHermesTools(tools []ToolDefinition, choice ParsedToolChoice) string {
+	if len(tools) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("<HERMES_TOOLS>\n")
+	sb.WriteString("You have access to the following Hermes client tools:\n\n")
+
+	for _, t := range tools {
+		if t.Function == nil {
+			continue
+		}
+		sb.WriteString(fmt.Sprintf("- Function: %s\n", t.Function.Name))
+		if t.Function.Description != "" {
+			sb.WriteString(fmt.Sprintf("  Description: %s\n", t.Function.Description))
+		}
+		if len(t.Function.Parameters) > 0 {
+			sb.WriteString(fmt.Sprintf("  Parameters: %s\n", string(t.Function.Parameters)))
+		}
+		sb.WriteString("\n")
+	}
+
+	modeStr := choice.Mode
+	if modeStr == "" {
+		modeStr = "auto"
+	}
+	sb.WriteString(fmt.Sprintf("Tool Choice Policy: %s\n", modeStr))
+	if choice.SpecificFunction != "" {
+		sb.WriteString(fmt.Sprintf("Required Function: %s\n", choice.SpecificFunction))
+	}
+	sb.WriteString("\nCRITICAL INSTRUCTIONS FOR RESPONSE FORMAT:\n")
+	sb.WriteString("You MUST respond ONLY with a valid JSON object adhering to one of the following formats:\n\n")
+	sb.WriteString("1. If you decide to call one or more tools:\n")
+	sb.WriteString("```json\n")
+	sb.WriteString("{\n")
+	sb.WriteString("  \"type\": \"tool_call\",\n")
+	sb.WriteString("  \"calls\": [\n")
+	sb.WriteString("    {\"id\": \"call_123\", \"name\": \"<tool_name>\", \"arguments\": {<json_arguments>}}\n")
+	sb.WriteString("  ]\n")
+	sb.WriteString("}\n")
+	sb.WriteString("```\n\n")
+	sb.WriteString("2. If you are providing the final response to the user:\n")
+	sb.WriteString("```json\n")
+	sb.WriteString("{\n")
+	sb.WriteString("  \"type\": \"final\",\n")
+	sb.WriteString("  \"content\": \"<your full textual response here>\"\n")
+	sb.WriteString("}\n")
+	sb.WriteString("```\n\n")
+	sb.WriteString("Do NOT execute tools yourself natively. Output only the JSON envelope matching the schema above.\n")
+	sb.WriteString("</HERMES_TOOLS>\n\n")
+	return sb.String()
+}
+
 // RenderPrompt builds a deterministic, role-preserving prompt representation from OpenAI messages.
 func RenderPrompt(messages []ChatMessage) (string, error) {
+	return RenderPromptWithTools(messages, nil, nil)
+}
+
+// RenderPromptWithTools builds a prompt including Hermes tool definitions and instructions if tools are provided.
+func RenderPromptWithTools(messages []ChatMessage, tools []ToolDefinition, toolChoice any) (string, error) {
 	if len(messages) == 0 {
 		return "", nil
+	}
+
+	var parsedChoice ParsedToolChoice
+	var err error
+	if len(tools) > 0 {
+		parsedChoice, err = ParseToolChoice(toolChoice, tools)
+		if err != nil {
+			return "", fmt.Errorf("invalid tool_choice: %w", err)
+		}
 	}
 
 	systemMsgs, transcriptMsgs, currentTurnMsgs := splitMessages(messages)
 
 	var sb strings.Builder
+
+	// 0. Hermes Tools (if provided)
+	if len(tools) > 0 {
+		sb.WriteString(renderHermesTools(tools, parsedChoice))
+	}
 
 	// 1. System and Developer Messages
 	if len(systemMsgs) > 0 {

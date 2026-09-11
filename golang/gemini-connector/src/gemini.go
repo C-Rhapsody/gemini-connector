@@ -10,6 +10,13 @@ import (
 	"time"
 )
 
+type AgyStep struct {
+	StepIndex int    `json:"step_index,omitempty"`
+	State     string `json:"state,omitempty"`
+	StepType  string `json:"step_type"`
+	TextDelta string `json:"text_delta,omitempty"`
+}
+
 type AgyResponse struct {
 	ConversationID   string          `json:"conversation_id"`
 	Status           string          `json:"status"`
@@ -19,6 +26,7 @@ type AgyResponse struct {
 	NumTurns         int             `json:"num_turns"`
 	Usage            *AgyUsage       `json:"usage,omitempty"`
 	StructuredOutput json.RawMessage `json:"structured_output,omitempty"`
+	Steps            []AgyStep       `json:"steps,omitempty"`
 }
 
 type AgyUsage struct {

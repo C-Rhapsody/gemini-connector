@@ -8,7 +8,7 @@ import (
 	"sync"
 )
 
-func isKnownNonAssistantStepType(stepType string) bool {
+func isNativeToolStepType(stepType string) bool {
 	st := strings.ToLower(strings.TrimSpace(stepType))
 	switch st {
 	case "tool",
@@ -16,8 +16,17 @@ func isKnownNonAssistantStepType(stepType string) bool {
 		"tool_call_start",
 		"tool_call_delta",
 		"tool_output",
-		"tool_result",
-		"plan",
+		"tool_result":
+		return true
+	default:
+		return false
+	}
+}
+
+func isReasoningStepType(stepType string) bool {
+	st := strings.ToLower(strings.TrimSpace(stepType))
+	switch st {
+	case "plan",
 		"thought",
 		"thinking",
 		"reasoning":
@@ -25,6 +34,10 @@ func isKnownNonAssistantStepType(stepType string) bool {
 	default:
 		return false
 	}
+}
+
+func isKnownNonAssistantStepType(stepType string) bool {
+	return isNativeToolStepType(stepType) || isReasoningStepType(stepType)
 }
 
 // ndjsonStreamWriter parses streaming NDJSON events from agy --output-format stream-json
@@ -36,6 +49,7 @@ type ndjsonStreamWriter struct {
 	maxBytes           int64
 	maxLine            int64
 	sawSuccess         bool
+	sawNativeToolStep  bool
 	usage              *AgyUsage
 	err                error
 	mu                 sync.Mutex
@@ -86,8 +100,12 @@ func (w *ndjsonStreamWriter) Write(p []byte) (n int, err error) {
 				if ev.StepUpdate.Usage != nil {
 					w.usage = ev.StepUpdate.Usage
 				}
-				if isKnownNonAssistantStepType(ev.StepUpdate.StepType) {
-					// Known non-assistant step type must never become assistant content
+				if isNativeToolStepType(ev.StepUpdate.StepType) {
+					w.sawNativeToolStep = true
+					continue
+				}
+				if isReasoningStepType(ev.StepUpdate.StepType) {
+					// Known reasoning step type must never become assistant content
 					continue
 				}
 				if ev.StepUpdate.TextDelta != "" {
@@ -127,6 +145,13 @@ func (w *ndjsonStreamWriter) Write(p []byte) (n int, err error) {
 							}
 						}
 						w.emittedDeltasCount++
+					}
+					if w.sawNativeToolStep && w.emittedDeltasCount == 0 {
+						w.err = &AgyError{
+							Type:   "native_tool_containment_violation",
+							Detail: "native AGY tool execution is prohibited in ProfileAPI; tools must be executed by client",
+						}
+						return len(p), w.err
 					}
 				} else {
 					errDetail := ev.Result.Error

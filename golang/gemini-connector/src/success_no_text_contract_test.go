@@ -193,12 +193,10 @@ func TestContract_4_Stream_AgentResponseDeltas(t *testing.T) {
 	}
 }
 
-// 5. Stream tool text never appears in assistant content.
-func TestContract_5_Stream_ToolTextNeverAppearsInAssistantContent(t *testing.T) {
+// 5. Stream reasoning text never appears in assistant content and produces success_no_text.
+func TestContract_5_Stream_ReasoningTextNeverAppearsInAssistantContent(t *testing.T) {
 	body := `{"model":"gemini-3.8-flash-high","messages":[{"role":"user","content":"run"}] ,"stream":true}`
 	rec, raw := runContractRequest(t, body, mockAgyStreamRunner(
-		`{"event":"step_update","step_update":{"step_type":"tool","text_delta":"secret_tool_execution"}}`,
-		`{"event":"step_update","step_update":{"step_type":"tool_call","text_delta":"call bash echo"}}`,
 		`{"event":"step_update","step_update":{"step_type":"plan","text_delta":"step 1 plan"}}`,
 		`{"event":"step_update","step_update":{"step_type":"thought","text_delta":"internal thought"}}`,
 		`{"event":"step_update","step_update":{"step_type":"reasoning","text_delta":"internal reasoning"}}`,
@@ -209,9 +207,9 @@ func TestContract_5_Stream_ToolTextNeverAppearsInAssistantContent(t *testing.T) 
 		t.Fatalf("expected 200, got %d: %s", rec.Code, raw)
 	}
 
-	for _, forbidden := range []string{"secret_tool_execution", "call bash echo", "step 1 plan", "internal thought", "internal reasoning"} {
+	for _, forbidden := range []string{"step 1 plan", "internal thought", "internal reasoning"} {
 		if strings.Contains(raw, forbidden) {
-			t.Errorf("stream output must NEVER contain tool text %q, got:\n%s", forbidden, raw)
+			t.Errorf("stream output must NEVER contain reasoning text %q, got:\n%s", forbidden, raw)
 		}
 	}
 
@@ -223,6 +221,45 @@ func TestContract_5_Stream_ToolTextNeverAppearsInAssistantContent(t *testing.T) 
 	}
 	if !strings.Contains(raw, "data: [DONE]") {
 		t.Errorf("expected data: [DONE], got:\n%s", raw)
+	}
+}
+
+// 5b. Stream native tool execution triggers typed containment error without [DONE].
+func TestContract_5b_Stream_NativeToolContainmentViolation(t *testing.T) {
+	body := `{"model":"gemini-3.8-flash-high","messages":[{"role":"user","content":"run native tool"}] ,"stream":true}`
+	_, raw := runContractRequest(t, body, mockAgyStreamRunner(
+		`{"event":"step_update","step_update":{"step_type":"tool","text_delta":"secret_tool_execution"}}`,
+		`{"event":"step_update","step_update":{"step_type":"tool_call","text_delta":"call bash echo"}}`,
+		`{"event":"result","result":{"status":"SUCCESS","response":""}}`,
+	))
+
+	if !strings.Contains(raw, "event: error") {
+		t.Errorf("expected event: error frame in stream, got:\n%s", raw)
+	}
+	if !strings.Contains(raw, "native_tool_containment_violation") {
+		t.Errorf("expected code native_tool_containment_violation in error data, got:\n%s", raw)
+	}
+	if strings.Contains(raw, "data: [DONE]") {
+		t.Errorf("stream with native tool containment violation must NOT emit [DONE], got:\n%s", raw)
+	}
+}
+
+// 5c. Non-stream native tool execution triggers typed containment error.
+func TestContract_5c_NonStream_NativeToolContainmentViolation(t *testing.T) {
+	body := `{"model":"gemini-3.8-flash-high","messages":[{"role":"user","content":"run native tool"}]}`
+	rec, raw := runContractRequest(t, body, mockAgyJSONRunner(AgyResponse{
+		Status:   "SUCCESS",
+		Response: "",
+		Steps: []AgyStep{
+			{StepType: "tool", TextDelta: "exec bash"},
+		},
+	}))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request, got %d: %s", rec.Code, raw)
+	}
+	if !strings.Contains(raw, "native_tool_containment_violation") {
+		t.Errorf("expected error JSON to contain code 'native_tool_containment_violation', got:\n%s", raw)
 	}
 }
 

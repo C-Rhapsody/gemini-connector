@@ -235,6 +235,9 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 
 		if o.Profile == ProfileAPI && o.Stream {
 			if streamWriter.err != nil {
+				if ae, ok := streamWriter.err.(*AgyError); ok {
+					return "", ae
+				}
 				return "", &AgyError{Type: "stream_error", Detail: streamWriter.err.Error()}
 			}
 			if !streamWriter.sawSuccess {
@@ -297,6 +300,22 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 		respText := result.Response
 		if respText == "" && len(result.StructuredOutput) > 0 {
 			respText = string(result.StructuredOutput)
+		}
+
+		if o.Profile == ProfileAPI {
+			sawNativeTool := false
+			for _, step := range result.Steps {
+				if isNativeToolStepType(step.StepType) {
+					sawNativeTool = true
+					break
+				}
+			}
+			if sawNativeTool && respText == "" {
+				return "", &AgyError{
+					Type:   "native_tool_containment_violation",
+					Detail: "native AGY tool execution is prohibited in ProfileAPI; tools must be executed by client",
+				}
+			}
 		}
 
 		if o.Profile == ProfileAPI && int64(len(respText)) > 4*1024*1024 {

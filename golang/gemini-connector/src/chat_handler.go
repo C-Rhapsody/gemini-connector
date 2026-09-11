@@ -201,11 +201,19 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 		return
 	}
 
+	hasTools := len(req.Tools) > 0
+	parsedToolChoice, tcErr := ParseToolChoice(req.ToolChoice, req.Tools)
+	if tcErr != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Invalid tool_choice: %v", tcErr), "invalid_tool_choice", strPtr("tool_choice"), false)
+		s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "invalid_tool_choice", startTime, req.Stream, &req.Model, 0, clientClass)
+		return
+	}
+
 	// Render messages into role-preserving structured prompt
-	prompt, err := RenderPrompt(req.Messages)
+	prompt, err := RenderPromptWithTools(req.Messages, req.Tools, req.ToolChoice)
 	if err != nil {
-		writeAPIError(w, http.StatusInternalServerError, "api_error", "Internal error rendering prompt", "internal_error", nil, false)
-		s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusInternalServerError, "internal_error", startTime, req.Stream, &req.Model, 0, clientClass)
+		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Failed to render prompt: %v", err), "invalid_prompt", nil, false)
+		s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "invalid_prompt", startTime, req.Stream, &req.Model, 0, clientClass)
 		return
 	}
 
@@ -371,11 +379,17 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 				if jobCtx.Err() != nil || reqCtx.Err() != nil {
 					return jobCtx.Err()
 				}
+				prevLen := cumText.Len()
+				cumText.WriteString(delta)
+
+				if hasTools {
+					// In tool-call mode, do NOT leak raw structured envelope deltas into content!
+					return nil
+				}
+
 				if stopped {
 					return nil
 				}
-				prevLen := cumText.Len()
-				cumText.WriteString(delta)
 				curStr := cumText.String()
 
 				if len(stopSeqs) > 0 {
@@ -420,7 +434,7 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 				StreamCallback:            streamCb,
 				Logger:                    s.logger,
 				JSONSchema:                schemaToPass,
-				StructuredOutputRequested: schemaToPass != "" || req.ResponseFormat != nil,
+				StructuredOutputRequested: schemaToPass != "" || req.ResponseFormat != nil || hasTools,
 				UsageCallback: func(u *AgyUsage) {
 					actualUsage = u
 				},
@@ -433,11 +447,15 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 					return
 				}
 				// Send post-header error frame and close without finish/[DONE]
+				errCode := "upstream_stream_error"
+				if ae, ok := streamErr.(*AgyError); ok && ae.Type != "" {
+					errCode = ae.Type
+				}
 				errEvent := APIErrorResponse{
 					Error: APIErrorBody{
 						Message: "Upstream error during stream",
 						Type:    "api_error",
-						Code:    "upstream_stream_error",
+						Code:    errCode,
 					},
 				}
 				errBytes, _ := json.Marshal(errEvent)
@@ -446,27 +464,153 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 				return
 			}
 
-			// Terminal finish chunk
-			stopStr := "stop"
-			var ext *GeminiConnectorExtension
-			if cumText.Len() == 0 {
-				ext = &GeminiConnectorExtension{
-					State:     "success_no_text",
-					Retryable: false,
+			if hasTools {
+				env, envErr := ParseAndValidateAgyEnvelope(cumText.String(), req.Tools, parsedToolChoice)
+				if envErr != nil {
+					errEvent := APIErrorResponse{
+						Error: APIErrorBody{
+							Message: fmt.Sprintf("Tool envelope validation failed: %v", envErr),
+							Type:    "api_error",
+							Code:    "invalid_tool_envelope",
+						},
+					}
+					errBytes, _ := json.Marshal(errEvent)
+					_ = writeRaw("event: error\ndata: %s\n\n", string(errBytes))
+					turnErr = &AgyError{Type: "invalid_tool_envelope", Detail: envErr.Error()}
+					return
 				}
-			}
-			finishChunk := ChatCompletionChunk{
-				ID:               "chatcmpl-" + reqID,
-				Object:           "chat.completion.chunk",
-				Created:          created,
-				Model:            req.Model,
-				Choices:          []ChunkChoice{{Index: 0, Delta: ChunkDelta{}, FinishReason: &stopStr}},
-				XGeminiConnector: ext,
-			}
-			fBytes, _ := json.Marshal(finishChunk)
-			if err := writeEvent(fBytes); err != nil {
-				turnErr = err
-				return
+
+				if env.Type == "tool_call" {
+					for i, call := range env.Calls {
+						callIdx := i
+						// 1. Initial tool call chunk with ID, type, and function name
+						tcStart := ToolCall{
+							Index: &callIdx,
+							ID:    call.ID,
+							Type:  "function",
+							Function: ToolCallFunction{
+								Name: call.Name,
+							},
+						}
+						cStart := ChatCompletionChunk{
+							ID:      "chatcmpl-" + reqID,
+							Object:  "chat.completion.chunk",
+							Created: created,
+							Model:   req.Model,
+							Choices: []ChunkChoice{{Index: 0, Delta: ChunkDelta{ToolCalls: []ToolCall{tcStart}}, FinishReason: nil}},
+						}
+						bStart, _ := json.Marshal(cStart)
+						if err := writeEvent(bStart); err != nil {
+							turnErr = err
+							return
+						}
+
+						// 2. Arguments chunk(s)
+						argsStr := call.ArgumentsStr
+						var argParts []string
+						if len(argsStr) > 30 {
+							mid := len(argsStr) / 2
+							argParts = []string{argsStr[:mid], argsStr[mid:]}
+						} else {
+							argParts = []string{argsStr}
+						}
+						for _, part := range argParts {
+							tcArgs := ToolCall{
+								Index: &callIdx,
+								Function: ToolCallFunction{
+									Arguments: part,
+								},
+							}
+							cArgs := ChatCompletionChunk{
+								ID:      "chatcmpl-" + reqID,
+								Object:  "chat.completion.chunk",
+								Created: created,
+								Model:   req.Model,
+								Choices: []ChunkChoice{{Index: 0, Delta: ChunkDelta{ToolCalls: []ToolCall{tcArgs}}, FinishReason: nil}},
+							}
+							bArgs, _ := json.Marshal(cArgs)
+							if err := writeEvent(bArgs); err != nil {
+								turnErr = err
+								return
+							}
+						}
+					}
+
+					// Terminal finish chunk with finish_reason: "tool_calls"
+					finishReason := "tool_calls"
+					finishChunk := ChatCompletionChunk{
+						ID:      "chatcmpl-" + reqID,
+						Object:  "chat.completion.chunk",
+						Created: created,
+						Model:   req.Model,
+						Choices: []ChunkChoice{{Index: 0, Delta: ChunkDelta{}, FinishReason: &finishReason}},
+					}
+					fBytes, _ := json.Marshal(finishChunk)
+					if err := writeEvent(fBytes); err != nil {
+						turnErr = err
+						return
+					}
+				} else {
+					// env.Type == "final"
+					contentStr := ""
+					if env.Content != nil {
+						contentStr = *env.Content
+					}
+					if len(stopSeqs) > 0 {
+						contentStr, _ = applyStopSequences(contentStr, stopSeqs)
+					}
+					if contentStr != "" {
+						cContent := ChatCompletionChunk{
+							ID:      "chatcmpl-" + reqID,
+							Object:  "chat.completion.chunk",
+							Created: created,
+							Model:   req.Model,
+							Choices: []ChunkChoice{{Index: 0, Delta: ChunkDelta{Content: contentStr}, FinishReason: nil}},
+						}
+						bContent, _ := json.Marshal(cContent)
+						if err := writeEvent(bContent); err != nil {
+							turnErr = err
+							return
+						}
+					}
+
+					finishReason := "stop"
+					finishChunk := ChatCompletionChunk{
+						ID:      "chatcmpl-" + reqID,
+						Object:  "chat.completion.chunk",
+						Created: created,
+						Model:   req.Model,
+						Choices: []ChunkChoice{{Index: 0, Delta: ChunkDelta{}, FinishReason: &finishReason}},
+					}
+					fBytes, _ := json.Marshal(finishChunk)
+					if err := writeEvent(fBytes); err != nil {
+						turnErr = err
+						return
+					}
+				}
+			} else {
+				// Terminal finish chunk for no-tools mode
+				stopStr := "stop"
+				var ext *GeminiConnectorExtension
+				if cumText.Len() == 0 {
+					ext = &GeminiConnectorExtension{
+						State:     "success_no_text",
+						Retryable: false,
+					}
+				}
+				finishChunk := ChatCompletionChunk{
+					ID:               "chatcmpl-" + reqID,
+					Object:           "chat.completion.chunk",
+					Created:          created,
+					Model:            req.Model,
+					Choices:          []ChunkChoice{{Index: 0, Delta: ChunkDelta{}, FinishReason: &stopStr}},
+					XGeminiConnector: ext,
+				}
+				fBytes, _ := json.Marshal(finishChunk)
+				if err := writeEvent(fBytes); err != nil {
+					turnErr = err
+					return
+				}
 			}
 
 			// Usage chunk before [DONE] if requested and available
@@ -495,12 +639,12 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 				Stream:                    false,
 				Logger:                    s.logger,
 				JSONSchema:                schemaToPass,
-				StructuredOutputRequested: schemaToPass != "" || req.ResponseFormat != nil,
+				StructuredOutputRequested: schemaToPass != "" || req.ResponseFormat != nil || hasTools,
 				UsageCallback: func(u *AgyUsage) {
 					actualUsage = u
 				},
 			})
-			if len(stopSeqs) > 0 && nonStreamErr == nil {
+			if len(stopSeqs) > 0 && nonStreamErr == nil && !hasTools {
 				resp, _ = applyStopSequences(resp, stopSeqs)
 			}
 			turnResp = resp
@@ -596,6 +740,12 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 			case "stream_error", "stream_incomplete":
 				status = http.StatusBadGateway
 				code = ae.Type
+			case "native_tool_containment_violation":
+				status = http.StatusBadRequest
+				code = "native_tool_containment_violation"
+			case "invalid_tool_envelope":
+				status = http.StatusBadRequest
+				code = "invalid_tool_envelope"
 			}
 		}
 		if !streamHeadersSent.Load() {
@@ -606,36 +756,93 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 	}
 
 	if !req.Stream {
-		var contentVal any = turnResp
-		var ext *GeminiConnectorExtension
-		if turnResp == "" {
-			contentVal = nil
-			ext = &GeminiConnectorExtension{
-				State:     "success_no_text",
-				Retryable: false,
+		if hasTools {
+			env, envErr := ParseAndValidateAgyEnvelope(turnResp, req.Tools, parsedToolChoice)
+			if envErr != nil {
+				writeAPIError(w, http.StatusBadRequest, "api_error", fmt.Sprintf("Tool envelope validation failed: %v", envErr), "invalid_tool_envelope", nil, false)
+				s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "invalid_tool_envelope", startTime, req.Stream, &req.Model, queueWaitMS.Load(), clientClass)
+				return
 			}
-		}
-		respObj := ChatCompletionResponse{
-			ID:      "chatcmpl-" + reqID,
-			Object:  "chat.completion",
-			Created: time.Now().Unix(),
-			Model:   req.Model,
-			Choices: []ChatCompletionChoice{
-				{
-					Index: 0,
-					Message: ChatMessage{
-						Role:    "assistant",
-						Content: contentVal,
+
+			var choice ChatCompletionChoice
+			choice.Index = 0
+			if env.Type == "tool_call" {
+				var tcList []ToolCall
+				for _, call := range env.Calls {
+					tcList = append(tcList, ToolCall{
+						ID:   call.ID,
+						Type: "function",
+						Function: ToolCallFunction{
+							Name:      call.Name,
+							Arguments: call.ArgumentsStr,
+						},
+					})
+				}
+				choice.Message = ChatMessage{
+					Role:      "assistant",
+					Content:   nil,
+					ToolCalls: tcList,
+				}
+				choice.FinishReason = "tool_calls"
+			} else {
+				var contentVal any = ""
+				if env.Content != nil {
+					contentVal = *env.Content
+				}
+				if s, ok := contentVal.(string); ok && len(stopSeqs) > 0 {
+					s, _ = applyStopSequences(s, stopSeqs)
+					contentVal = s
+				}
+				choice.Message = ChatMessage{
+					Role:    "assistant",
+					Content: contentVal,
+				}
+				choice.FinishReason = "stop"
+			}
+
+			respObj := ChatCompletionResponse{
+				ID:      "chatcmpl-" + reqID,
+				Object:  "chat.completion",
+				Created: time.Now().Unix(),
+				Model:   req.Model,
+				Choices: []ChatCompletionChoice{choice},
+				Usage:   mapAgyUsageToOpenAI(turnUsage),
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(respObj)
+		} else {
+			var contentVal any = turnResp
+			var ext *GeminiConnectorExtension
+			if turnResp == "" {
+				contentVal = nil
+				ext = &GeminiConnectorExtension{
+					State:     "success_no_text",
+					Retryable: false,
+				}
+			}
+			respObj := ChatCompletionResponse{
+				ID:      "chatcmpl-" + reqID,
+				Object:  "chat.completion",
+				Created: time.Now().Unix(),
+				Model:   req.Model,
+				Choices: []ChatCompletionChoice{
+					{
+						Index: 0,
+						Message: ChatMessage{
+							Role:    "assistant",
+							Content: contentVal,
+						},
+						FinishReason: "stop",
 					},
-					FinishReason: "stop",
 				},
-			},
-			Usage:            mapAgyUsageToOpenAI(turnUsage),
-			XGeminiConnector: ext,
+				Usage:            mapAgyUsageToOpenAI(turnUsage),
+				XGeminiConnector: ext,
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(respObj)
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(respObj)
 	}
 
 	s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusOK, "", startTime, req.Stream, &req.Model, queueWaitMS.Load(), clientClass)

@@ -222,8 +222,8 @@ func (c *ModelCatalog) CheckModelSnapshotValid(modelID string) (exists bool, exp
 }
 
 type ToolCallFunction struct {
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
 }
 
 type ToolCall struct {

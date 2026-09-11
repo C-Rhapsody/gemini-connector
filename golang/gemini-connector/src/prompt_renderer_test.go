@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -296,3 +297,102 @@ func TestRenderPrompt_EdgeCases(t *testing.T) {
 		t.Errorf("pure system messages should not emit transcript or current turn tags:\n%s", r3)
 	}
 }
+
+func TestRenderPromptWithTools_SchemaDelivered(t *testing.T) {
+	messages := []ChatMessage{
+		{Role: "user", Content: "Probe system"},
+	}
+	tools := []ToolDefinition{
+		{
+			Type: "function",
+			Function: &FunctionDefinition{
+				Name:        "hermes_probe",
+				Description: "Probe a host system",
+				Parameters:  json.RawMessage(`{"type":"object","properties":{"target":{"type":"string"}},"required":["target"]}`),
+			},
+		},
+	}
+
+	rendered, err := RenderPromptWithTools(messages, tools, "auto")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	for _, reqText := range []string{
+		"<HERMES_TOOLS>",
+		"hermes_probe",
+		"Probe a host system",
+		`"target"`,
+		"auto",
+		`"type": "final"`,
+		`"type": "tool_call"`,
+		"</HERMES_TOOLS>",
+	} {
+		if !strings.Contains(rendered, reqText) {
+			t.Errorf("expected prompt to contain %q, but was:\n%s", reqText, rendered)
+		}
+	}
+}
+
+func TestRenderPromptWithTools_RoleToolRoundTrip(t *testing.T) {
+	messages := []ChatMessage{
+		{Role: "user", Content: "Run probe"},
+		{
+			Role: "assistant",
+			ToolCalls: []ToolCall{
+				{
+					ID:   "call_probe_1",
+					Type: "function",
+					Function: ToolCallFunction{
+						Name:      "hermes_probe",
+						Arguments: `{"target":"localhost"}`,
+					},
+				},
+			},
+		},
+		{
+			Role:       "tool",
+			ToolCallID: "call_probe_1",
+			Name:       "hermes_probe",
+			Content:    `{"status":"healthy"}`,
+		},
+	}
+	tools := []ToolDefinition{
+		{
+			Type: "function",
+			Function: &FunctionDefinition{
+				Name: "hermes_probe",
+			},
+		},
+	}
+
+	rendered, err := RenderPromptWithTools(messages, tools, "auto")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	for _, expected := range []string{
+		"call_id: call_probe_1",
+		"name: hermes_probe",
+		`{"status":"healthy"}`,
+		`{"target":"localhost"}`,
+	} {
+		if !strings.Contains(rendered, expected) {
+			t.Errorf("expected prompt to contain %q, got:\n%s", expected, rendered)
+		}
+	}
+}
+
+func TestRenderPromptWithTools_NoToolsOmitsSection(t *testing.T) {
+	messages := []ChatMessage{
+		{Role: "user", Content: "Ordinary question"},
+	}
+	rendered, err := RenderPromptWithTools(messages, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(rendered, "<HERMES_TOOLS>") {
+		t.Errorf("expected <HERMES_TOOLS> to be omitted when tools is empty:\n%s", rendered)
+	}
+}
+

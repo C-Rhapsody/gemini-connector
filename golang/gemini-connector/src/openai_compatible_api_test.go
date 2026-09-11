@@ -528,7 +528,7 @@ func TestChatCompletions_HermesTools_Fallback(t *testing.T) {
 	agyCmdRunner = func(cmd *exec.Cmd) error {
 		resp := AgyResponse{
 			Status:   "SUCCESS",
-			Response: "I am ready without tool calls.",
+			Response: `{"type":"final","content":"I am ready without tool calls."}`,
 		}
 		b, _ := json.Marshal(resp)
 		cmd.Stdout.Write(b)
@@ -930,9 +930,8 @@ func TestChatCompletions_Stream_HermesShape_FirstFrameJSON(t *testing.T) {
 	agyCmdRunner = func(cmd *exec.Cmd) error {
 		lines := []string{
 			`{"event":"init","conversation_id":"00000000","init":{"model":"gemini-3.8-flash-high"}}`,
-			`{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"Hermes"}}`,
-			`{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":" stream"}}`,
-			`{"event":"result","result":{"status":"SUCCESS","response":"Hermes stream"}}`,
+			`{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"{\"type\":\"final\",\"content\":\"Hermes stream\"}"}}`,
+			`{"event":"result","result":{"status":"SUCCESS","response":""}}`,
 		}
 		for _, l := range lines {
 			cmd.Stdout.Write([]byte(l + "\n"))
