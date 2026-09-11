@@ -112,6 +112,7 @@ func Bootstrap(opts BootstrapOptions) (*Application, error) {
 
 	registry := NewAdapterRegistry(adapters)
 	turns := NewTurnCoordinator()
+	executor := newAgyExecutor()
 
 	var cronSurface CronSurface
 	if cs, ok := adapters["telegram"].(CronSurface); ok {
@@ -134,7 +135,7 @@ func Bootstrap(opts BootstrapOptions) (*Application, error) {
 		cronSvc = cron.Service
 	}
 
-	controller := NewController(registry, turns, cfg, msgs, cronSvc)
+	controller := NewController(registry, turns, cfg, msgs, cronSvc, executor)
 
 	return &Application{
 		cfg:        cfg,

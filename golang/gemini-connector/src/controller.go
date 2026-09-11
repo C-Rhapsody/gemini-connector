@@ -20,9 +20,10 @@ type Controller struct {
 	cron         *CronService
 	commands     *commandRouter
 	interactions *interactionRouter
+	executor     AgyExecutor
 }
 
-func NewController(registry *AdapterRegistry, turns *TurnCoordinator, cfg *Config, msgs *Messages, cron *CronService) *Controller {
+func NewController(registry *AdapterRegistry, turns *TurnCoordinator, cfg *Config, msgs *Messages, cron *CronService, executor AgyExecutor) *Controller {
 	if msgs != nil {
 		msgs.applyDefaults()
 	}
@@ -34,6 +35,7 @@ func NewController(registry *AdapterRegistry, turns *TurnCoordinator, cfg *Confi
 		cron:         cron,
 		commands:     newCommandRouter(),
 		interactions: newInteractionRouter(),
+		executor:     executor,
 	}
 	c.registerHandlers()
 	return c
@@ -219,7 +221,7 @@ func (c *Controller) runChatTurn(ctx context.Context, adapter Messenger, ev Inbo
 	// AI-produced and eligible for attachment delivery.
 	turnStart := time.Now()
 
-	response, err := agyInvoker(ctx, ev.Content, c.cfg.ConversationID(), AgyCallOptions{})
+	response, err := c.executor.Execute(ctx, ev.Content, c.cfg.ConversationID(), AgyCallOptions{})
 	if err != nil {
 		if ctx.Err() != nil {
 			// Cancelled via /stop: stay silent, the stop notice already went out.

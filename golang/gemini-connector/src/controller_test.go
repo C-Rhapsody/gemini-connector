@@ -91,7 +91,7 @@ func newTestController(t *testing.T, cron *CronService) (*Controller, *fakeMesse
 	msgs := &Messages{}
 	msgs.applyDefaults()
 	cfg := &Config{AgyConversationID: "conv-test"}
-	c := NewController(registry, turns, cfg, msgs, cron)
+	c := NewController(registry, turns, cfg, msgs, cron, stubAgyExecutor{})
 	t.Cleanup(func() {
 		for turns.Busy() {
 			turns.StopActive()
@@ -118,11 +118,10 @@ func TestController_TeamsSlashTextIsPlainTurn(t *testing.T) {
 	c, _, turns := newTestController(t, nil)
 
 	var invoked atomicPrompt
-	restore := swapAgyInvoker(func(ctx context.Context, prompt string, convID string, opts ...AgyCallOptions) (string, error) {
+	c.executor = stubAgyExecutor{execute: func(ctx context.Context, prompt string, convID string, opts AgyCallOptions) (string, error) {
 		invoked.set(prompt)
 		return "응답입니다", nil
-	})
-	defer restore()
+	}}
 
 	c.Handle(InboundEvent{Platform: "teams", ChatID: "chat-1", Kind: EventMessage, Content: "/stop", MessageID: 3})
 
@@ -135,11 +134,10 @@ func TestController_TelegramStopDoesNotSpawnAgy(t *testing.T) {
 	c, tg, _ := newTestController(t, nil)
 
 	calls := atomicCounter{}
-	restore := swapAgyInvoker(func(ctx context.Context, prompt string, convID string, opts ...AgyCallOptions) (string, error) {
+	c.executor = stubAgyExecutor{execute: func(ctx context.Context, prompt string, convID string, opts AgyCallOptions) (string, error) {
 		calls.inc()
 		return "", nil
-	})
-	defer restore()
+	}}
 
 	// Seed a running turn so StopActive has something to cancel.
 	blocked := make(chan struct{})
@@ -213,10 +211,9 @@ func TestController_ForeignInteractionAnsweredSilently(t *testing.T) {
 func TestController_InboundAttachmentPathsExcludedFromReply(t *testing.T) {
 	c, tg, turns := newTestController(t, nil)
 
-	restore := swapAgyInvoker(func(ctx context.Context, prompt string, convID string, opts ...AgyCallOptions) (string, error) {
+	c.executor = stubAgyExecutor{execute: func(ctx context.Context, prompt string, convID string, opts AgyCallOptions) (string, error) {
 		return "분석 완료", nil
-	})
-	defer restore()
+	}}
 
 	inbound := []string{`C:\bot\downloads\51867851_26597_01.jpg`}
 	c.Handle(InboundEvent{
