@@ -772,14 +772,13 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 		return
 	}
 
-	// Convert messages to deterministic structured JSON
-	promptBytes, err := json.Marshal(req.Messages)
+	// Render messages into role-preserving structured prompt
+	prompt, err := RenderPrompt(req.Messages)
 	if err != nil {
-		writeAPIError(w, http.StatusInternalServerError, "api_error", "Internal error encoding messages", "internal_error", nil, false)
+		writeAPIError(w, http.StatusInternalServerError, "api_error", "Internal error rendering prompt", "internal_error", nil, false)
 		s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusInternalServerError, "internal_error", startTime, req.Stream, &req.Model, 0, clientClass)
 		return
 	}
-	prompt := string(promptBytes)
 
 	stopSeqs := parseStopSequences(req.Stop)
 	wantUsage := false

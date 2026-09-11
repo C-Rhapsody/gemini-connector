@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1380,3 +1381,305 @@ func TestChatCompletions_ByteLimits(t *testing.T) {
 		t.Errorf("expected code request_too_large, got %q", errResp3.Error.Code)
 	}
 }
+
+// TestChatCompletions_MultiTurnRolePreservation_Regression captures the actual stdin passed
+// to AGY and verifies that multi-turn history is rendered with explicit role/turn boundaries
+// instead of being flattened into an opaque JSON array string (which causes semantic drift).
+func TestChatCompletions_MultiTurnRolePreservation_Regression(t *testing.T) {
+	server, _, _ := setupTestServer(t)
+
+	var capturedStdin string
+	var capturedArgs []string
+	var mu sync.Mutex
+
+	oldRunner := agyCmdRunner
+	defer func() { agyCmdRunner = oldRunner }()
+	agyCmdRunner = func(cmd *exec.Cmd) error {
+		mu.Lock()
+		capturedArgs = append([]string(nil), cmd.Args...)
+		if cmd.Stdin != nil {
+			b, _ := io.ReadAll(cmd.Stdin)
+			capturedStdin = string(b)
+		}
+		mu.Unlock()
+
+		resp := AgyResponse{
+			Status:   "SUCCESS",
+			Response: "16",
+		}
+		b, _ := json.Marshal(resp)
+		cmd.Stdout.Write(b)
+		return nil
+	}
+
+	callID := "call_calc1"
+	reqBody := map[string]any{
+		"model": "gemini-3.8-flash-high",
+		"messages": []map[string]any{
+			{"role": "system", "content": "You are a helpful coding assistant."},
+			{"role": "user", "content": "Topic A: Tell me about Go channels."},
+			{"role": "assistant", "content": "Go channels are typed conduits for synchronization."},
+			{"role": "user", "content": "Topic B: Tell me about Rust ownership."},
+			{"role": "assistant", "content": "Rust uses ownership to manage memory safely without GC."},
+			{
+				"role":    "assistant",
+				"content": "",
+				"tool_calls": []map[string]any{
+					{
+						"id":   callID,
+						"type": "function",
+						"function": map[string]any{
+							"name":      "calculator",
+							"arguments": `{"expr":"2+2"}`,
+						},
+					},
+				},
+			},
+			{
+				"role":         "tool",
+				"tool_call_id": callID,
+				"name":         "calculator",
+				"content":      "4",
+			},
+			{"role": "user", "content": "Now answer this: What is 4 * 4?"},
+		},
+	}
+
+	b, err := json.Marshal(reqBody)
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(b))
+	req.Host = "127.0.0.1:49152"
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	mu.Lock()
+	stdin := capturedStdin
+	args := capturedArgs
+	mu.Unlock()
+
+	// 1. Verify --conversation is NOT in args (statelessness)
+	for _, arg := range args {
+		if arg == "--conversation" {
+			t.Fatalf("expected stateless execution without --conversation, but found in args: %v", args)
+		}
+	}
+
+	// 2. RED Check: AGY stdin MUST NOT be a raw JSON array of req.Messages
+	var rawArr []any
+	if err := json.Unmarshal([]byte(stdin), &rawArr); err == nil && len(rawArr) == 8 {
+		t.Fatalf("FAIL (Semantic Drift Root Cause): AGY stdin was passed as a raw opaque JSON array of req.Messages:\n%s", stdin)
+	}
+
+	// 3. System section check
+	if !strings.Contains(stdin, "<SYSTEM_AND_DEVELOPER_MESSAGES>") || !strings.Contains(stdin, "You are a helpful coding assistant.") {
+		t.Errorf("expected <SYSTEM_AND_DEVELOPER_MESSAGES> containing system prompt, got:\n%s", stdin)
+	}
+
+	// 4. Transcript section check
+	if !strings.Contains(stdin, "<CONVERSATION_TRANSCRIPT>") {
+		t.Fatalf("expected <CONVERSATION_TRANSCRIPT> in stdin, got:\n%s", stdin)
+	}
+
+	// Transcript must contain past topics and tool calls in order
+	idxA := strings.Index(stdin, "Topic A: Tell me about Go channels.")
+	idxB := strings.Index(stdin, "Topic B: Tell me about Rust ownership.")
+	idxToolCall := strings.Index(stdin, callID)
+	idxToolRes := strings.Index(stdin, `4`)
+	if idxA == -1 || idxB == -1 || idxA > idxB {
+		t.Errorf("expected past topics in order in transcript, idxA=%d, idxB=%d", idxA, idxB)
+	}
+	if idxToolCall == -1 || idxToolRes == -1 {
+		t.Errorf("expected tool call metadata and tool result in transcript")
+	}
+
+	// 5. Current turn check
+	if !strings.Contains(stdin, "<CURRENT_TURN>") {
+		t.Fatalf("expected <CURRENT_TURN> in stdin, got:\n%s", stdin)
+	}
+	idxCurrent := strings.Index(stdin, "Now answer this: What is 4 * 4?")
+	idxCurrentTurnTag := strings.Index(stdin, "<CURRENT_TURN>")
+	if idxCurrent == -1 || idxCurrent < idxCurrentTurnTag {
+		t.Errorf("expected current question to be inside <CURRENT_TURN>, got:\n%s", stdin)
+	}
+
+	// Ensure past topic A is NOT inside <CURRENT_TURN>
+	currentTurnPart := stdin[idxCurrentTurnTag:]
+	if strings.Contains(currentTurnPart, "Topic A") {
+		t.Errorf("past Topic A leaked into <CURRENT_TURN>")
+	}
+}
+
+// TestChatCompletions_Stream_UsesSameRenderer verifies that streaming requests
+// use the exact same role-preserving prompt renderer as non-stream requests.
+func TestChatCompletions_Stream_UsesSameRenderer(t *testing.T) {
+	server, _, _ := setupTestServer(t)
+
+	var lastCapturedStdin string
+	var mu sync.Mutex
+
+	oldRunner := agyCmdRunner
+	defer func() { agyCmdRunner = oldRunner }()
+	agyCmdRunner = func(cmd *exec.Cmd) error {
+		mu.Lock()
+		if cmd.Stdin != nil {
+			b, _ := io.ReadAll(cmd.Stdin)
+			lastCapturedStdin = string(b)
+		}
+		mu.Unlock()
+
+		isStream := false
+		for _, arg := range cmd.Args {
+			if arg == "stream-json" {
+				isStream = true
+				break
+			}
+		}
+
+		if isStream {
+			cmd.Stdout.Write([]byte(`{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"hello"}}` + "\n"))
+			cmd.Stdout.Write([]byte(`{"event":"result","result":{"status":"SUCCESS","response":"hello"}}` + "\n"))
+		} else {
+			resp := AgyResponse{
+				Status:   "SUCCESS",
+				Response: "hello",
+			}
+			b, _ := json.Marshal(resp)
+			cmd.Stdout.Write(b)
+		}
+		return nil
+	}
+
+	messages := []map[string]any{
+		{"role": "system", "content": "You are a test system."},
+		{"role": "user", "content": "Past question"},
+		{"role": "assistant", "content": "Past answer"},
+		{"role": "user", "content": "Active question"},
+	}
+
+	// 1. Non-stream request
+	bodyNonStream, _ := json.Marshal(map[string]any{
+		"model":    "gemini-3.8-flash-high",
+		"messages": messages,
+		"stream":   false,
+	})
+	req1 := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(bodyNonStream))
+	req1.Host = "127.0.0.1:49152"
+	req1.Header.Set("Authorization", "Bearer "+testAPIKey)
+	req1.Header.Set("Content-Type", "application/json")
+	rec1 := httptest.NewRecorder()
+	server.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("non-stream expected 200, got %d: %s", rec1.Code, rec1.Body.String())
+	}
+	mu.Lock()
+	nonStreamStdin := lastCapturedStdin
+	mu.Unlock()
+
+	// 2. Stream request
+	bodyStream, _ := json.Marshal(map[string]any{
+		"model":    "gemini-3.8-flash-high",
+		"messages": messages,
+		"stream":   true,
+	})
+	req2 := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(bodyStream))
+	req2.Host = "127.0.0.1:49152"
+	req2.Header.Set("Authorization", "Bearer "+testAPIKey)
+	req2.Header.Set("Content-Type", "application/json")
+	rec2 := httptest.NewRecorder()
+	server.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("stream expected 200, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+	mu.Lock()
+	streamStdin := lastCapturedStdin
+	mu.Unlock()
+
+	if streamStdin != nonStreamStdin {
+		t.Fatalf("stream stdin differs from non-stream stdin!\nNon-Stream:\n%s\nStream:\n%s", nonStreamStdin, streamStdin)
+	}
+}
+
+// TestChatCompletions_Stateless_NoStateLeak verifies that consecutive HTTP requests
+// do not leak prompts, conversations, or command arguments between requests.
+func TestChatCompletions_Stateless_NoStateLeak(t *testing.T) {
+	server, _, _ := setupTestServer(t)
+
+	var lastCapturedStdin string
+	var lastCapturedArgs []string
+	var mu sync.Mutex
+
+	oldRunner := agyCmdRunner
+	defer func() { agyCmdRunner = oldRunner }()
+	agyCmdRunner = func(cmd *exec.Cmd) error {
+		mu.Lock()
+		lastCapturedArgs = append([]string(nil), cmd.Args...)
+		if cmd.Stdin != nil {
+			b, _ := io.ReadAll(cmd.Stdin)
+			lastCapturedStdin = string(b)
+		}
+		mu.Unlock()
+
+		resp := AgyResponse{Status: "SUCCESS", Response: "ok"}
+		b, _ := json.Marshal(resp)
+		cmd.Stdout.Write(b)
+		return nil
+	}
+
+	sendReq := func(userContent string) (string, []string) {
+		body, _ := json.Marshal(map[string]any{
+			"model": "gemini-3.8-flash-high",
+			"messages": []map[string]any{
+				{"role": "user", "content": userContent},
+			},
+		})
+		req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
+		req.Host = "127.0.0.1:49152"
+		req.Header.Set("Authorization", "Bearer "+testAPIKey)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rec.Code)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		return lastCapturedStdin, lastCapturedArgs
+	}
+
+	// Request 1: Unique Topic A
+	stdin1, args1 := sendReq("UNIQUE_TOPIC_ALPHA_12345")
+	if !strings.Contains(stdin1, "UNIQUE_TOPIC_ALPHA_12345") {
+		t.Fatal("expected request 1 to contain ALPHA")
+	}
+	for _, a := range args1 {
+		if a == "--conversation" {
+			t.Fatal("request 1 should not have --conversation")
+		}
+	}
+
+	// Request 2: Unique Topic B
+	stdin2, args2 := sendReq("UNIQUE_TOPIC_BETA_67890")
+	if !strings.Contains(stdin2, "UNIQUE_TOPIC_BETA_67890") {
+		t.Fatal("expected request 2 to contain BETA")
+	}
+	if strings.Contains(stdin2, "UNIQUE_TOPIC_ALPHA_12345") {
+		t.Fatalf("STATE LEAK: request 2 stdin contained data from request 1:\n%s", stdin2)
+	}
+	for _, a := range args2 {
+		if a == "--conversation" {
+			t.Fatal("request 2 should not have --conversation")
+		}
+	}
+}
+
+
