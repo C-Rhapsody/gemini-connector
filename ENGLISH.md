@@ -116,6 +116,19 @@ Source code, executables, and data are clearly separated.
     AGY_CONVERSATION_ID=auto_or_manually_entered_id
     ```
 
+### Telegram Rich Messages and LaTeX
+
+To render LaTeX formulas as Telegram Rich Messages, add the following entries to `src/.env`:
+
+```ini
+TELEGRAM_RICH_MESSAGES=true
+TELEGRAM_RICH_MATH_ESCAPE=numeric
+```
+
+- The `numeric` profile is recommended for formulas that may contain `<`, `>`, or `&`, including inequalities and matrix/alignment environments. The `raw` profile may reject these HTML-significant characters.
+- Rich delivery applies to non-empty AI responses. Commands, cron, and other system replies continue to use the ordinary Telegram message path.
+- Restart the connector after changing `.env` so the new configuration is loaded.
+
 ## Installation & Run
 
 You can either compile the source code yourself or download a pre-built executable to get started immediately.

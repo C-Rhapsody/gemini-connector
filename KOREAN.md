@@ -116,6 +116,19 @@
     AGY_CONVERSATION_ID=자동_또는_수동_입력_ID
     ```
 
+### Telegram Rich Messages 및 LaTeX 수식
+
+Telegram에서 LaTeX 수식을 Rich Message로 렌더링하려면 `src/.env`에 다음 항목을 추가합니다.
+
+```ini
+TELEGRAM_RICH_MESSAGES=true
+TELEGRAM_RICH_MATH_ESCAPE=numeric
+```
+
+- `numeric` 프로파일은 부등식과 행렬/정렬 환경처럼 `<`, `>`, `&`가 포함될 수 있는 수식에 권장됩니다. `raw` 프로파일은 이러한 HTML 예약 문자를 거부할 수 있습니다.
+- Rich 전송은 비어 있지 않은 AI 응답에 적용됩니다. 명령, cron 및 기타 시스템 응답은 일반 Telegram 메시지 경로를 사용합니다.
+- `.env` 변경 후 새 설정을 읽도록 커넥터를 재시작해야 합니다.
+
 ## 다운로드 및 실행 (Installation & Run)
 
 본 커넥터는 직접 소스 코드를 빌드하여 사용하거나, 이미 빌드된 실행 파일을 다운로드하여 곧바로 사용할 수 있습니다.
