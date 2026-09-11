@@ -119,38 +119,29 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 		// point on belong to the turn we are about to spawn.
 		turnStart := time.Now()
 
-		var args []string
-		if o.Profile == ProfileAPI {
-			args = []string{
-				"--mode", "plan",
-				"--sandbox",
-				"--disable-slash-commands",
-				"--print-timeout", "90s",
-			}
-			if o.Stream {
-				args = append(args, "--output-format", "stream-json")
-			} else {
-				args = append(args, "--output-format", "json")
-			}
-			if o.Model != "" {
-				args = append(args, "--model", o.Model)
-			}
-			if tempSchemaPath != "" {
-				args = append(args, "--json-schema", tempSchemaPath)
-			}
-			// Note: API calls are stateless and never inherit conversation ID or dangerous permissions.
-		} else {
-			args = []string{
-				"--output-format", "json",
-				"--dangerously-skip-permissions",
-				"--print-timeout", "5m",
-			}
-			if o.Profile == ProfilePlanner {
-				args = append(args, "--mode", "plan", "--sandbox", "--disable-slash-commands")
-			}
-			if conversationID != "" {
-				args = append(args, "--conversation", conversationID)
-			}
+		// Interactive and API turns share the same execution policy. The only
+		// protocol-specific argument is stream-json for API streaming; API turns
+		// remain stateless and therefore do not inherit a conversation ID.
+		outputFormat := "json"
+		if o.Profile == ProfileAPI && o.Stream {
+			outputFormat = "stream-json"
+		}
+		args := []string{
+			"--output-format", outputFormat,
+			"--dangerously-skip-permissions",
+			"--print-timeout", "5m",
+		}
+		if o.Profile == ProfileAPI && o.Model != "" {
+			args = append(args, "--model", o.Model)
+		}
+		if tempSchemaPath != "" {
+			args = append(args, "--json-schema", tempSchemaPath)
+		}
+		if o.Profile == ProfilePlanner {
+			args = append(args, "--mode", "plan", "--sandbox", "--disable-slash-commands")
+		}
+		if o.Profile != ProfileAPI && conversationID != "" {
+			args = append(args, "--conversation", conversationID)
 		}
 
 		cmd := exec.CommandContext(ctx, "agy", args...)

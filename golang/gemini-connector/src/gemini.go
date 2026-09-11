@@ -63,8 +63,8 @@ const (
 	ProfileScheduled
 	// ProfileBootstrap creates or replays into a fresh conversation.
 	ProfileBootstrap
-	// ProfileAPI runs stateless OpenAI-compatible completions with sandbox restrictions
-	// and no dangerous permissions.
+	// ProfileAPI runs stateless OpenAI-compatible completions with the same
+	// execution policy and working directory as regular interactive turns.
 	ProfileAPI
 )
 

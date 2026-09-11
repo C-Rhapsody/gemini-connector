@@ -205,8 +205,9 @@ func TestHermes_TwoTurnIntegrationFixture(t *testing.T) {
 	}
 }
 
-// TestProfileAPI_ArgvInvariants verifies that ProfileAPI invocations MUST include --sandbox
-// and MUST NOT include --dangerously-skip-permissions.
+// TestProfileAPI_ArgvInvariants verifies that ProfileAPI invocations use the
+// same regular execution policy: no plan/slash/sandbox restrictions and
+// dangerous permissions enabled.
 func TestProfileAPI_ArgvInvariants(t *testing.T) {
 	body := `{"model": "gemini-3.8-flash-high", "messages": [{"role": "user", "content": "test"}]}`
 
@@ -224,20 +225,50 @@ func TestProfileAPI_ArgvInvariants(t *testing.T) {
 	}
 
 	hasSandbox := false
+	hasPlanMode := false
+	hasDisableSlashCommands := false
 	hasDangerousSkip := false
-	for _, arg := range observedArgs {
+	hasPrintTimeout5m := false
+	hasPrintTimeout90s := false
+	for i, arg := range observedArgs {
 		if arg == "--sandbox" {
 			hasSandbox = true
+		}
+		if arg == "--mode" {
+			hasPlanMode = true
+		}
+		if arg == "--disable-slash-commands" {
+			hasDisableSlashCommands = true
 		}
 		if arg == "--dangerously-skip-permissions" {
 			hasDangerousSkip = true
 		}
+		if arg == "--print-timeout" && i+1 < len(observedArgs) {
+			if observedArgs[i+1] == "5m" {
+				hasPrintTimeout5m = true
+			}
+			if observedArgs[i+1] == "90s" {
+				hasPrintTimeout90s = true
+			}
+		}
 	}
 
-	if !hasSandbox {
-		t.Errorf("ProfileAPI invocation missing required --sandbox flag: %v", observedArgs)
+	if hasSandbox {
+		t.Errorf("ProfileAPI invocation must not contain --sandbox: %v", observedArgs)
 	}
-	if hasDangerousSkip {
-		t.Errorf("ProfileAPI invocation must NEVER contain --dangerously-skip-permissions: %v", observedArgs)
+	if hasPlanMode {
+		t.Errorf("ProfileAPI invocation must not contain --mode: %v", observedArgs)
+	}
+	if hasDisableSlashCommands {
+		t.Errorf("ProfileAPI invocation must not contain --disable-slash-commands: %v", observedArgs)
+	}
+	if !hasDangerousSkip {
+		t.Errorf("ProfileAPI invocation must contain --dangerously-skip-permissions: %v", observedArgs)
+	}
+	if !hasPrintTimeout5m {
+		t.Errorf("ProfileAPI invocation must contain --print-timeout 5m: %v", observedArgs)
+	}
+	if hasPrintTimeout90s {
+		t.Errorf("ProfileAPI invocation must not contain --print-timeout 90s: %v", observedArgs)
 	}
 }

@@ -211,8 +211,8 @@ Antigravity CLI (agy)
    - 스트리밍: 표준 인덱스 기반 `tool_calls` 델타 생성 (call ID, function name, arguments 전달). 인자가 여러 청크로 분할되어도 클라이언트가 온전히 재조립 가능. 마지막 청크는 `finish_reason: "tool_calls"`, 정상 스트림은 `[DONE]`으로 종료. 도구 호출 스트림 중에는 도구 의도가 `content` 텍스트로 절대 유출되지 않음.
    - `role=tool` 왕복: Hermes가 도구를 실행한 후 전달하는 `role: "tool"` 메시지와 `tool_call_id`가 다음 턴의 대화 기록으로 온전히 보존되어 AGY에 전달됩니다.
 
-4. **보안 및 네이티브 격리 (Containment & Security)**:
-   - **Argv 불변조건**: ProfileAPI 호출은 항상 `--sandbox`를 유지하며, `--dangerously-skip-permissions` 플래그는 절대 사용하지 않습니다.
+4. **보안 및 실행 정책 (Execution Policy & Containment)**:
+   - **Argv 불변조건**: ProfileAPI 호출은 일반 모드(`ProfileInteractive`)와 동일한 실행 정책을 적용받아 `--dangerously-skip-permissions` 및 `--print-timeout 5m`를 사용하며, `--sandbox`, `--mode plan`, `--disable-slash-commands` 플래그는 사용하지 않습니다.
    - **소프트 격리 한계 (Soft Containment Boundary)**: AGY CLI (v1.2.1 기준)에 공식적인 `--disable-tools` 플래그가 없으므로 커넥터 레벨의 감시 기반 소프트 격리가 적용됩니다. AGY가 클라이언트 대신 네이티브 도구를 자체 실행하려 할 경우 `native_tool_containment_violation` 에러를 발생시키며, `success_no_text`나 비정상 `[DONE]`으로 덮어쓰지 않습니다.
 
 ---
