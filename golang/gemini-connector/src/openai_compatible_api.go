@@ -252,6 +252,7 @@ type FunctionDefinition struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description,omitempty"`
 	Parameters  json.RawMessage `json:"parameters,omitempty"`
+	Strict      *bool           `json:"strict,omitempty"`
 }
 
 type ToolDefinition struct {
@@ -670,7 +671,7 @@ func (s *OpenAICompatibleServer) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	s.handleChatCompletions(w, r, reqID, startTime, clientClass)
 }
 
-var rejectedFields = []string{}
+var rejectedFields = []string{"audio", "modalities"}
 
 func (s *OpenAICompatibleServer) logOutcome(reqID, method, route string, status int, code string, startTime time.Time, stream bool, model *string, queueWaitMS int64, clientClass string) {
 	if s.logger == nil {

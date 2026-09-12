@@ -223,7 +223,11 @@ func resetConversation(ctx context.Context, cfg *Config, adapter Messenger, chat
 	notice := fmt.Sprintf("⚠️ 이전 대화를 요약해 새 세션으로 전환했습니다. (새 세션 ID: %s)", truncateString(newID, 8))
 
 	if replayPrompt != "" {
-		response, rerr := executeAgy(ctx, replayPrompt, newID, AgyCallOptions{Profile: ProfileBootstrap, BypassQuotaGate: true})
+		res, rerr := executeAgy(ctx, replayPrompt, newID, AgyCallOptions{Profile: ProfileBootstrap, BypassQuotaGate: true})
+		response := ""
+		if res != nil {
+			response = res.Text
+		}
 		if rerr == nil && response != "" && ctx.Err() == nil {
 			appendTranscript(newID, "user", replayPrompt)
 			appendTranscript(newID, "assistant", response)

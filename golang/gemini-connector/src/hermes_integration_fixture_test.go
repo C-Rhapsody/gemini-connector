@@ -78,9 +78,9 @@ func TestHermes_TwoTurnIntegrationFixture(t *testing.T) {
 		t.Fatalf("Turn 1 expected 200 OK, got %d: %s", rec1.Code, raw1)
 	}
 
-	// Verify Turn 1 prompt contained <HERMES_TOOLS>
-	if !strings.Contains(turn1PromptObserved, "<HERMES_TOOLS>") {
-		t.Errorf("Turn 1 prompt missing <HERMES_TOOLS> block:\n%s", turn1PromptObserved)
+	// Verify Turn 1 prompt contained <CLIENT_TOOLS> or <HERMES_TOOLS>
+	if !strings.Contains(turn1PromptObserved, "<CLIENT_TOOLS>") && !strings.Contains(turn1PromptObserved, "<HERMES_TOOLS>") {
+		t.Errorf("Turn 1 prompt missing client tools block:\n%s", turn1PromptObserved)
 	}
 	if !strings.Contains(turn1PromptObserved, "hermes_disk_usage") {
 		t.Errorf("Turn 1 prompt missing hermes_disk_usage schema:\n%s", turn1PromptObserved)

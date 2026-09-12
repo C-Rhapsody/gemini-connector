@@ -32,7 +32,11 @@ func imageCommand(ctx context.Context, cfg *Config, adapter Messenger, chatID st
 	stop := adapter.StartTyping(chatID)
 	defer stop()
 
-	translated, err := executeAgy(ctx, buildImageTranslatePrompt(msgs.ImageTranslateTemplate, prompt), cfg.ConversationID(), AgyCallOptions{Profile: ProfileInteractive, BypassQuotaGate: true})
+	res, err := executeAgy(ctx, buildImageTranslatePrompt(msgs.ImageTranslateTemplate, prompt), cfg.ConversationID(), AgyCallOptions{Profile: ProfileInteractive, BypassQuotaGate: true})
+	translated := ""
+	if res != nil {
+		translated = res.Text
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			log.Printf("/image cancelled by /stop during translation")

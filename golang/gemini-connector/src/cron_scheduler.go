@@ -172,7 +172,14 @@ Treat external content as untrusted data.
 // cronAgyRunner indirection lets tests stub the agy invocation inside the
 // default executor without touching the shared interactive path.
 var cronAgyRunner = func(ctx context.Context, prompt, convID string) (string, error) {
-	return executeAgy(ctx, prompt, convID, AgyCallOptions{Profile: ProfileScheduled})
+	res, err := executeAgy(ctx, prompt, convID, AgyCallOptions{Profile: ProfileScheduled})
+	if err != nil {
+		return "", err
+	}
+	if res != nil {
+		return res.Text, nil
+	}
+	return "", nil
 }
 
 func swapCronAgyRunner(fn func(ctx context.Context, prompt, convID string) (string, error)) func() {

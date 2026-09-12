@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -36,186 +35,79 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 		return
 	}
 
-	// Parse into raw map to detect rejected/unsupported fields
-	var rawMap map[string]json.RawMessage
-	if err := json.Unmarshal(bodyBytes, &rawMap); err != nil {
-		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", "Malformed JSON body", "invalid_json", nil, false)
-		s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "invalid_json", startTime, false, nil, 0, clientClass)
+	normReq, valErr := ParseAndNormalizeRequest(bodyBytes)
+	if valErr != nil {
+		writeAPIError(w, valErr.Status, valErr.ErrType, valErr.Message, valErr.Code, valErr.Param, false)
+		s.logOutcome(reqID, "POST", "/v1/chat/completions", valErr.Status, valErr.Code, startTime, false, nil, 0, clientClass)
 		return
-	}
-
-	for _, field := range rejectedFields {
-		if _, ok := rawMap[field]; ok {
-			writeAPIError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Field %q is not supported", field), "unsupported_field", strPtr(field), false)
-			s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "unsupported_field", startTime, false, nil, 0, clientClass)
-			return
-		}
-	}
-
-	if nRaw, ok := rawMap["n"]; ok {
-		var n int
-		if err := json.Unmarshal(nRaw, &n); err == nil && n > 1 {
-			writeAPIError(w, http.StatusBadRequest, "invalid_request_error", "n > 1 is not supported", "unsupported_value", strPtr("n"), false)
-			s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "unsupported_value", startTime, false, nil, 0, clientClass)
-			return
-		}
-	}
-
-	var effectiveMaxCompletionTokens *int
-
-	// Validate max_tokens if present in raw JSON
-	if rawMaxTokens, ok := rawMap["max_tokens"]; ok {
-		var mt int
-		if err := json.Unmarshal(rawMaxTokens, &mt); err != nil || mt <= 0 {
-			writeAPIError(w, http.StatusBadRequest, "invalid_request_error", "max_tokens must be a positive integer", "invalid_value", strPtr("max_tokens"), false)
-			s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "invalid_value", startTime, false, nil, 0, clientClass)
-			return
-		}
-		effectiveMaxCompletionTokens = &mt
-	}
-
-	// Validate max_completion_tokens if present in raw JSON
-	if rawMCT, ok := rawMap["max_completion_tokens"]; ok {
-		var mct int
-		if err := json.Unmarshal(rawMCT, &mct); err != nil || mct <= 0 {
-			writeAPIError(w, http.StatusBadRequest, "invalid_request_error", "max_completion_tokens must be a positive integer", "invalid_value", strPtr("max_completion_tokens"), false)
-			s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "invalid_value", startTime, false, nil, 0, clientClass)
-			return
-		}
-		// Modern max_completion_tokens takes precedence if both provided
-		effectiveMaxCompletionTokens = &mct
-	}
-	_ = effectiveMaxCompletionTokens
-
-	var req ChatCompletionRequest
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", "Failed to decode completion request", "invalid_request", nil, false)
-		s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "invalid_request", startTime, false, nil, 0, clientClass)
-		return
-	}
-
-	// Normalize legacy functions to tools
-	if len(req.Functions) > 0 && len(req.Tools) == 0 {
-		for _, fn := range req.Functions {
-			fnCopy := fn
-			req.Tools = append(req.Tools, ToolDefinition{
-				Type:     "function",
-				Function: &fnCopy,
-			})
-		}
-	}
-	if req.FunctionCall != nil && req.ToolChoice == nil {
-		req.ToolChoice = req.FunctionCall
 	}
 
 	// Validate response_format and extract schema if requested
 	var schemaToPass string
-	if req.ResponseFormat != nil {
-		switch req.ResponseFormat.Type {
+	if normReq.ResponseFormat != nil {
+		switch normReq.ResponseFormat.Type {
 		case "", "text":
 			// plain text
 		case "json_object":
 			schemaToPass = `{"type":"object"}`
 		case "json_schema":
-			if req.ResponseFormat.JSONSchema != nil && len(req.ResponseFormat.JSONSchema.Schema) > 0 {
-				schemaToPass = strings.TrimSpace(string(req.ResponseFormat.JSONSchema.Schema))
-			} else if len(req.ResponseFormat.Schema) > 0 {
-				schemaToPass = strings.TrimSpace(string(req.ResponseFormat.Schema))
+			if normReq.ResponseFormat.JSONSchema != nil && len(normReq.ResponseFormat.JSONSchema.Schema) > 0 {
+				schemaToPass = strings.TrimSpace(string(normReq.ResponseFormat.JSONSchema.Schema))
+			} else if len(normReq.ResponseFormat.Schema) > 0 {
+				schemaToPass = strings.TrimSpace(string(normReq.ResponseFormat.Schema))
 			} else {
 				schemaToPass = `{"type":"object"}`
 			}
-		default:
-			writeAPIError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Unsupported response_format type %q", req.ResponseFormat.Type), "unsupported_response_format_type", strPtr("response_format.type"), false)
-			s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "unsupported_response_format_type", startTime, req.Stream, &req.Model, 0, clientClass)
-			return
-		}
-	}
-
-	if schemaToPass != "" {
-		var jsTest any
-		if err := json.Unmarshal([]byte(schemaToPass), &jsTest); err != nil {
-			writeAPIError(w, http.StatusBadRequest, "invalid_request_error", "response_format schema is not valid JSON", "invalid_response_format_schema", strPtr("response_format"), false)
-			s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "invalid_response_format_schema", startTime, req.Stream, &req.Model, 0, clientClass)
-			return
 		}
 	}
 
 	// Model validation
-	if req.Model == "" || !strings.HasPrefix(req.Model, "gemini-") {
+	if normReq.Model == "" || !strings.HasPrefix(normReq.Model, "gemini-") {
 		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", "A valid Gemini model ID is required", "model_not_found", strPtr("model"), false)
-		s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "model_not_found", startTime, req.Stream, nil, 0, clientClass)
+		s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "model_not_found", startTime, normReq.Stream, nil, 0, clientClass)
 		return
 	}
 
-	ok, valErr := s.catalog.ValidateModel(reqCtx, req.Model)
-	if valErr != nil {
+	ok, mValErr := s.catalog.ValidateModel(reqCtx, normReq.Model)
+	if mValErr != nil {
 		writeAPIError(w, http.StatusServiceUnavailable, "api_error", "Catalog unavailable", "catalog_unavailable", nil, true)
-		s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusServiceUnavailable, "catalog_unavailable", startTime, req.Stream, &req.Model, 0, clientClass)
+		s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusServiceUnavailable, "catalog_unavailable", startTime, normReq.Stream, &normReq.Model, 0, clientClass)
 		return
 	}
 	if !ok {
-		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Model %q not found in catalog", req.Model), "model_not_found", strPtr("model"), false)
-		s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "model_not_found", startTime, req.Stream, &req.Model, 0, clientClass)
-		return
-	}
-
-	// Messages validation
-	if len(req.Messages) == 0 {
-		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", "messages must be a non-empty array", "invalid_messages", strPtr("messages"), false)
-		s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "invalid_messages", startTime, req.Stream, &req.Model, 0, clientClass)
-		return
-	}
-	if len(req.Messages) > defaultMaxMessages {
-		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("messages count exceeds maximum %d", defaultMaxMessages), "messages_too_many", strPtr("messages"), false)
-		s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "messages_too_many", startTime, req.Stream, &req.Model, 0, clientClass)
-		return
-	}
-
-	totalMsgBytes := 0
-	for idx, msg := range req.Messages {
-		switch msg.Role {
-		case "developer", "system", "user", "assistant", "tool":
-		default:
-			writeAPIError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Unsupported role %q at messages[%d]", msg.Role, idx), "invalid_role", strPtr("role"), false)
-			s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "invalid_role", startTime, req.Stream, &req.Model, 0, clientClass)
-			return
-		}
-		msgStr := stringifyMessageContent(msg.Content)
-		msgLen := len(msgStr)
-		if msgLen > defaultMaxMessageBytes {
-			writeAPIError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Message at index %d exceeds maximum %d bytes", idx, defaultMaxMessageBytes), "message_too_large", strPtr("content"), false)
-			s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "message_too_large", startTime, req.Stream, &req.Model, 0, clientClass)
-			return
-		}
-		totalMsgBytes += msgLen
-	}
-	if totalMsgBytes > defaultMaxAggregateBytes {
-		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Aggregate messages content exceeds maximum %d bytes", defaultMaxAggregateBytes), "messages_aggregate_too_large", strPtr("messages"), false)
-		s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "messages_aggregate_too_large", startTime, req.Stream, &req.Model, 0, clientClass)
+		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Model %q not found in catalog", normReq.Model), "model_not_found", strPtr("model"), false)
+		s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "model_not_found", startTime, normReq.Stream, &normReq.Model, 0, clientClass)
 		return
 	}
 
 	// Drain check
 	if atomic.LoadInt32(&s.draining) == 1 {
 		writeAPIError(w, http.StatusServiceUnavailable, "api_error", "Server is shutting down", "server_draining", nil, true)
-		s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusServiceUnavailable, "server_draining", startTime, req.Stream, &req.Model, 0, clientClass)
+		s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusServiceUnavailable, "server_draining", startTime, normReq.Stream, &normReq.Model, 0, clientClass)
 		return
+	}
+
+	req := ChatCompletionRequest{
+		Model:               normReq.Model,
+		Messages:            normReq.Messages,
+		Stream:              normReq.Stream,
+		Tools:               normReq.Tools,
+		ToolChoice:          normReq.ToolChoice,
+		ResponseFormat:      normReq.ResponseFormat,
+		Stop:                normReq.Stop,
+		MaxCompletionTokens: normReq.MaxCompletionTokens,
+		StreamOptions:       normReq.StreamOptions,
+		Temperature:         normReq.Temperature,
+		TopP:                normReq.TopP,
+		Seed:                normReq.Seed,
+		PresencePenalty:     normReq.PresencePenalty,
+		FrequencyPenalty:    normReq.FrequencyPenalty,
+		User:                normReq.User,
+		Metadata:            normReq.Metadata,
 	}
 
 	hasTools := len(req.Tools) > 0
-	parsedToolChoice, tcErr := ParseToolChoice(req.ToolChoice, req.Tools)
-	if tcErr != nil {
-		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Invalid tool_choice: %v", tcErr), "invalid_tool_choice", strPtr("tool_choice"), false)
-		s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "invalid_tool_choice", startTime, req.Stream, &req.Model, 0, clientClass)
-		return
-	}
-
-	convID := s.getConversationID()
-	if convID == "" {
-		writeAPIError(w, http.StatusInternalServerError, "server_error", "Missing AGY_CONVERSATION_ID configuration", "missing_conversation_id", nil, false)
-		s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusInternalServerError, "missing_conversation_id", startTime, req.Stream, &req.Model, 0, clientClass)
-		return
-	}
+	parsedToolChoice := normReq.ToolChoice
 
 	remoteHistory, remoteHistoryErr := ParseRemoteHistoryRequest(r.Header)
 	if remoteHistoryErr != nil {
@@ -224,34 +116,31 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 		return
 	}
 
-	var systemMsgs, priorTranscriptMsgs, currentTurnMsgs []ChatMessage
-	var historyHash string
-	if remoteHistory.Enabled {
-		var splitErr error
-		systemMsgs, currentTurnMsgs, splitErr = SplitRemoteHistoryMessages(req.Messages, remoteHistory.Sequence)
-		if splitErr != nil {
-			writeAPIError(w, http.StatusBadRequest, "invalid_request_error", splitErr.Error(), "invalid_history_protocol", nil, false)
-			s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "invalid_history_protocol", startTime, req.Stream, &req.Model, 0, clientClass)
-			return
-		}
-	} else {
-		systemMsgs, priorTranscriptMsgs, currentTurnMsgs = ExtractCurrentTurn(req.Messages)
-		historyHash = ComputeHistoryHash(priorTranscriptMsgs)
+	convID := s.getConversationID()
+	if remoteHistory.Enabled && convID == "" {
+		writeAPIError(w, http.StatusInternalServerError, "server_error", "Missing AGY_CONVERSATION_ID configuration for remote history", "missing_conversation_id", nil, false)
+		s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusInternalServerError, "missing_conversation_id", startTime, req.Stream, &req.Model, 0, clientClass)
+		return
 	}
-
 	var prompt string
 	var renderErr error
 	var isResumeTurn bool
 
 	if remoteHistory.Enabled {
+		systemMsgs, currentTurnMsgs, splitErr := SplitRemoteHistoryMessages(req.Messages, remoteHistory.Sequence)
+		if splitErr != nil {
+			writeAPIError(w, http.StatusBadRequest, "invalid_request_error", splitErr.Error(), "invalid_history_protocol", nil, false)
+			s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "invalid_history_protocol", startTime, req.Stream, &req.Model, 0, clientClass)
+			return
+		}
 		isResumeTurn = true
 		prompt, renderErr = RenderRemoteHistoryPrompt(systemMsgs, currentTurnMsgs, req.Tools, req.ToolChoice, remoteHistory.Sequence)
-	} else if len(priorTranscriptMsgs) > 0 && s.syncTracker != nil && s.syncTracker.IsSessionSynced(convID) {
+	} else if convID != "" && s.syncTracker != nil && s.syncTracker.IsSessionSynced(convID) {
+		systemMsgs, _, currentTurnMsgs := ExtractCurrentTurn(req.Messages)
 		isResumeTurn = true
 		prompt, renderErr = RenderTurnPromptWithTools(systemMsgs, currentTurnMsgs, req.Tools, req.ToolChoice)
-	} else if len(priorTranscriptMsgs) > 0 {
-		prompt, _, _, renderErr = CompactPromptWithTools(req.Messages, req.Tools, req.ToolChoice, DefaultCompactionBudget)
 	} else {
+		// Standard chat completions: full messages array is authoritative context!
 		prompt, renderErr = RenderPromptWithTools(req.Messages, req.Tools, req.ToolChoice)
 	}
 
@@ -294,6 +183,7 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 	jobDone := make(chan struct{})
 	var turnErr error
 	var turnResp string
+	var turnResult *CompletionResult
 	var turnUsage *AgyUsage
 
 	s.activeJobs.Add(1)
@@ -363,29 +253,17 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 			}
 
 			var writeMu sync.Mutex
-			writeEvent := func(data []byte) error {
-				writeMu.Lock()
-				defer writeMu.Unlock()
-				if jobCtx.Err() != nil || reqCtx.Err() != nil {
-					return jobCtx.Err()
-				}
-				if _, err := fmt.Fprintf(w, "data: %s\n\n", string(data)); err != nil {
-					return err
-				}
-				safeFlush()
-				return nil
+			flushingWriter := &FlushingWriter{
+				W:       w,
+				Flusher: safeFlush,
+				Mu:      &writeMu,
+				IsDropped: func() bool {
+					return jobCtx.Err() != nil || reqCtx.Err() != nil
+				},
 			}
 			writeRaw := func(format string, args ...any) error {
-				writeMu.Lock()
-				defer writeMu.Unlock()
-				if jobCtx.Err() != nil || reqCtx.Err() != nil {
-					return jobCtx.Err()
-				}
-				if _, err := fmt.Fprintf(w, format, args...); err != nil {
-					return err
-				}
-				safeFlush()
-				return nil
+				_, err := fmt.Fprintf(flushingWriter, format, args...)
+				return err
 			}
 
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -436,16 +314,8 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 			}()
 
 			created := time.Now().Unix()
-			// Role chunk is the first SSE frame
-			roleChunk := ChatCompletionChunk{
-				ID:      "chatcmpl-" + reqID,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   req.Model,
-				Choices: []ChunkChoice{{Index: 0, Delta: ChunkDelta{Role: "assistant"}, FinishReason: nil}},
-			}
-			roleBytes, _ := json.Marshal(roleChunk)
-			if err := writeEvent(roleBytes); err != nil {
+			streamWriter := NewStreamWriter(flushingWriter, reqID, req.Model, created)
+			if err := streamWriter.WriteRole(); err != nil {
 				turnErr = err
 				return
 			}
@@ -454,12 +324,11 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 			if replayResult != nil {
 				cumText.WriteString(replayResult.Response)
 			}
-			stopped := false
+			stopFilter := NewStopFilter(stopSeqs)
 			streamCb := func(delta string) error {
 				if jobCtx.Err() != nil || reqCtx.Err() != nil {
 					return jobCtx.Err()
 				}
-				prevLen := cumText.Len()
 				cumText.WriteString(delta)
 
 				if hasTools {
@@ -467,51 +336,24 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 					return nil
 				}
 
-				if stopped {
+				if stopFilter.IsStopped() {
 					return nil
 				}
-				curStr := cumText.String()
 
-				if len(stopSeqs) > 0 {
-					truncated, hitStop := applyStopSequences(curStr, stopSeqs)
-					if hitStop {
-						stopped = true
-						if len(truncated) > prevLen {
-							emitDelta := truncated[prevLen:]
-							chunk := ChatCompletionChunk{
-								ID:      "chatcmpl-" + reqID,
-								Object:  "chat.completion.chunk",
-								Created: created,
-								Model:   req.Model,
-								Choices: []ChunkChoice{{Index: 0, Delta: ChunkDelta{Content: emitDelta}, FinishReason: nil}},
-							}
-							b, _ := json.Marshal(chunk)
-							return writeEvent(b)
-						}
-						return nil
-					}
+				toEmit, _ := stopFilter.Feed(delta)
+				if toEmit != "" {
+					return streamWriter.WriteContentDelta(toEmit)
 				}
-
-				chunk := ChatCompletionChunk{
-					ID:      "chatcmpl-" + reqID,
-					Object:  "chat.completion.chunk",
-					Created: created,
-					Model:   req.Model,
-					Choices: []ChunkChoice{{Index: 0, Delta: ChunkDelta{Content: delta}, FinishReason: nil}},
-				}
-				b, mErr := json.Marshal(chunk)
-				if mErr != nil {
-					return mErr
-				}
-				return writeEvent(b)
+				return nil
 			}
 
 			var actualUsage *AgyUsage
 			var streamErr error
 			if replayResult != nil {
 				actualUsage = cloneAgyUsage(replayResult.Usage)
+				turnResult = &CompletionResult{Status: "SUCCESS", Text: replayResult.Response, Usage: actualUsage}
 			} else {
-				_, streamErr = s.executor.Execute(execCtx, prompt, convID, AgyCallOptions{
+				turnResult, streamErr = s.executor.Execute(execCtx, prompt, convID, AgyCallOptions{
 					Profile:                   ProfileAPI,
 					Model:                     req.Model,
 					Stream:                    true,
@@ -522,6 +364,9 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 					UsageCallback: func(u *AgyUsage) {
 						actualUsage = u
 					},
+					Tools:      req.Tools,
+					ToolChoice: parsedToolChoice,
+					Stop:       stopSeqs,
 				})
 			}
 			if remoteReplayOwner && streamErr != nil {
@@ -537,7 +382,7 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 					}
 					fallbackPrompt, _, _, fbErr := CompactPromptWithTools(req.Messages, req.Tools, req.ToolChoice, DefaultCompactionBudget)
 					if fbErr == nil {
-						_, streamErr = s.executor.Execute(execCtx, fallbackPrompt, convID, AgyCallOptions{
+						turnResult, streamErr = s.executor.Execute(execCtx, fallbackPrompt, convID, AgyCallOptions{
 							Profile:                   ProfileAPI,
 							Model:                     req.Model,
 							Stream:                    true,
@@ -548,12 +393,25 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 							UsageCallback: func(u *AgyUsage) {
 								actualUsage = u
 							},
+							Tools:      req.Tools,
+							ToolChoice: parsedToolChoice,
+							Stop:       stopSeqs,
 						})
 					}
 				}
 			}
-			if streamErr == nil && s.syncTracker != nil && !remoteHistory.Enabled {
-				s.syncTracker.MarkSessionSynced(convID, historyHash, len(req.Messages))
+			if streamErr == nil && s.syncTracker != nil && remoteHistory.Enabled && convID != "" {
+				s.syncTracker.MarkSessionSynced(convID, "", len(req.Messages))
+			}
+			if turnResult != nil && turnResult.Usage != nil && actualUsage == nil {
+				actualUsage = turnResult.Usage
+			}
+			turnErr = streamErr
+			if streamErr == nil && turnResult != nil && turnResult.IsError {
+				turnErr = &AgyError{Type: turnResult.ErrorCode, Detail: turnResult.ErrorMessage}
+			}
+			if turnErr == nil {
+				turnUsage = actualUsage
 			}
 			if streamErr != nil {
 				// If the stream ended because the client disconnected or context timed out/canceled,
@@ -567,152 +425,43 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 				if ae, ok := streamErr.(*AgyError); ok && ae.Type != "" {
 					errCode = ae.Type
 				}
-				errEvent := APIErrorResponse{
-					Error: APIErrorBody{
-						Message: "Upstream error during stream",
-						Type:    "api_error",
-						Code:    errCode,
-					},
-				}
-				errBytes, _ := json.Marshal(errEvent)
-				_ = writeRaw("event: error\ndata: %s\n\n", string(errBytes))
+				_ = streamWriter.WriteError("Upstream error during stream", errCode)
 				turnErr = streamErr
 				return
 			}
 
 			if hasTools {
-				env, envErr := ParseAndValidateAgyEnvelope(cumText.String(), req.Tools, parsedToolChoice)
-				if envErr != nil {
-					errEvent := APIErrorResponse{
-						Error: APIErrorBody{
-							Message: fmt.Sprintf("Tool envelope validation failed: %v", envErr),
-							Type:    "api_error",
-							Code:    "invalid_tool_envelope",
-						},
+				if turnResult != nil && len(turnResult.ToolCalls) > 0 {
+					if err := streamWriter.WriteToolCallIntent(turnResult.ToolCalls); err != nil {
+						turnErr = err
+						return
 					}
-					errBytes, _ := json.Marshal(errEvent)
-					_ = writeRaw("event: error\ndata: %s\n\n", string(errBytes))
-					turnErr = &AgyError{Type: "invalid_tool_envelope", Detail: envErr.Error()}
-					return
-				}
-
-				if env.Type == "tool_call" {
-					for i, call := range env.Calls {
-						callIdx := i
-						// 1. Initial tool call chunk with ID, type, and function name
-						tcStart := ToolCall{
-							Index: &callIdx,
-							ID:    call.ID,
-							Type:  "function",
-							Function: ToolCallFunction{
-								Name: call.Name,
-							},
-						}
-						cStart := ChatCompletionChunk{
-							ID:      "chatcmpl-" + reqID,
-							Object:  "chat.completion.chunk",
-							Created: created,
-							Model:   req.Model,
-							Choices: []ChunkChoice{{Index: 0, Delta: ChunkDelta{ToolCalls: []ToolCall{tcStart}}, FinishReason: nil}},
-						}
-						bStart, _ := json.Marshal(cStart)
-						if err := writeEvent(bStart); err != nil {
-							turnErr = err
-							return
-						}
-
-						// 2. Arguments chunk(s)
-						argsStr := call.ArgumentsStr
-						var argParts []string
-						if len(argsStr) > 30 {
-							mid := len(argsStr) / 2
-							argParts = []string{argsStr[:mid], argsStr[mid:]}
-						} else {
-							argParts = []string{argsStr}
-						}
-						for _, part := range argParts {
-							tcArgs := ToolCall{
-								Index: &callIdx,
-								Function: ToolCallFunction{
-									Arguments: part,
-								},
-							}
-							cArgs := ChatCompletionChunk{
-								ID:      "chatcmpl-" + reqID,
-								Object:  "chat.completion.chunk",
-								Created: created,
-								Model:   req.Model,
-								Choices: []ChunkChoice{{Index: 0, Delta: ChunkDelta{ToolCalls: []ToolCall{tcArgs}}, FinishReason: nil}},
-							}
-							bArgs, _ := json.Marshal(cArgs)
-							if err := writeEvent(bArgs); err != nil {
-								turnErr = err
-								return
-							}
-						}
-					}
-
-					// Terminal finish chunk with finish_reason: "tool_calls"
-					finishReason := "tool_calls"
-					finishChunk := ChatCompletionChunk{
-						ID:      "chatcmpl-" + reqID,
-						Object:  "chat.completion.chunk",
-						Created: created,
-						Model:   req.Model,
-						Choices: []ChunkChoice{{Index: 0, Delta: ChunkDelta{}, FinishReason: &finishReason}},
-					}
-					fBytes, _ := json.Marshal(finishChunk)
-					if err := writeEvent(fBytes); err != nil {
+					if err := streamWriter.WriteFinish("tool_calls"); err != nil {
 						turnErr = err
 						return
 					}
 				} else {
-					// env.Type == "final"
 					contentStr := ""
-					if env.Content != nil {
-						contentStr = *env.Content
-					}
-					if len(stopSeqs) > 0 {
-						contentStr, _ = applyStopSequences(contentStr, stopSeqs)
+					if turnResult != nil {
+						contentStr = turnResult.Text
+					} else {
+						contentStr = cumText.String()
 					}
 					if contentStr != "" {
-						cContent := ChatCompletionChunk{
-							ID:      "chatcmpl-" + reqID,
-							Object:  "chat.completion.chunk",
-							Created: created,
-							Model:   req.Model,
-							Choices: []ChunkChoice{{Index: 0, Delta: ChunkDelta{Content: contentStr}, FinishReason: nil}},
-						}
-						bContent, _ := json.Marshal(cContent)
-						if err := writeEvent(bContent); err != nil {
+						if err := streamWriter.WriteContentDelta(contentStr); err != nil {
 							turnErr = err
 							return
 						}
 					}
-
-					finishReason := "stop"
-					finishChunk := ChatCompletionChunk{
-						ID:      "chatcmpl-" + reqID,
-						Object:  "chat.completion.chunk",
-						Created: created,
-						Model:   req.Model,
-						Choices: []ChunkChoice{{Index: 0, Delta: ChunkDelta{}, FinishReason: &finishReason}},
-					}
-					fBytes, _ := json.Marshal(finishChunk)
-					if err := writeEvent(fBytes); err != nil {
+					if err := streamWriter.WriteFinish("stop"); err != nil {
 						turnErr = err
 						return
 					}
 				}
 			} else {
-				// Terminal finish chunk for no-tools mode
-				stopStr := "stop"
-				var ext *GeminiConnectorExtension
-				if cumText.Len() == 0 {
-					ext = &GeminiConnectorExtension{
-						State:     "success_no_text",
-						Retryable: false,
-					}
+				// Flush any held back suffix from StopFilter
+				if remaining := stopFilter.Flush(); remaining != "" {
+					_ = streamWriter.WriteContentDelta(remaining)
 				}
 				if replayResult != nil && cumText.Len() > 0 {
 					content := cumText.String()
@@ -720,33 +469,10 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 						content, _ = applyStopSequences(content, stopSeqs)
 					}
 					if content != "" {
-						contentChunk := ChatCompletionChunk{
-							ID:      "chatcmpl-" + reqID,
-							Object:  "chat.completion.chunk",
-							Created: created,
-							Model:   req.Model,
-							Choices: []ChunkChoice{{Index: 0, Delta: ChunkDelta{Content: content}, FinishReason: nil}},
-						}
-						contentBytes, _ := json.Marshal(contentChunk)
-						if err := writeEvent(contentBytes); err != nil {
-							turnErr = err
-							return
-						}
+						_ = streamWriter.WriteContentDelta(content)
 					}
 				}
-				finishChunk := ChatCompletionChunk{
-					ID:               "chatcmpl-" + reqID,
-					Object:           "chat.completion.chunk",
-					Created:          created,
-					Model:            req.Model,
-					Choices:          []ChunkChoice{{Index: 0, Delta: ChunkDelta{}, FinishReason: &stopStr}},
-					XGeminiConnector: ext,
-				}
-				fBytes, _ := json.Marshal(finishChunk)
-				if err := writeEvent(fBytes); err != nil {
-					turnErr = err
-					return
-				}
+				_ = streamWriter.WriteFinish("stop")
 			}
 
 			if remoteReplayOwner {
@@ -758,32 +484,22 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 			if wantUsage && actualUsage != nil {
 				mappedUsage := mapAgyUsageForRequest(actualUsage, remoteHistory.Enabled)
 				if mappedUsage != nil {
-					usageChunk := ChatCompletionChunk{
-						ID:      "chatcmpl-" + reqID,
-						Object:  "chat.completion.chunk",
-						Created: created,
-						Model:   req.Model,
-						Choices: []ChunkChoice{},
-						Usage:   mappedUsage,
-					}
-					uBytes, _ := json.Marshal(usageChunk)
-					if err := writeEvent(uBytes); err != nil {
-						turnErr = err
-						return
-					}
+					_ = streamWriter.WriteUsage(mappedUsage)
 				}
 			}
 
-			_ = writeRaw("data: [DONE]\n\n")
+			_ = streamWriter.WriteDone()
 		} else {
 			var actualUsage *AgyUsage
 			var resp string
+			var compResult *CompletionResult
 			var nonStreamErr error
 			if replayResult != nil {
 				resp = replayResult.Response
 				actualUsage = cloneAgyUsage(replayResult.Usage)
+				compResult = &CompletionResult{Status: "SUCCESS", Text: resp, Usage: actualUsage}
 			} else {
-				resp, nonStreamErr = s.executor.Execute(execCtx, prompt, convID, AgyCallOptions{
+				compResult, nonStreamErr = s.executor.Execute(execCtx, prompt, convID, AgyCallOptions{
 					Profile:                   ProfileAPI,
 					Model:                     req.Model,
 					Stream:                    false,
@@ -793,22 +509,22 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 					UsageCallback: func(u *AgyUsage) {
 						actualUsage = u
 					},
+					Tools:      req.Tools,
+					ToolChoice: parsedToolChoice,
+					Stop:       stopSeqs,
 				})
+				if compResult != nil {
+					resp = compResult.Text
+					if compResult.Usage != nil && actualUsage == nil {
+						actualUsage = compResult.Usage
+					}
+				}
 			}
 			if remoteReplayOwner {
-				if nonStreamErr != nil {
+				if nonStreamErr != nil || (compResult != nil && compResult.IsError) {
 					s.getRemoteReplayLedger().Abort(convID, remoteHistory, replayFingerprint)
 					replayFinalized = true
-				} else if hasTools {
-					if _, validationErr := ParseAndValidateAgyEnvelope(resp, req.Tools, parsedToolChoice); validationErr != nil {
-						nonStreamErr = &AgyError{Type: "invalid_tool_envelope", Detail: validationErr.Error()}
-						s.getRemoteReplayLedger().Abort(convID, remoteHistory, replayFingerprint)
-						replayFinalized = true
-					} else {
-						s.getRemoteReplayLedger().Complete(convID, remoteHistory, replayFingerprint, resp, actualUsage)
-						replayFinalized = true
-					}
-				} else {
+				} else if compResult != nil {
 					s.getRemoteReplayLedger().Complete(convID, remoteHistory, replayFingerprint, resp, actualUsage)
 					replayFinalized = true
 				}
@@ -817,12 +533,12 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 				var ae *AgyError
 				if errors.As(nonStreamErr, &ae) && ae.Type == "session_resume_failed" {
 					log.Printf("[Compaction Fallback] session resume failed for %s, falling back to structured compaction", reqID)
-					if s.syncTracker != nil {
+					if s.syncTracker != nil && convID != "" {
 						s.syncTracker.ResetSession(convID)
 					}
 					fallbackPrompt, _, _, fbErr := CompactPromptWithTools(req.Messages, req.Tools, req.ToolChoice, DefaultCompactionBudget)
 					if fbErr == nil {
-						resp, nonStreamErr = s.executor.Execute(execCtx, fallbackPrompt, convID, AgyCallOptions{
+						compResult, nonStreamErr = s.executor.Execute(execCtx, fallbackPrompt, convID, AgyCallOptions{
 							Profile:                   ProfileAPI,
 							Model:                     req.Model,
 							Stream:                    false,
@@ -832,19 +548,29 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 							UsageCallback: func(u *AgyUsage) {
 								actualUsage = u
 							},
+							Tools:      req.Tools,
+							ToolChoice: parsedToolChoice,
+							Stop:       stopSeqs,
 						})
+						if compResult != nil {
+							resp = compResult.Text
+							if compResult.Usage != nil && actualUsage == nil {
+								actualUsage = compResult.Usage
+							}
+						}
 					}
 				}
 			}
-			if nonStreamErr == nil && s.syncTracker != nil && !remoteHistory.Enabled {
-				s.syncTracker.MarkSessionSynced(convID, historyHash, len(req.Messages))
-			}
-			if len(stopSeqs) > 0 && nonStreamErr == nil && !hasTools {
-				resp, _ = applyStopSequences(resp, stopSeqs)
+			if nonStreamErr == nil && s.syncTracker != nil && remoteHistory.Enabled && convID != "" {
+				s.syncTracker.MarkSessionSynced(convID, "", len(req.Messages))
 			}
 			turnResp = resp
+			turnResult = compResult
 			turnErr = nonStreamErr
-			if nonStreamErr == nil {
+			if nonStreamErr == nil && compResult != nil {
+				if compResult.IsError {
+					turnErr = &AgyError{Type: compResult.ErrorCode, Detail: compResult.ErrorMessage}
+				}
 				turnUsage = actualUsage
 			}
 		}
@@ -910,7 +636,8 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 	}
 
 	if turnErr != nil {
-		ae, isAgyErr := turnErr.(*AgyError)
+		var ae *AgyError
+		isAgyErr := errors.As(turnErr, &ae)
 		status := http.StatusInternalServerError
 		code := "upstream_error"
 		retry := false
@@ -941,6 +668,9 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 			case "invalid_tool_envelope":
 				status = http.StatusBadRequest
 				code = "invalid_tool_envelope"
+			case "upstream_no_output":
+				status = http.StatusBadGateway
+				code = "upstream_no_output"
 			case "remote_request_in_progress":
 				status = http.StatusServiceUnavailable
 				code = "remote_request_in_progress"
@@ -951,6 +681,9 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 				retry = true
 			}
 		}
+		if turnResult != nil && turnResult.HTTPStatus != 0 {
+			status = turnResult.HTTPStatus
+		}
 		if !streamHeadersSent.Load() {
 			writeAPIError(w, status, "api_error", "Execution failed", code, nil, retry)
 		}
@@ -959,93 +692,17 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 	}
 
 	if !req.Stream {
-		if hasTools {
-			env, envErr := ParseAndValidateAgyEnvelope(turnResp, req.Tools, parsedToolChoice)
-			if envErr != nil {
-				writeAPIError(w, http.StatusBadRequest, "api_error", fmt.Sprintf("Tool envelope validation failed: %v", envErr), "invalid_tool_envelope", nil, false)
-				s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "invalid_tool_envelope", startTime, req.Stream, &req.Model, queueWaitMS.Load(), clientClass)
-				return
+		if turnResult == nil {
+			turnResult = &CompletionResult{
+				Text:         turnResp,
+				Usage:        turnUsage,
+				FinishReason: "stop",
 			}
-
-			var choice ChatCompletionChoice
-			choice.Index = 0
-			if env.Type == "tool_call" {
-				var tcList []ToolCall
-				for _, call := range env.Calls {
-					tcList = append(tcList, ToolCall{
-						ID:   call.ID,
-						Type: "function",
-						Function: ToolCallFunction{
-							Name:      call.Name,
-							Arguments: call.ArgumentsStr,
-						},
-					})
-				}
-				choice.Message = ChatMessage{
-					Role:      "assistant",
-					Content:   nil,
-					ToolCalls: tcList,
-				}
-				choice.FinishReason = "tool_calls"
-			} else {
-				var contentVal any = ""
-				if env.Content != nil {
-					contentVal = *env.Content
-				}
-				if s, ok := contentVal.(string); ok && len(stopSeqs) > 0 {
-					s, _ = applyStopSequences(s, stopSeqs)
-					contentVal = s
-				}
-				choice.Message = ChatMessage{
-					Role:    "assistant",
-					Content: contentVal,
-				}
-				choice.FinishReason = "stop"
-			}
-
-			respObj := ChatCompletionResponse{
-				ID:      "chatcmpl-" + reqID,
-				Object:  "chat.completion",
-				Created: time.Now().Unix(),
-				Model:   req.Model,
-				Choices: []ChatCompletionChoice{choice},
-				Usage:   mapAgyUsageForRequest(turnUsage, remoteHistory.Enabled),
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(respObj)
-		} else {
-			var contentVal any = turnResp
-			var ext *GeminiConnectorExtension
-			if turnResp == "" {
-				contentVal = nil
-				ext = &GeminiConnectorExtension{
-					State:     "success_no_text",
-					Retryable: false,
-				}
-			}
-			respObj := ChatCompletionResponse{
-				ID:      "chatcmpl-" + reqID,
-				Object:  "chat.completion",
-				Created: time.Now().Unix(),
-				Model:   req.Model,
-				Choices: []ChatCompletionChoice{
-					{
-						Index: 0,
-						Message: ChatMessage{
-							Role:    "assistant",
-							Content: contentVal,
-						},
-						FinishReason: "stop",
-					},
-				},
-				Usage:            mapAgyUsageForRequest(turnUsage, remoteHistory.Enabled),
-				XGeminiConnector: ext,
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(respObj)
 		}
+		if turnResult.Usage == nil && turnUsage != nil {
+			turnResult.Usage = turnUsage
+		}
+		_ = WriteNonStreamResponse(w, reqID, req.Model, turnResult, remoteHistory.Enabled)
 	}
 
 	s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusOK, "", startTime, req.Stream, &req.Model, queueWaitMS.Load(), clientClass)

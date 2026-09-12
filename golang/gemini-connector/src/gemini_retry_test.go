@@ -37,8 +37,8 @@ func TestExecuteAgy_TransientStreamLag_RetriesAndSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected executeAgy to succeed on retry, got err: %v", err)
 	}
-	if resp != "Recovered successfully on retry!" {
-		t.Fatalf("unexpected response: %q", resp)
+	if resp.Text != "Recovered successfully on retry!" {
+		t.Fatalf("unexpected response: %q", resp.Text)
 	}
 	if attempts != 2 {
 		t.Fatalf("expected exactly 2 attempts, got %d", attempts)
@@ -236,8 +236,8 @@ func TestExecuteAgy_SalvagedResponseOnStreamLag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected executeAgy to salvage response, got err: %v", err)
 	}
-	if resp != "The price is 100 USD." {
-		t.Fatalf("unexpected salvaged response: %q", resp)
+	if resp.Text != "The price is 100 USD." {
+		t.Fatalf("unexpected salvaged response: %q", resp.Text)
 	}
 	if attempts != 1 {
 		t.Fatalf("expected 1 attempt because turn was salvaged, got %d", attempts)

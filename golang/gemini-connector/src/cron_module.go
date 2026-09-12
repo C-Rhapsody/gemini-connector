@@ -97,7 +97,11 @@ func newCronPlanner(turns *TurnCoordinator, convID func() string) cronPlannerFun
 		// the waiting caller immediately instead of letting its 6-minute
 		// budget expire silently.
 		turns.SubmitManaged(func(ctx context.Context) {
-			resp, err := executeAgy(ctx, prompt, convID(), AgyCallOptions{Profile: ProfilePlanner})
+			res, err := executeAgy(ctx, prompt, convID(), AgyCallOptions{Profile: ProfilePlanner})
+			resp := ""
+			if res != nil {
+				resp = res.Text
+			}
 			ch <- plannerResult{response: resp, err: err}
 		}, func() {
 			ch <- plannerResult{err: errCronPlannerStopped}

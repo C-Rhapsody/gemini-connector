@@ -24,6 +24,8 @@ func ParseToolChoice(toolChoice any, tools []ToolDefinition) (ParsedToolChoice, 
 	}
 
 	switch tc := toolChoice.(type) {
+	case ParsedToolChoice:
+		return tc, nil
 	case string:
 		s := strings.TrimSpace(tc)
 		switch s {

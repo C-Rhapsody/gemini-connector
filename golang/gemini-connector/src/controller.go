@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -221,7 +222,7 @@ func (c *Controller) runChatTurn(ctx context.Context, adapter Messenger, ev Inbo
 	// AI-produced and eligible for attachment delivery.
 	turnStart := time.Now()
 
-	response, err := c.executor.Execute(ctx, ev.Content, c.cfg.ConversationID(), AgyCallOptions{})
+	result, err := c.executor.Execute(ctx, ev.Content, c.cfg.ConversationID(), AgyCallOptions{})
 	if err != nil {
 		if ctx.Err() != nil {
 			// Cancelled via /stop: stay silent, the stop notice already went out.
@@ -238,6 +239,12 @@ func (c *Controller) runChatTurn(ctx context.Context, adapter Messenger, ev Inbo
 		log.Printf("agy turn cancelled by /stop (after completion): %s", truncateString(ev.Content, 50))
 		return
 	}
+
+	response := ""
+	if result != nil {
+		response = result.Text
+	}
+
 	if response != "" {
 		appendTranscript(c.cfg.ConversationID(), "user", ev.Content)
 		appendTranscript(c.cfg.ConversationID(), "assistant", response)
@@ -257,52 +264,64 @@ func (c *Controller) runChatTurn(ctx context.Context, adapter Messenger, ev Inbo
 // stuck-conversation self-healing rules.
 func (c *Controller) deliverTurnError(ctx context.Context, adapter Messenger, ev InboundEvent, err error) {
 	replyOpt := c.replyOpt(ev)
-	ae, ok := err.(*AgyError)
-	if !ok {
-		return
-	}
-	switch ae.Type {
-	case "cli_failure":
-		adapter.Send(ev.ChatID, fmt.Sprintf(c.msgs.ErrorCLIFailure, ae.Err, ae.Detail), replyOpt)
-	case "json_parse_fail":
-		adapter.Send(ev.ChatID, c.msgs.ErrorJSONParseFail, replyOpt)
-	case "quota_cooldown":
-		adapter.Send(ev.ChatID, fmt.Sprintf(c.msgs.ErrorSystemResponse, ae.Detail), replyOpt)
-	case "error_status":
-		detail := ae.Detail
-		// 429 quota exhaustion: start/refresh cooldown and answer with the
-		// decremented error text.
-		if QuotaCapture(detail) {
-			adapter.Send(ev.ChatID, fmt.Sprintf(c.msgs.ErrorSystemResponse, QuotaRefreshedDetail()), replyOpt)
+	var ae *AgyError
+	if errors.As(err, &ae) {
+		switch ae.Type {
+		case "cli_failure":
+			adapter.Send(ev.ChatID, fmt.Sprintf(c.msgs.ErrorCLIFailure, ae.Err, ae.Detail), replyOpt)
 			return
-		}
-		if extractUrlFetchFailure(detail) != "" && c.cfg.recordStuckError("url_fetch", detail) {
-			log.Printf("Stuck conversation detected (repeated URL fetch failure), resetting session")
-			resetConversation(ctx, c.cfg, adapter, ev.ChatID, ev.MessageID, ev.Content, c.msgs)
+		case "json_parse_fail":
+			adapter.Send(ev.ChatID, c.msgs.ErrorJSONParseFail, replyOpt)
 			return
-		}
-		// Conversation-state validation failures poison every subsequent
-		// turn; auto-reset after a repeat.
-		if strings.Contains(detail, "invalid arguments") {
-			if c.cfg.recordStuckError("invalid_args", detail) {
-				log.Printf("Repeated invalid-arguments errors, auto-resetting session")
+		case "quota_cooldown":
+			adapter.Send(ev.ChatID, fmt.Sprintf(c.msgs.ErrorSystemResponse, ae.Detail), replyOpt)
+			return
+		case "launch_timeout":
+			adapter.Send(ev.ChatID, fmt.Sprintf(c.msgs.ErrorSystemResponse, "timed out waiting for agy launch lock"), replyOpt)
+			return
+		case "error_status":
+			detail := ae.Detail
+			// 429 quota exhaustion: start/refresh cooldown and answer with the
+			// decremented error text.
+			if QuotaCapture(detail) {
+				adapter.Send(ev.ChatID, fmt.Sprintf(c.msgs.ErrorSystemResponse, QuotaRefreshedDetail()), replyOpt)
+				return
+			}
+			if extractUrlFetchFailure(detail) != "" && c.cfg.recordStuckError("url_fetch", detail) {
+				log.Printf("Stuck conversation detected (repeated URL fetch failure), resetting session")
 				resetConversation(ctx, c.cfg, adapter, ev.ChatID, ev.MessageID, ev.Content, c.msgs)
 				return
 			}
-			adapter.Send(ev.ChatID, fmt.Sprintf(c.msgs.ErrorSystemResponse, detail+invalidArgsHint), replyOpt)
+			// Conversation-state validation failures poison every subsequent
+			// turn; auto-reset after a repeat.
+			if strings.Contains(detail, "invalid arguments") {
+				if c.cfg.recordStuckError("invalid_args", detail) {
+					log.Printf("Repeated invalid-arguments errors, auto-resetting session")
+					resetConversation(ctx, c.cfg, adapter, ev.ChatID, ev.MessageID, ev.Content, c.msgs)
+					return
+				}
+				adapter.Send(ev.ChatID, fmt.Sprintf(c.msgs.ErrorSystemResponse, detail+invalidArgsHint), replyOpt)
+				return
+			}
+			// Any other repeating error_status: fall back to a fresh session
+			// WITHOUT replaying the failing prompt — such errors are often
+			// environmental or model-behavioural, so replaying would just burn
+			// quota in a loop.
+			if c.cfg.recordStuckError("generic", detail) {
+				log.Printf("Repeated error detected, auto-resetting session without replay")
+				resetConversation(ctx, c.cfg, adapter, ev.ChatID, ev.MessageID, "", c.msgs)
+				return
+			}
+			adapter.Send(ev.ChatID, fmt.Sprintf(c.msgs.ErrorSystemResponse, detail), replyOpt)
+			return
+		case "authentication_required":
+			adapter.Send(ev.ChatID, "⚠️ agy 인증이 필요합니다. 터미널에서 'agy'를 한 번 실행해 인증을 완료한 뒤 봇을 재시작하세요.", replyOpt)
 			return
 		}
-		// Any other repeating error_status: fall back to a fresh session
-		// WITHOUT replaying the failing prompt — such errors are often
-		// environmental or model-behavioural, so replaying would just burn
-		// quota in a loop.
-		if c.cfg.recordStuckError("generic", detail) {
-			log.Printf("Repeated error detected, auto-resetting session without replay")
-			resetConversation(ctx, c.cfg, adapter, ev.ChatID, ev.MessageID, "", c.msgs)
-			return
-		}
-		adapter.Send(ev.ChatID, fmt.Sprintf(c.msgs.ErrorSystemResponse, detail), replyOpt)
-	case "authentication_required":
-		adapter.Send(ev.ChatID, "⚠️ agy 인증이 필요합니다. 터미널에서 'agy'를 한 번 실행해 인증을 완료한 뒤 봇을 재시작하세요.", replyOpt)
+	}
+
+	// General error fallback for non-AgyError or unhandled types (F15)
+	if ctx.Err() == nil {
+		adapter.Send(ev.ChatID, fmt.Sprintf(c.msgs.ErrorSystemResponse, err.Error()), replyOpt)
 	}
 }

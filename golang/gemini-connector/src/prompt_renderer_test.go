@@ -319,14 +319,14 @@ func TestRenderPromptWithTools_SchemaDelivered(t *testing.T) {
 	}
 
 	for _, reqText := range []string{
-		"<HERMES_TOOLS>",
+		"<CLIENT_TOOLS>",
 		"hermes_probe",
 		"Probe a host system",
 		`"target"`,
 		"auto",
 		`"type": "final"`,
 		`"type": "tool_call"`,
-		"</HERMES_TOOLS>",
+		"</CLIENT_TOOLS>",
 	} {
 		if !strings.Contains(rendered, reqText) {
 			t.Errorf("expected prompt to contain %q, but was:\n%s", reqText, rendered)
@@ -391,8 +391,7 @@ func TestRenderPromptWithTools_NoToolsOmitsSection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if strings.Contains(rendered, "<HERMES_TOOLS>") {
-		t.Errorf("expected <HERMES_TOOLS> to be omitted when tools is empty:\n%s", rendered)
+	if strings.Contains(rendered, "<CLIENT_TOOLS>") || strings.Contains(rendered, "<HERMES_TOOLS>") {
+		t.Errorf("expected tools section to be omitted when tools is empty:\n%s", rendered)
 	}
 }
-

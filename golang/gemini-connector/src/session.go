@@ -14,7 +14,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 )
 
 const agyConversationCacheRelPath = ".gemini/antigravity-cli/cache/last_conversations.json"
@@ -172,31 +171,12 @@ func loadConversationCache() ([]ConversationEntry, error) {
 
 func createNewConversation() (string, error) {
 	fmt.Println("⏳ Generating a new Antigravity conversation...")
-
-	prompt := "This connector bridges Telegram to agy. Reply only with 'agy Connector Ready.'"
-	cmd := exec.Command("agy", "--output-format", "json", "--dangerously-skip-permissions", "--print-timeout", "5m")
-	cmd.Env = agyEnv()
-	cmd.Stdin = strings.NewReader(prompt)
-	cmd.Dir = findProjectRoot()
-
-	out, err := cmd.Output()
+	id, err := createNewConversationRuntime(context.Background())
 	if err != nil {
-		return "", fmt.Errorf("failed to run agy CLI: %w", err)
+		return "", err
 	}
-
-	var result struct {
-		ConversationID string `json:"conversation_id"`
-		Status         string `json:"status"`
-	}
-	if err := json.Unmarshal(out, &result); err != nil {
-		return "", fmt.Errorf("failed to parse agy response: %w (raw: %s)", err, string(out))
-	}
-	if result.ConversationID == "" {
-		return "", fmt.Errorf("agy did not return a conversation_id (status: %s)", result.Status)
-	}
-
 	fmt.Println("✅ Conversation creation command finished.")
-	return result.ConversationID, nil
+	return id, nil
 }
 
 // createNewConversationRuntime creates a fresh agy conversation during bot
@@ -220,38 +200,15 @@ func createNewConversationRuntimeWithPrompt(ctx context.Context, prompt string, 
 		return "", "", ae
 	}
 
-	cmd := exec.CommandContext(ctx, "agy", "--output-format", "json", "--dangerously-skip-permissions", "--print-timeout", "5m")
-	cmd.Env = agyEnv()
-	configureAgyProcess(cmd)
-	cmd.Cancel = func() error { return killAgyProcess(cmd.Process) }
-	cmd.WaitDelay = 10 * time.Second
-	cmd.Stdin = strings.NewReader(prompt)
-	cmd.Dir = findProjectRoot()
-
-	out, err := cmd.Output()
+	res, err := executeAgy(ctx, prompt, "", o)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to run agy CLI: %w", err)
+		return "", "", err
+	}
+	if res.ConversationID == "" {
+		return "", "", fmt.Errorf("agy did not return a conversation_id (status: %s)", res.Status)
 	}
 
-	var result struct {
-		ConversationID string `json:"conversation_id"`
-		Status         string `json:"status"`
-		Response       string `json:"response"`
-		Error          string `json:"error,omitempty"`
-	}
-	if err := json.Unmarshal(out, &result); err != nil {
-		return "", "", fmt.Errorf("failed to parse agy response: %w (raw: %s)", err, string(out))
-	}
-	if result.ConversationID == "" {
-		// A bypassed attempt can still hit the exhausted quota; capture the
-		// fresh reset time so the cooldown stays accurate and report it.
-		if QuotaCapture(result.Error) {
-			return "", "", &AgyError{Type: "quota_cooldown", Detail: QuotaRefreshedDetail()}
-		}
-		return "", "", fmt.Errorf("agy did not return a conversation_id (status: %s)", result.Status)
-	}
-
-	return result.ConversationID, result.Response, nil
+	return res.ConversationID, res.Text, nil
 }
 
 // updateEnvKey updates a single KEY=value line in the .env file, preserving

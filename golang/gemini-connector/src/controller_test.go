@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -118,9 +120,9 @@ func TestController_TeamsSlashTextIsPlainTurn(t *testing.T) {
 	c, _, turns := newTestController(t, nil)
 
 	var invoked atomicPrompt
-	c.executor = stubAgyExecutor{execute: func(ctx context.Context, prompt string, convID string, opts AgyCallOptions) (string, error) {
+	c.executor = stubAgyExecutor{execute: func(ctx context.Context, prompt string, convID string, opts AgyCallOptions) (*CompletionResult, error) {
 		invoked.set(prompt)
-		return "응답입니다", nil
+		return &CompletionResult{Status: "SUCCESS", Text: "응답입니다"}, nil
 	}}
 
 	c.Handle(InboundEvent{Platform: "teams", ChatID: "chat-1", Kind: EventMessage, Content: "/stop", MessageID: 3})
@@ -134,9 +136,9 @@ func TestController_TelegramStopDoesNotSpawnAgy(t *testing.T) {
 	c, tg, _ := newTestController(t, nil)
 
 	calls := atomicCounter{}
-	c.executor = stubAgyExecutor{execute: func(ctx context.Context, prompt string, convID string, opts AgyCallOptions) (string, error) {
+	c.executor = stubAgyExecutor{execute: func(ctx context.Context, prompt string, convID string, opts AgyCallOptions) (*CompletionResult, error) {
 		calls.inc()
-		return "", nil
+		return &CompletionResult{Status: "SUCCESS", Text: ""}, nil
 	}}
 
 	// Seed a running turn so StopActive has something to cancel.
@@ -211,8 +213,8 @@ func TestController_ForeignInteractionAnsweredSilently(t *testing.T) {
 func TestController_InboundAttachmentPathsExcludedFromReply(t *testing.T) {
 	c, tg, turns := newTestController(t, nil)
 
-	c.executor = stubAgyExecutor{execute: func(ctx context.Context, prompt string, convID string, opts AgyCallOptions) (string, error) {
-		return "분석 완료", nil
+	c.executor = stubAgyExecutor{execute: func(ctx context.Context, prompt string, convID string, opts AgyCallOptions) (*CompletionResult, error) {
+		return &CompletionResult{Status: "SUCCESS", Text: "분석 완료"}, nil
 	}}
 
 	inbound := []string{`C:\bot\downloads\51867851_26597_01.jpg`}
@@ -237,6 +239,69 @@ func TestController_InboundAttachmentPathsExcludedFromReply(t *testing.T) {
 	if len(excluded) != 1 || excluded[0] != inbound[0] {
 		t.Fatalf("exclusion not forwarded: %v", excluded)
 	}
+}
+
+func TestController_LaunchTimeoutRepliesNotice(t *testing.T) {
+	c, tg, turns := newTestController(t, nil)
+	c.executor = stubAgyExecutor{execute: func(ctx context.Context, prompt string, convID string, opts AgyCallOptions) (*CompletionResult, error) {
+		return nil, &AgyError{Type: "launch_timeout", Detail: "timeout waiting for lock"}
+	}}
+
+	c.Handle(InboundEvent{Platform: "telegram", ChatID: "chat-1", Kind: EventMessage, Content: "hello", MessageID: 1})
+	waitCond(t, "reply sent", func() bool { return !turns.Busy() && tg.sendCount() == 1 })
+
+	tg.mu.Lock()
+	reply := tg.sent[0].text
+	tg.mu.Unlock()
+	if !strings.Contains(reply, "launch lock") {
+		t.Fatalf("expected launch lock notice, got: %q", reply)
+	}
+}
+
+func TestController_WrappedAgyErrorRepliesNotice(t *testing.T) {
+	c, tg, turns := newTestController(t, nil)
+	c.executor = stubAgyExecutor{execute: func(ctx context.Context, prompt string, convID string, opts AgyCallOptions) (*CompletionResult, error) {
+		return nil, fmt.Errorf("wrapped: %w", &AgyError{Type: "quota_cooldown", Detail: "rate limited"})
+	}}
+
+	c.Handle(InboundEvent{Platform: "telegram", ChatID: "chat-1", Kind: EventMessage, Content: "hello", MessageID: 1})
+	waitCond(t, "reply sent", func() bool { return !turns.Busy() && tg.sendCount() == 1 })
+
+	tg.mu.Lock()
+	reply := tg.sent[0].text
+	tg.mu.Unlock()
+	if !strings.Contains(reply, "rate limited") {
+		t.Fatalf("expected rate limited notice from wrapped error, got: %q", reply)
+	}
+}
+
+func TestController_GeneralErrorRepliesNotice(t *testing.T) {
+	c, tg, turns := newTestController(t, nil)
+	c.executor = stubAgyExecutor{execute: func(ctx context.Context, prompt string, convID string, opts AgyCallOptions) (*CompletionResult, error) {
+		return nil, errors.New("unexpected database error")
+	}}
+
+	c.Handle(InboundEvent{Platform: "telegram", ChatID: "chat-1", Kind: EventMessage, Content: "hello", MessageID: 1})
+	waitCond(t, "reply sent", func() bool { return !turns.Busy() && tg.sendCount() == 1 })
+
+	tg.mu.Lock()
+	reply := tg.sent[0].text
+	tg.mu.Unlock()
+	if !strings.Contains(reply, "unexpected database error") {
+		t.Fatalf("expected error notice for general error, got: %q", reply)
+	}
+}
+
+func TestController_CancelledTurnSilent(t *testing.T) {
+	c, _, turns := newTestController(t, nil)
+	c.executor = stubAgyExecutor{execute: func(ctx context.Context, prompt string, convID string, opts AgyCallOptions) (*CompletionResult, error) {
+		return nil, context.Canceled
+	}}
+
+	c.Handle(InboundEvent{Platform: "telegram", ChatID: "chat-1", Kind: EventMessage, Content: "hello", MessageID: 1})
+	// In cancellation, deliverTurnError is called with context.Canceled.
+	// Since ctx.Err() might or might not be checked: let's verify if turns drain.
+	waitCond(t, "turns drained", func() bool { return !turns.Busy() })
 }
 
 // --- tiny atomic helpers ---

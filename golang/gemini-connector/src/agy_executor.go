@@ -15,16 +15,25 @@ import (
 // and the inbound-message controller. The CLI implementation remains behind
 // this boundary so callers can be tested without package-level function swaps.
 type AgyExecutor interface {
-	Execute(ctx context.Context, prompt string, conversationID string, opts AgyCallOptions) (string, error)
+	Execute(ctx context.Context, prompt string, conversationID string, opts AgyCallOptions) (*CompletionResult, error)
 }
 
-type cliAgyExecutor struct{}
+type cliAgyExecutor struct {
+	runner AgyCmdRunner
+}
 
 func newAgyExecutor() AgyExecutor {
 	return cliAgyExecutor{}
 }
 
-func (cliAgyExecutor) Execute(ctx context.Context, prompt string, conversationID string, opts AgyCallOptions) (string, error) {
+func newAgyExecutorWithRunner(runner AgyCmdRunner) AgyExecutor {
+	return cliAgyExecutor{runner: runner}
+}
+
+func (c cliAgyExecutor) Execute(ctx context.Context, prompt string, conversationID string, opts AgyCallOptions) (*CompletionResult, error) {
+	if opts.Runner == nil && c.runner != nil {
+		opts.Runner = c.runner
+	}
 	return executeAgy(ctx, prompt, conversationID, opts)
 }
 
@@ -68,9 +77,17 @@ type AgyCallOptions struct {
 	UsageCallback func(*AgyUsage)
 	// StructuredOutputRequested is set when structured output / JSON schema was requested.
 	StructuredOutputRequested bool
+	// Tools is the set of declared tools for validation against model envelope calls.
+	Tools []ToolDefinition
+	// ToolChoice is the parsed tool choice policy.
+	ToolChoice ParsedToolChoice
+	// Stop is the list of stop sequences.
+	Stop []string
+	// Runner provides an optional instance-local command runner.
+	Runner AgyCmdRunner
 }
 
-func executeAgy(ctx context.Context, prompt string, conversationID string, opts ...AgyCallOptions) (string, error) {
+func executeAgy(ctx context.Context, prompt string, conversationID string, opts ...AgyCallOptions) (*CompletionResult, error) {
 	var o AgyCallOptions
 	if len(opts) > 0 {
 		o = opts[0]
@@ -78,29 +95,25 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 	// While quota cooldown is active, do not spawn agy at all; reply with
 	// the stored error text whose time fields show the remaining time.
 	if ae := quotaBlockErr(o.BypassQuotaGate); ae != nil {
-		return "", ae
+		return nil, ae
 	}
 
 	var tempSchemaPath string
 	if o.Profile == ProfileAPI && o.JSONSchema != "" {
 		tmpFile, err := os.CreateTemp("", "agy_schema_*.json")
 		if err != nil {
-			return "", &AgyError{Type: "schema_error", Detail: "failed to create temporary schema file: " + err.Error()}
+			return nil, &AgyError{Type: "schema_error", Detail: "failed to create temporary schema file: " + err.Error()}
 		}
 		tempSchemaPath = tmpFile.Name()
 		defer os.Remove(tempSchemaPath)
 		if _, err := tmpFile.WriteString(o.JSONSchema); err != nil {
 			_ = tmpFile.Close()
-			return "", &AgyError{Type: "schema_error", Detail: "failed to write temporary schema file: " + err.Error()}
+			return nil, &AgyError{Type: "schema_error", Detail: "failed to write temporary schema file: " + err.Error()}
 		}
 		_ = tmpFile.Close()
 	}
 
 	maxAttempts := 2
-	if o.Profile == ProfileAPI && conversationID == "" {
-		return "", &AgyError{Type: "missing_conversation_id", Detail: "ProfileAPI requires a non-empty conversation ID"}
-	}
-
 	if o.DisableRetry || o.Profile == ProfileAPI {
 		maxAttempts = 1
 	}
@@ -109,7 +122,7 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 		if attempt > 1 {
 			select {
 			case <-ctx.Done():
-				return "", ctx.Err()
+				return nil, ctx.Err()
 			case <-time.After(agyRetryDelay):
 			}
 			log.Printf("Retrying agy CLI execution (attempt %d/%d) for message: %s", attempt, maxAttempts, truncateString(prompt, 50))
@@ -161,29 +174,43 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 		cmd.Stdin = strings.NewReader(prompt)
 
 		var stdout bytes.Buffer
+		stdoutLimit := int64(8 * 1024 * 1024)
+		boundedStdout := NewBoundedWriter(&stdout, stdoutLimit)
 		var streamWriter *ndjsonStreamWriter
 		if o.Profile == ProfileAPI && o.Stream {
 			streamWriter = &ndjsonStreamWriter{
-				callback: o.StreamCallback,
-				maxBytes: 4 * 1024 * 1024,
-				maxLine:  4 * 1024 * 1024,
+				callback:       o.StreamCallback,
+				maxBytes:       4 * 1024 * 1024,
+				maxLine:        4 * 1024 * 1024,
+				structuredMode: o.StructuredOutputRequested || o.JSONSchema != "" || len(o.Tools) > 0,
 			}
 			cmd.Stdout = streamWriter
 		} else {
-			cmd.Stdout = &stdout
+			cmd.Stdout = boundedStdout
 		}
 		var stderr bytes.Buffer
-		cmd.Stderr = &stderr
+		stderrLimit := int64(4 * 1024 * 1024)
+		boundedStderr := NewBoundedWriter(&stderr, stderrLimit)
+		cmd.Stderr = boundedStderr
 
 		if projectRoot := findProjectRoot(); projectRoot != "" {
 			cmd.Dir = projectRoot
 		}
 
 		if !acquireAgyLaunch(ctx, 30*time.Second) {
-			return "", &AgyError{Type: "launch_timeout", Detail: "timed out waiting for agy launch lock"}
+			return nil, &AgyError{Type: "launch_timeout", Detail: "timed out waiting for agy launch lock"}
 		}
-		cmdErr := agyCmdRunner(cmd)
+		runner := resolveRunner(o.Runner, nil)
+		cmdErr := runner(cmd)
 		releaseAgyLaunch()
+
+		if boundedStdout.Exceeded {
+			return nil, &AgyError{Type: "output_too_large", Detail: "raw JSON stdout exceeded 8 MiB limit"}
+		}
+
+		if streamWriter != nil {
+			_ = streamWriter.Finalize()
+		}
 
 		if cmdErr != nil {
 			stderrMsg := strings.TrimSpace(stderr.String())
@@ -199,11 +226,11 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 				if len(detail) > 200 {
 					detail = detail[len(detail)-200:]
 				}
-				return "", &AgyError{Type: "cli_failure", Err: cmdErr, Detail: detail}
+				return nil, &AgyError{Type: "cli_failure", Err: cmdErr, Detail: detail}
 			}
 
 			if strings.Contains(stderrMsg, "authentication required") {
-				return "", &AgyError{Type: "authentication_required", Err: cmdErr, Detail: stderrMsg}
+				return nil, &AgyError{Type: "authentication_required", Err: cmdErr, Detail: stderrMsg}
 			}
 
 			// agy occasionally reports an error (or process terminates early)
@@ -211,7 +238,7 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 			if !isQuotaExhaustedDetail(stderrMsg) {
 				if salvaged := salvageTurnResponse(conversationID, prompt, turnStart); salvaged != "" {
 					log.Printf("agy CLI reported error (%s) but transcript salvaged response", truncateString(stderrMsg, 80))
-					return salvaged, nil
+					return &CompletionResult{Status: "SUCCESS", Text: salvaged, ConversationID: conversationID, FinishReason: "stop"}, nil
 				}
 			}
 
@@ -225,23 +252,23 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 			if len(detail) > 200 {
 				detail = detail[len(detail)-200:]
 			}
-			return "", &AgyError{Type: "cli_failure", Err: cmdErr, Detail: detail}
+			return nil, &AgyError{Type: "cli_failure", Err: cmdErr, Detail: detail}
 		}
 
 		if o.Profile == ProfileAPI && o.Stream {
 			if streamWriter.err != nil {
 				if ae, ok := streamWriter.err.(*AgyError); ok {
-					return "", ae
+					return nil, ae
 				}
-				return "", &AgyError{Type: "stream_error", Detail: streamWriter.err.Error()}
+				return nil, &AgyError{Type: "stream_error", Detail: streamWriter.err.Error()}
 			}
 			if !streamWriter.sawSuccess {
-				return "", &AgyError{Type: "stream_incomplete", Detail: "stream ended without success result"}
+				return nil, &AgyError{Type: "stream_incomplete", Detail: "stream ended without success result"}
 			}
 			if conversationID != "" {
 				stderrStr := stderr.String()
 				if strings.Contains(stderrStr, "not found") && strings.Contains(stderrStr, "conversation") {
-					return "", &AgyError{
+					return nil, &AgyError{
 						Type:   "session_resume_failed",
 						Detail: "AGY conversation resume failed: session not found",
 					}
@@ -250,12 +277,53 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 			if o.UsageCallback != nil && streamWriter.usage != nil {
 				o.UsageCallback(streamWriter.usage)
 			}
-			return "", nil
+
+			res := BuildCompletionResult(
+				"SUCCESS",
+				streamWriter.terminalResponse,
+				streamWriter.terminalStructuredOutput,
+				streamWriter.steps,
+				streamWriter.accumulatedProgress.String(),
+				true,
+				streamWriter.sawNativeToolStep,
+				streamWriter.usage,
+				streamWriter.conversationID,
+				o.Tools,
+				o.ToolChoice,
+				o.Stop,
+			)
+			if res.IsError {
+				return res, &AgyError{Type: res.ErrorCode, Detail: res.ErrorMessage}
+			}
+			return res, nil
 		}
 
 		stdoutBytes := stdout.Bytes()
 		if o.Profile == ProfileAPI && int64(len(stdoutBytes)) > 8*1024*1024 {
-			return "", &AgyError{Type: "output_too_large", Detail: "raw JSON stdout exceeded 8 MiB limit"}
+			return nil, &AgyError{Type: "output_too_large", Detail: "raw JSON stdout exceeded 8 MiB limit"}
+		}
+
+		if o.Profile == ProfileAPI {
+			if conversationID != "" {
+				stderrStr := stderr.String()
+				if strings.Contains(stderrStr, "not found") && strings.Contains(stderrStr, "conversation") {
+					return nil, &AgyError{
+						Type:   "session_resume_failed",
+						Detail: "AGY conversation resume failed: session not found",
+					}
+				}
+			}
+			compRes, parseErr := ParseAgyExecutionOutput(stdoutBytes, o.Tools, o.ToolChoice, o.Stop)
+			if parseErr != nil {
+				return nil, parseErr
+			}
+			if compRes.IsError {
+				return compRes, &AgyError{Type: compRes.ErrorCode, Detail: compRes.ErrorMessage}
+			}
+			if o.UsageCallback != nil && compRes.Usage != nil {
+				o.UsageCallback(compRes.Usage)
+			}
+			return compRes, nil
 		}
 
 		var result AgyResponse
@@ -267,13 +335,13 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 					continue
 				}
 			}
-			return "", &AgyError{Type: "json_parse_fail", Err: err, Detail: string(stdoutBytes)}
+			return nil, &AgyError{Type: "json_parse_fail", Err: err, Detail: string(stdoutBytes)}
 		}
 
 		if conversationID != "" {
 			stderrStr := stderr.String()
 			if strings.Contains(stderrStr, "not found") && strings.Contains(stderrStr, "conversation") {
-				return "", &AgyError{
+				return nil, &AgyError{
 					Type:   "session_resume_failed",
 					Detail: "AGY conversation resume failed: session not found",
 				}
@@ -286,7 +354,7 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 				detail = "agy returned status: " + result.Status
 			}
 			if o.Profile == ProfileAPI {
-				return "", &AgyError{Type: "error_status", Detail: detail}
+				return nil, &AgyError{Type: "error_status", Detail: detail}
 			}
 
 			log.Printf("agy returned non-success status: %s, error: %s", result.Status, detail)
@@ -299,7 +367,7 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 			if !isQuotaExhaustedDetail(detail) {
 				if salvaged := salvageTurnResponse(conversationID, prompt, turnStart); salvaged != "" {
 					log.Printf("agy reported an error (%s) but the turn completed; delivering the recovered response", truncateString(detail, 80))
-					return salvaged, nil
+					return &CompletionResult{Status: "SUCCESS", Text: salvaged, ConversationID: conversationID, FinishReason: "stop"}, nil
 				}
 			}
 
@@ -308,7 +376,7 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 				continue
 			}
 
-			return "", &AgyError{Type: "error_status", Detail: detail}
+			return nil, &AgyError{Type: "error_status", Detail: detail}
 		}
 
 		respText := result.Response
@@ -316,32 +384,22 @@ func executeAgy(ctx context.Context, prompt string, conversationID string, opts 
 			respText = string(result.StructuredOutput)
 		}
 
-		if o.Profile == ProfileAPI {
-			sawNativeTool := false
-			for _, step := range result.Steps {
-				if isNativeToolStepType(step.StepType) {
-					sawNativeTool = true
-					break
-				}
-			}
-			if sawNativeTool && respText == "" {
-				return "", &AgyError{
-					Type:   "native_tool_containment_violation",
-					Detail: "native AGY tool execution is prohibited in ProfileAPI; tools must be executed by client",
-				}
-			}
-		}
-
-		if o.Profile == ProfileAPI && int64(len(respText)) > 4*1024*1024 {
-			return "", &AgyError{Type: "output_too_large", Detail: "decoded assistant response exceeded 4 MiB limit"}
-		}
-
 		if o.UsageCallback != nil && result.Usage != nil {
 			o.UsageCallback(result.Usage)
 		}
 
-		return respText, nil
+		convID := result.ConversationID
+		if convID == "" {
+			convID = conversationID
+		}
+		return &CompletionResult{
+			Status:         result.Status,
+			Text:           respText,
+			Usage:          result.Usage,
+			ConversationID: convID,
+			FinishReason:   "stop",
+		}, nil
 	}
 
-	return "", &AgyError{Type: "cli_failure", Detail: "agy execution attempts exhausted"}
+	return nil, &AgyError{Type: "cli_failure", Detail: "agy execution attempts exhausted"}
 }

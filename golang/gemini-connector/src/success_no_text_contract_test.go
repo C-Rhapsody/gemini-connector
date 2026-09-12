@@ -86,7 +86,7 @@ func TestContract_1_NonStream_Success_VisibleText(t *testing.T) {
 	}
 }
 
-// 2. Non-stream SUCCESS_NO_TEXT returns content:null and the extension.
+// 2. Non-stream empty upstream output returns 502 upstream_no_output.
 func TestContract_2_NonStream_Success_NoText(t *testing.T) {
 	body := `{"model":"gemini-3.8-flash-high","messages":[{"role":"user","content":"run tool"}]}`
 	rec, raw := runContractRequest(t, body, mockAgyJSONRunner(AgyResponse{
@@ -94,42 +94,11 @@ func TestContract_2_NonStream_Success_NoText(t *testing.T) {
 		Response: "",
 	}))
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", rec.Code, raw)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 Bad Gateway, got %d: %s", rec.Code, raw)
 	}
-
-	// Raw JSON verification: message content MUST be JSON null, not ""
-	if !strings.Contains(raw, `"content":null`) {
-		t.Fatalf("expected raw JSON to contain '\"content\":null', got:\n%s", raw)
-	}
-
-	var resp map[string]any
-	if err := json.Unmarshal([]byte(raw), &resp); err != nil {
-		t.Fatalf("failed to parse response JSON: %v", err)
-	}
-
-	choices, ok := resp["choices"].([]any)
-	if !ok || len(choices) != 1 {
-		t.Fatalf("expected 1 choice, got: %v", resp["choices"])
-	}
-	ch := choices[0].(map[string]any)
-	msg := ch["message"].(map[string]any)
-	if msg["content"] != nil {
-		t.Errorf("expected content nil, got %v", msg["content"])
-	}
-	if ch["finish_reason"] != "stop" {
-		t.Errorf("expected finish_reason 'stop', got %v", ch["finish_reason"])
-	}
-
-	ext, exists := resp["x_gemini_connector"].(map[string]any)
-	if !exists {
-		t.Fatalf("expected x_gemini_connector extension in response, got:\n%s", raw)
-	}
-	if ext["state"] != "success_no_text" {
-		t.Errorf("expected x_gemini_connector.state == 'success_no_text', got %v", ext["state"])
-	}
-	if ext["retryable"] != false {
-		t.Errorf("expected x_gemini_connector.retryable == false, got %v", ext["retryable"])
+	if !strings.Contains(raw, "upstream_no_output") {
+		t.Fatalf("expected error code 'upstream_no_output', got:\n%s", raw)
 	}
 }
 
@@ -193,19 +162,15 @@ func TestContract_4_Stream_AgentResponseDeltas(t *testing.T) {
 	}
 }
 
-// 5. Stream reasoning text never appears in assistant content and produces success_no_text.
+// 5. Stream reasoning text never appears in assistant content; empty output produces error upstream_no_output.
 func TestContract_5_Stream_ReasoningTextNeverAppearsInAssistantContent(t *testing.T) {
 	body := `{"model":"gemini-3.8-flash-high","messages":[{"role":"user","content":"run"}] ,"stream":true}`
-	rec, raw := runContractRequest(t, body, mockAgyStreamRunner(
+	_, raw := runContractRequest(t, body, mockAgyStreamRunner(
 		`{"event":"step_update","step_update":{"step_type":"plan","text_delta":"step 1 plan"}}`,
 		`{"event":"step_update","step_update":{"step_type":"thought","text_delta":"internal thought"}}`,
 		`{"event":"step_update","step_update":{"step_type":"reasoning","text_delta":"internal reasoning"}}`,
 		`{"event":"result","result":{"status":"SUCCESS","response":""}}`,
 	))
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", rec.Code, raw)
-	}
 
 	for _, forbidden := range []string{"step 1 plan", "internal thought", "internal reasoning"} {
 		if strings.Contains(raw, forbidden) {
@@ -213,14 +178,11 @@ func TestContract_5_Stream_ReasoningTextNeverAppearsInAssistantContent(t *testin
 		}
 	}
 
-	if !strings.Contains(raw, `"finish_reason":"stop"`) {
-		t.Errorf("expected finish_reason 'stop', got:\n%s", raw)
+	if !strings.Contains(raw, "event: error") {
+		t.Errorf("expected event: error frame in stream, got:\n%s", raw)
 	}
-	if !strings.Contains(raw, `"state":"success_no_text"`) {
-		t.Errorf("expected x_gemini_connector state success_no_text in stream finish chunk, got:\n%s", raw)
-	}
-	if !strings.Contains(raw, "data: [DONE]") {
-		t.Errorf("expected data: [DONE], got:\n%s", raw)
+	if !strings.Contains(raw, "upstream_no_output") {
+		t.Errorf("expected error code 'upstream_no_output', got:\n%s", raw)
 	}
 }
 
@@ -472,16 +434,16 @@ func TestContract_14_ToolActivity_RemainsUnknownWhenNoToolMetadataParsed(t *test
 	}
 }
 
-// 15. SUCCESS_NO_TEXT does not produce an HTTP 5xx.
+// 15. Empty output due to stop truncation produces 200 OK without 5xx.
 func TestContract_15_SuccessNoText_DoesNotProduceHTTP5xx(t *testing.T) {
-	body := `{"model":"gemini-3.8-flash-high","messages":[{"role":"user","content":"tool only"}]}`
+	body := `{"model":"gemini-3.8-flash-high","messages":[{"role":"user","content":"tool only"}],"stop":["<STOP>"]}`
 	rec, raw := runContractRequest(t, body, mockAgyJSONRunner(AgyResponse{
 		Status:   "SUCCESS",
-		Response: "",
+		Response: "<STOP>truncated",
 	}))
 
 	if rec.Code >= 500 {
-		t.Fatalf("SUCCESS_NO_TEXT must never produce 5xx status, got %d: %s", rec.Code, raw)
+		t.Fatalf("Stop truncated response must never produce 5xx status, got %d: %s", rec.Code, raw)
 	}
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, raw)

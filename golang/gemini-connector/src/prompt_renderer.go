@@ -141,14 +141,14 @@ func renderSingleMessage(header string, msg ChatMessage) string {
 	return strings.TrimRight(sb.String(), "\n")
 }
 
-// renderHermesTools formats Hermes client tool definitions and structured output instructions.
-func renderHermesTools(tools []ToolDefinition, choice ParsedToolChoice) string {
+// renderClientTools formats client tool definitions and structured output instructions.
+func renderClientTools(tools []ToolDefinition, choice ParsedToolChoice) string {
 	if len(tools) == 0 {
 		return ""
 	}
 	var sb strings.Builder
-	sb.WriteString("<HERMES_TOOLS>\n")
-	sb.WriteString("You have access to the following Hermes client tools:\n\n")
+	sb.WriteString("<CLIENT_TOOLS>\n")
+	sb.WriteString("You have access to the following client-side tools:\n\n")
 
 	for _, t := range tools {
 		if t.Function == nil {
@@ -174,7 +174,7 @@ func renderHermesTools(tools []ToolDefinition, choice ParsedToolChoice) string {
 	}
 	sb.WriteString("\nCRITICAL INSTRUCTIONS FOR RESPONSE FORMAT:\n")
 	sb.WriteString("You MUST respond ONLY with a valid JSON object adhering to one of the following formats:\n\n")
-	sb.WriteString("1. If you decide to call one or more tools:\n")
+	sb.WriteString("1. If you decide to call one or more tools (return unexecuted intent for client execution):\n")
 	sb.WriteString("```json\n")
 	sb.WriteString("{\n")
 	sb.WriteString("  \"type\": \"tool_call\",\n")
@@ -190,9 +190,13 @@ func renderHermesTools(tools []ToolDefinition, choice ParsedToolChoice) string {
 	sb.WriteString("  \"content\": \"<your full textual response here>\"\n")
 	sb.WriteString("}\n")
 	sb.WriteString("```\n\n")
-	sb.WriteString("Do NOT execute tools yourself natively. Output only the JSON envelope matching the schema above.\n")
-	sb.WriteString("</HERMES_TOOLS>\n\n")
+	sb.WriteString("Output only the JSON envelope matching the schema above.\n")
+	sb.WriteString("</CLIENT_TOOLS>\n\n")
 	return sb.String()
+}
+
+func renderHermesTools(tools []ToolDefinition, choice ParsedToolChoice) string {
+	return renderClientTools(tools, choice)
 }
 
 // RenderPrompt builds a deterministic, role-preserving prompt representation from OpenAI messages.

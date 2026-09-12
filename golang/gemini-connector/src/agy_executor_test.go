@@ -203,12 +203,12 @@ func TestAgyProfiles_ArgvAndDirPolicies(t *testing.T) {
 }
 
 type stubAgyExecutor struct {
-	execute func(ctx context.Context, prompt string, conversationID string, opts AgyCallOptions) (string, error)
+	execute func(ctx context.Context, prompt string, conversationID string, opts AgyCallOptions) (*CompletionResult, error)
 }
 
-func (s stubAgyExecutor) Execute(ctx context.Context, prompt string, conversationID string, opts AgyCallOptions) (string, error) {
+func (s stubAgyExecutor) Execute(ctx context.Context, prompt string, conversationID string, opts AgyCallOptions) (*CompletionResult, error) {
 	if s.execute == nil {
-		return "", nil
+		return &CompletionResult{Status: "SUCCESS"}, nil
 	}
 	return s.execute(ctx, prompt, conversationID, opts)
 }

@@ -88,7 +88,7 @@ func TestSession_APIExecutor_ArgsIncludeConversationAndCorrectID(t *testing.T) {
 	}
 }
 
-// 3. Empty conversation ID in API request produces explicit configuration error
+// 3. Empty conversation ID in remote history request produces explicit configuration error
 func TestSession_APIHandler_EmptyConversationID_ReturnsExplicitError(t *testing.T) {
 	server, _, _ := setupTestServer(t)
 	// Explicitly configure empty conversation ID
@@ -101,6 +101,10 @@ func TestSession_APIHandler_EmptyConversationID_ReturnsExplicitError(t *testing.
 	req.Host = "127.0.0.1:49152"
 	req.Header.Set("Authorization", "Bearer "+testAPIKey)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Hermes-History-Mode", "current_only")
+	req.Header.Set("X-Hermes-Context-Owner", "agy")
+	req.Header.Set("X-Hermes-Turn-ID", "turn_1")
+	req.Header.Set("X-Hermes-Turn-Sequence", "1")
 	rec := httptest.NewRecorder()
 
 	server.ServeHTTP(rec, req)
@@ -118,17 +122,33 @@ func TestSession_APIHandler_EmptyConversationID_ReturnsExplicitError(t *testing.
 	}
 }
 
-// 4. API executor with empty conversation ID returns explicit error directly
-func TestSession_APIExecutor_EmptyConversationID_ReturnsExplicitError(t *testing.T) {
-	_, err := executeAgy(context.Background(), "hello", "", AgyCallOptions{
+// 4. API executor with empty conversation ID runs isolated turn without --conversation arg
+func TestSession_APIExecutor_EmptyConversationID_OmitsConversationArg(t *testing.T) {
+	oldRunner := agyCmdRunner
+	t.Cleanup(func() { agyCmdRunner = oldRunner })
+
+	var observedCmd *exec.Cmd
+	agyCmdRunner = func(cmd *exec.Cmd) error {
+		observedCmd = cmd
+		resp := AgyResponse{Status: "SUCCESS", Response: "isolated response"}
+		b, _ := json.Marshal(resp)
+		cmd.Stdout.Write(b)
+		return nil
+	}
+
+	res, err := executeAgy(context.Background(), "hello", "", AgyCallOptions{
 		Profile: ProfileAPI,
 	})
-	if err == nil {
-		t.Fatalf("expected error when conversation ID is empty in ProfileAPI, got nil")
+	if err != nil {
+		t.Fatalf("expected execution to succeed with empty conversation ID, got error: %v", err)
 	}
-	ae, ok := err.(*AgyError)
-	if !ok || ae.Type != "missing_conversation_id" {
-		t.Fatalf("expected AgyError type 'missing_conversation_id', got: %v", err)
+	if res.Text != "isolated response" {
+		t.Fatalf("expected text 'isolated response', got %q", res.Text)
+	}
+	for i, arg := range observedCmd.Args {
+		if arg == "--conversation" {
+			t.Fatalf("expected --conversation to be omitted when ID is empty, found at index %d", i)
+		}
 	}
 }
 
