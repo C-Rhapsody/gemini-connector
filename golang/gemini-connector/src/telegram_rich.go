@@ -490,6 +490,60 @@ func escapeFormula(formula string, profile string) (string, error) {
 	}
 }
 
+// isolateMathBlockPlaceholder unrolls an enclosing <p>...</p> wrapper around a MathBlock placeholder
+// so that <tg-math-block> is never illegally nested inside <p>.
+func isolateMathBlockPlaceholder(html string, placeholder string, blockTag string) string {
+	idx := strings.Index(html, placeholder)
+	if idx == -1 {
+		return html
+	}
+
+	// Look backwards from idx for the nearest "<p>"
+	pOpenIdx := strings.LastIndex(html[:idx], "<p>")
+	if pOpenIdx == -1 {
+		return strings.Replace(html, placeholder, blockTag, 1)
+	}
+
+	// Check if there is a closing "</p>" between pOpenIdx and idx
+	if strings.Contains(html[pOpenIdx:idx], "</p>") {
+		return strings.Replace(html, placeholder, blockTag, 1)
+	}
+
+	// Look forwards from idx for the nearest "</p>"
+	afterIdx := idx + len(placeholder)
+	pCloseRel := strings.Index(html[afterIdx:], "</p>")
+	if pCloseRel == -1 {
+		return strings.Replace(html, placeholder, blockTag, 1)
+	}
+	pCloseIdx := afterIdx + pCloseRel
+
+	// Check if there is another "<p>" between afterIdx and pCloseIdx
+	if strings.Contains(html[afterIdx:pCloseIdx], "<p>") {
+		return strings.Replace(html, placeholder, blockTag, 1)
+	}
+
+	lhs := html[pOpenIdx+len("<p>") : idx]
+	rhs := html[afterIdx:pCloseIdx]
+
+	lhs = strings.TrimSuffix(lhs, "<br>")
+	rhs = strings.TrimPrefix(rhs, "<br>")
+
+	var sb strings.Builder
+	if len(lhs) > 0 {
+		sb.WriteString("<p>")
+		sb.WriteString(lhs)
+		sb.WriteString("</p>")
+	}
+	sb.WriteString(blockTag)
+	if len(rhs) > 0 {
+		sb.WriteString("<p>")
+		sb.WriteString(rhs)
+		sb.WriteString("</p>")
+	}
+
+	return html[:pOpenIdx] + sb.String() + html[pCloseIdx+len("</p>"):]
+}
+
 // renderRichHTML tokenizes LaTeX math, renders the remaining markdown to Telegram HTML,
 // verifies placeholder integrity, and restores math tokens as <tg-math> or <tg-math-block>.
 func renderRichHTML(s string, mathEscape string) (string, error) {
@@ -516,14 +570,13 @@ func renderRichHTML(s string, mathEscape string) (string, error) {
 			return "", err
 		}
 
-		var replacement string
 		if tok.Kind == MathInline {
-			replacement = "<tg-math>" + escapedBody + "</tg-math>"
+			replacement := "<tg-math>" + escapedBody + "</tg-math>"
+			html = strings.Replace(html, tok.Placeholder, replacement, 1)
 		} else {
-			replacement = "<tg-math-block>" + escapedBody + "</tg-math-block>"
+			replacement := "<tg-math-block>" + escapedBody + "</tg-math-block>"
+			html = isolateMathBlockPlaceholder(html, tok.Placeholder, replacement)
 		}
-
-		html = strings.Replace(html, tok.Placeholder, replacement, 1)
 	}
 
 	return html, nil

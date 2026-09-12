@@ -423,22 +423,22 @@ func TestRenderRichHTML(t *testing.T) {
 			{
 				name: "heading followed by paragraph with italic and link",
 				in:   "# Heading\nParagraph with *italic* and [link](https://example.com)",
-				want: "<b>Heading</b>\n<p>Paragraph with <i>italic</i> and <a href=\"https://example.com\">link</a></p>",
+				want: "<h1>Heading</h1><p>Paragraph with <i>italic</i> and <a href=\"https://example.com\">link</a></p>",
 			},
 			{
-				name: "nested unordered list preserves bullet layout without p tags",
+				name: "nested unordered list renders structured tags without text bullets",
 				in:   "- item 1\n- item 2\n  - nested",
-				want: "• item 1\n• item 2\n  ◦ nested\n",
+				want: "<ul><li>item 1</li><li>item 2<ul><li>nested</li></ul></li></ul>",
 			},
 			{
-				name: "blockquote without unwanted p wrapping",
+				name: "blockquote wraps inner paragraph with p tag",
 				in:   "> a blockquote with `code`",
-				want: "<blockquote>a blockquote with <code>code</code></blockquote>\n",
+				want: "<blockquote><p>a blockquote with <code>code</code></p></blockquote>",
 			},
 			{
 				name: "fenced code block preserves raw newlines without br or p tags",
 				in:   "```go\nfunc main() {}\n```",
-				want: "<pre><code class=\"language-go\">func main() {}\n</code></pre>\n",
+				want: "<pre><code class=\"language-go\">func main() {}\n</code></pre>",
 			},
 		}
 
@@ -529,15 +529,197 @@ func TestRenderRichHTML(t *testing.T) {
 		}
 	})
 
-	t.Run("standard HTML convertMarkdownToTelegramHTML is completely unchanged", func(t *testing.T) {
-		in := "Line 1\nLine 2\n\nLine 3"
-		got := convertMarkdownToTelegramHTML(in)
-		if strings.Contains(got, "<p>") || strings.Contains(got, "</p>") || strings.Contains(got, "<br>") {
-			t.Errorf("standard HTML must NEVER contain <p> or <br> tags, got %q", got)
+	t.Run("rich contract verifies headings h1 to h6 and consecutive headings", func(t *testing.T) {
+		cases := []struct {
+			name string
+			in   string
+			want string
+		}{
+			{"h1", "# Heading 1", "<h1>Heading 1</h1>"},
+			{"h2", "## Heading 2", "<h2>Heading 2</h2>"},
+			{"h3", "### Heading 3", "<h3>Heading 3</h3>"},
+			{"h4", "#### Heading 4", "<h4>Heading 4</h4>"},
+			{"h5", "##### Heading 5", "<h5>Heading 5</h5>"},
+			{"h6", "###### Heading 6", "<h6>Heading 6</h6>"},
+			{"consecutive headings", "# Title\n## Subtitle\n### Section", "<h1>Title</h1><h2>Subtitle</h2><h3>Section</h3>"},
+			{"heading followed by list", "# List Title\n- item 1\n- item 2", "<h1>List Title</h1><ul><li>item 1</li><li>item 2</li></ul>"},
 		}
-		want := "Line 1\nLine 2\nLine 3"
-		if got != want {
-			t.Errorf("standard HTML got %q, want %q", got, want)
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				got, err := renderRichHTML(tc.in, "raw")
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if got != tc.want {
+					t.Errorf("got %q, want %q", got, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("rich contract verifies unordered and ordered lists including nested and loose", func(t *testing.T) {
+		cases := []struct {
+			name string
+			in   string
+			want string
+		}{
+			{
+				name: "tight unordered list",
+				in:   "- item 1\n- item 2\n- item 3",
+				want: "<ul><li>item 1</li><li>item 2</li><li>item 3</li></ul>",
+			},
+			{
+				name: "tight ordered list starting at 1",
+				in:   "1. first\n2. second\n3. third",
+				want: "<ol><li>first</li><li>second</li><li>third</li></ol>",
+			},
+			{
+				name: "tight ordered list starting at non-1",
+				in:   "3. third\n4. fourth",
+				want: `<ol start="3"><li>third</li><li>fourth</li></ol>`,
+			},
+			{
+				name: "nested ordered list inside unordered list",
+				in:   "- outer 1\n  1. inner 1\n  2. inner 2\n- outer 2",
+				want: "<ul><li>outer 1<ol><li>inner 1</li><li>inner 2</li></ol></li><li>outer 2</li></ul>",
+			},
+			{
+				name: "nested unordered list inside ordered list",
+				in:   "1. outer 1\n   - inner A\n   - inner B\n2. outer 2",
+				want: "<ol><li>outer 1<ul><li>inner A</li><li>inner B</li></ul></li><li>outer 2</li></ol>",
+			},
+			{
+				name: "loose unordered list with p tags inside li",
+				in:   "- item 1\n\n- item 2",
+				want: "<ul><li><p>item 1</p></li><li><p>item 2</p></li></ul>",
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				got, err := renderRichHTML(tc.in, "raw")
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if got != tc.want {
+					t.Errorf("got %q, want %q", got, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("rich contract verifies thematic breaks hr", func(t *testing.T) {
+		cases := []struct {
+			name string
+			in   string
+			want string
+		}{
+			{"standalone hr", "---", "<hr/>"},
+			{"hr between paragraphs", "Para 1\n\n---\n\nPara 2", "<p>Para 1</p><hr/><p>Para 2</p>"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				got, err := renderRichHTML(tc.in, "raw")
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if got != tc.want {
+					t.Errorf("got %q, want %q", got, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("rich contract verifies blockquotes with multiple paragraphs and nested list", func(t *testing.T) {
+		cases := []struct {
+			name string
+			in   string
+			want string
+		}{
+			{
+				name: "multi-paragraph blockquote",
+				in:   "> Paragraph one.\n>\n> Paragraph two.",
+				want: "<blockquote><p>Paragraph one.</p><p>Paragraph two.</p></blockquote>",
+			},
+			{
+				name: "nested list inside blockquote",
+				in:   "> - item 1\n> - item 2",
+				want: "<blockquote><ul><li>item 1</li><li>item 2</li></ul></blockquote>",
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				got, err := renderRichHTML(tc.in, "raw")
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if got != tc.want {
+					t.Errorf("got %q, want %q", got, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("rich contract verifies math block isolation from p tags", func(t *testing.T) {
+		cases := []struct {
+			name string
+			in   string
+			want string
+		}{
+			{
+				name: "standalone math block \\[ ... \\]",
+				in:   "\\[x = 1\\]",
+				want: "<tg-math-block>x = 1</tg-math-block>",
+			},
+			{
+				name: "standalone math block $$ ... $$",
+				in:   "$$E = mc^2$$",
+				want: "<tg-math-block>E = mc^2</tg-math-block>",
+			},
+			{
+				name: "math block between blank lines",
+				in:   "Before paragraph.\n\n\\[x = 1\\]\n\nAfter paragraph.",
+				want: "<p>Before paragraph.</p><tg-math-block>x = 1</tg-math-block><p>After paragraph.</p>",
+			},
+			{
+				name: "math block on adjacent lines inside paragraph",
+				in:   "Before line\n\\[x = 1\\]\nAfter line",
+				want: "<p>Before line</p><tg-math-block>x = 1</tg-math-block><p>After line</p>",
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				got, err := renderRichHTML(tc.in, "raw")
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if got != tc.want {
+					t.Errorf("got %q, want %q", got, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("standard HTML convertMarkdownToTelegramHTML is completely unchanged", func(t *testing.T) {
+		in := "# Title\n\nLine 1\nLine 2\n\n- item 1\n- item 2\n\n> quote\n\n---"
+		got := convertMarkdownToTelegramHTML(in)
+		forbidden := []string{"<p>", "</p>", "<br>", "<h1>", "</h1>", "<ul>", "</ul>", "<ol>", "</ol>", "<li>", "</li>", "<hr/>"}
+		for _, tag := range forbidden {
+			if strings.Contains(got, tag) {
+				t.Errorf("standard HTML must NEVER contain rich tag %s, got:\n%s", tag, got)
+			}
+		}
+		// Confirm standard tags are present
+		if !strings.Contains(got, "<b>Title</b>\n") {
+			t.Errorf("standard HTML should render heading as <b>Title</b>, got:\n%s", got)
+		}
+		if !strings.Contains(got, "• item 1\n• item 2\n") {
+			t.Errorf("standard HTML should render list with bullets, got:\n%s", got)
+		}
+		if !strings.Contains(got, "<blockquote>quote</blockquote>\n") {
+			t.Errorf("standard HTML should render blockquote, got:\n%s", got)
+		}
+		if !strings.Contains(got, "---\n") {
+			t.Errorf("standard HTML should render thematic break as ---, got:\n%s", got)
 		}
 	})
 
@@ -602,9 +784,9 @@ func TestRenderRichHTML(t *testing.T) {
 			{"inside bold", "**\\(x = 1\\)**", "<b><tg-math>x = 1</tg-math></b>"},
 			{"adjacent to italic", "*italic*\\(x = 1\\)", "<i>italic</i><tg-math>x = 1</tg-math>"},
 			{"adjacent to link", "[link](https://example.com)\\(x = 1\\)", `<a href="https://example.com">link</a><tg-math>x = 1</tg-math>`},
-			{"in heading", "# Header \\(x = 1\\)", "<b>Header <tg-math>x = 1</tg-math></b>"},
-			{"in list item", "- list item \\(x = 1\\)", "<tg-math>x = 1</tg-math>"},
-			{"in blockquote", "> quote \\(x = 1\\)", "<blockquote>quote <tg-math>x = 1</tg-math></blockquote>"},
+			{"in heading", "# Header \\(x = 1\\)", "<h1>Header <tg-math>x = 1</tg-math></h1>"},
+			{"in list item", "- list item \\(x = 1\\)", "<li>list item <tg-math>x = 1</tg-math></li>"},
+			{"in blockquote", "> quote \\(x = 1\\)", "<blockquote><p>quote <tg-math>x = 1</tg-math></p></blockquote>"},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
@@ -1031,6 +1213,59 @@ func TestTelegramAdapter_Send_RichIntegration(t *testing.T) {
 		want := "<p>Line 1<br>Line 2</p><p>Line 3</p>"
 		if capturedHTML != want {
 			t.Errorf("captured rich_message.html = %q, want %q", capturedHTML, want)
+		}
+	})
+
+	t.Run("rich wire payload preserves structured headings, lists, blockquotes, hr, and math blocks in Send path", func(t *testing.T) {
+		var capturedHTML string
+		adapter := &TelegramAdapter{
+			chatID: 12345,
+			richConfig: TelegramRichConfig{
+				Enabled:    true,
+				ChatID:     12345,
+				MathEscape: "raw",
+			},
+			makeRequestFn: func(endpoint string, params tgbotapi.Params) (*tgbotapi.APIResponse, error) {
+				if endpoint == "sendRichMessage" {
+					var decoded struct {
+						HTML *string `json:"html"`
+					}
+					if err := json.Unmarshal([]byte(params["rich_message"]), &decoded); err == nil && decoded.HTML != nil {
+						capturedHTML = *decoded.HTML
+					}
+					return &tgbotapi.APIResponse{
+						Ok:     true,
+						Result: []byte(`{"message_id": 999, "chat": {"id": 12345}}`),
+					}, nil
+				}
+				return &tgbotapi.APIResponse{Ok: false}, errors.New("unexpected endpoint")
+			},
+			collectDeliverablesFn: func(after time.Time, exclude exclusionSet) []deliverable { return nil },
+		}
+
+		inMarkdown := "# Heading 1\n## Subheading\n\nParagraph 1 line 1\nParagraph 1 line 2\n\n" +
+			"- Bullet item 1\n- Bullet item 2\n  - Sub bullet\n\n" +
+			"1. Ordered item 1\n2. Ordered item 2\n\n" +
+			"> Quote para 1\n>\n> Quote para 2\n\n" +
+			"---\n\n" +
+			"\\[x^2 + y^2 = z^2\\]\n\n" +
+			"Final para with \\(E = mc^2\\)."
+
+		wantHTML := "<h1>Heading 1</h1><h2>Subheading</h2>" +
+			"<p>Paragraph 1 line 1<br>Paragraph 1 line 2</p>" +
+			"<ul><li>Bullet item 1</li><li>Bullet item 2<ul><li>Sub bullet</li></ul></li></ul>" +
+			"<ol><li>Ordered item 1</li><li>Ordered item 2</li></ol>" +
+			"<blockquote><p>Quote para 1</p><p>Quote para 2</p></blockquote>" +
+			"<hr/>" +
+			"<tg-math-block>x^2 + y^2 = z^2</tg-math-block>" +
+			"<p>Final para with <tg-math>E = mc^2</tg-math>.</p>"
+
+		err := adapter.Send("12345", inMarkdown, aiOpt)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if capturedHTML != wantHTML {
+			t.Errorf("captured rich_message.html mismatch:\ngot:  %q\nwant: %q", capturedHTML, wantHTML)
 		}
 	})
 

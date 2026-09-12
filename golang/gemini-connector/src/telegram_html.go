@@ -154,6 +154,13 @@ var (
 	tagPOpen      = []byte{0x3C, 0x70, 0x3E}                                                             // <p>
 	tagPClose     = []byte{0x3C, 0x2F, 0x70, 0x3E}                                                       // </p>
 	tagBROpen     = []byte{0x3C, 0x62, 0x72, 0x3E}                                                       // <br>
+	tagULOpen     = []byte{0x3C, 0x75, 0x6C, 0x3E}                                                       // <ul>
+	tagULClose    = []byte{0x3C, 0x2F, 0x75, 0x6C, 0x3E}                                                 // </ul>
+	tagOLOpen     = []byte{0x3C, 0x6F, 0x6C, 0x3E}                                                       // <ol>
+	tagOLClose    = []byte{0x3C, 0x2F, 0x6F, 0x6C, 0x3E}                                                 // </ol>
+	tagLIOpen     = []byte{0x3C, 0x6C, 0x69, 0x3E}                                                       // <li>
+	tagLIClose    = []byte{0x3C, 0x2F, 0x6C, 0x69, 0x3E}                                                 // </li>
+	tagHROpen     = []byte{0x3C, 0x68, 0x72, 0x2F, 0x3E}                                                 // <hr/>
 	newline       = []byte{0x0A}
 )
 
@@ -251,7 +258,7 @@ func isInside(n ast.Node, kind ast.NodeKind) bool {
 }
 
 func (r *telegramHTMLRenderer) renderParagraph(w util.BufWriter, _ []byte, n ast.Node, entering bool) (ast.WalkStatus, error) {
-	if r.richMode && !isInside(n, ast.KindListItem) && !isInside(n, ast.KindBlockquote) {
+	if r.richMode {
 		if entering {
 			_, _ = w.Write(tagPOpen)
 		} else {
@@ -266,13 +273,27 @@ func (r *telegramHTMLRenderer) renderParagraph(w util.BufWriter, _ []byte, n ast
 }
 
 func (r *telegramHTMLRenderer) renderTextBlock(w util.BufWriter, _ []byte, n ast.Node, entering bool) (ast.WalkStatus, error) {
-	if !entering {
+	if !r.richMode && !entering {
 		r.separateBlocks(w, n)
 	}
 	return ast.WalkContinue, nil
 }
 
-func (r *telegramHTMLRenderer) renderHeading(w util.BufWriter, _ []byte, _ ast.Node, entering bool) (ast.WalkStatus, error) {
+func (r *telegramHTMLRenderer) renderHeading(w util.BufWriter, _ []byte, n ast.Node, entering bool) (ast.WalkStatus, error) {
+	if r.richMode {
+		level := n.(*ast.Heading).Level
+		if level < 1 {
+			level = 1
+		} else if level > 6 {
+			level = 6
+		}
+		if entering {
+			_, _ = fmt.Fprintf(w, "<h%d>", level)
+		} else {
+			_, _ = fmt.Fprintf(w, "</h%d>", level)
+		}
+		return ast.WalkContinue, nil
+	}
 	if entering {
 		_, _ = w.Write(tagBOpen)
 	} else {
@@ -283,6 +304,12 @@ func (r *telegramHTMLRenderer) renderHeading(w util.BufWriter, _ []byte, _ ast.N
 }
 
 func (r *telegramHTMLRenderer) renderThematicBreak(w util.BufWriter, _ []byte, _ ast.Node, entering bool) (ast.WalkStatus, error) {
+	if r.richMode {
+		if entering {
+			_, _ = w.Write(tagHROpen)
+		}
+		return ast.WalkContinue, nil
+	}
 	if entering {
 		r.ensureLineStart(w)
 		_, _ = w.WriteString("---\n")
@@ -295,7 +322,9 @@ func (r *telegramHTMLRenderer) renderCodeBlock(w util.BufWriter, _ []byte, _ ast
 		_, _ = w.Write(tagPreOpen)
 	} else {
 		_, _ = w.Write(tagPreClose)
-		_, _ = w.Write(newline)
+		if !r.richMode {
+			_, _ = w.Write(newline)
+		}
 	}
 	return ast.WalkContinue, nil
 }
@@ -322,7 +351,9 @@ func (r *telegramHTMLRenderer) renderFencedCodeBlock(w util.BufWriter, source []
 	} else {
 		_, _ = w.Write(tagCodeClose)
 		_, _ = w.Write(tagPreClose)
-		_, _ = w.Write(newline)
+		if !r.richMode {
+			_, _ = w.Write(newline)
+		}
 	}
 	return ast.WalkContinue, nil
 }
@@ -433,13 +464,35 @@ func (r *telegramHTMLRenderer) renderBlockquote(w util.BufWriter, _ []byte, _ as
 		_, _ = w.Write(tagBlockOpen)
 	} else {
 		_, _ = w.Write(tagBlockClose)
-		_, _ = w.Write(newline)
+		if !r.richMode {
+			_, _ = w.Write(newline)
+		}
 	}
 	return ast.WalkContinue, nil
 }
 
 func (r *telegramHTMLRenderer) renderList(w util.BufWriter, _ []byte, n ast.Node, entering bool) (ast.WalkStatus, error) {
 	list := n.(*ast.List)
+	if r.richMode {
+		if entering {
+			if list.IsOrdered() {
+				if list.Start > 1 {
+					_, _ = fmt.Fprintf(w, "<ol start=\"%d\">", list.Start)
+				} else {
+					_, _ = w.Write(tagOLOpen)
+				}
+			} else {
+				_, _ = w.Write(tagULOpen)
+			}
+		} else {
+			if list.IsOrdered() {
+				_, _ = w.Write(tagOLClose)
+			} else {
+				_, _ = w.Write(tagULClose)
+			}
+		}
+		return ast.WalkContinue, nil
+	}
 	if entering {
 		if list.IsOrdered() {
 			if r.listCounters == nil {
@@ -458,6 +511,14 @@ func (r *telegramHTMLRenderer) renderList(w util.BufWriter, _ []byte, n ast.Node
 }
 
 func (r *telegramHTMLRenderer) renderListItem(w util.BufWriter, _ []byte, n ast.Node, entering bool) (ast.WalkStatus, error) {
+	if r.richMode {
+		if entering {
+			_, _ = w.Write(tagLIOpen)
+		} else {
+			_, _ = w.Write(tagLIClose)
+		}
+		return ast.WalkContinue, nil
+	}
 	if !entering {
 		r.closeLine(w)
 		return ast.WalkContinue, nil
