@@ -217,14 +217,36 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 		return
 	}
 
-	systemMsgs, priorTranscriptMsgs, currentTurnMsgs := ExtractCurrentTurn(req.Messages)
-	historyHash := ComputeHistoryHash(priorTranscriptMsgs)
+	remoteHistory, remoteHistoryErr := ParseRemoteHistoryRequest(r.Header)
+	if remoteHistoryErr != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", remoteHistoryErr.Error(), "invalid_history_protocol", nil, false)
+		s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "invalid_history_protocol", startTime, req.Stream, &req.Model, 0, clientClass)
+		return
+	}
+
+	var systemMsgs, priorTranscriptMsgs, currentTurnMsgs []ChatMessage
+	var historyHash string
+	if remoteHistory.Enabled {
+		var splitErr error
+		systemMsgs, currentTurnMsgs, splitErr = SplitRemoteHistoryMessages(req.Messages, remoteHistory.Sequence)
+		if splitErr != nil {
+			writeAPIError(w, http.StatusBadRequest, "invalid_request_error", splitErr.Error(), "invalid_history_protocol", nil, false)
+			s.logOutcome(reqID, "POST", "/v1/chat/completions", http.StatusBadRequest, "invalid_history_protocol", startTime, req.Stream, &req.Model, 0, clientClass)
+			return
+		}
+	} else {
+		systemMsgs, priorTranscriptMsgs, currentTurnMsgs = ExtractCurrentTurn(req.Messages)
+		historyHash = ComputeHistoryHash(priorTranscriptMsgs)
+	}
 
 	var prompt string
 	var renderErr error
 	var isResumeTurn bool
 
-	if len(priorTranscriptMsgs) > 0 && s.syncTracker != nil && s.syncTracker.IsSessionSynced(convID) {
+	if remoteHistory.Enabled {
+		isResumeTurn = true
+		prompt, renderErr = RenderRemoteHistoryPrompt(systemMsgs, currentTurnMsgs, req.Tools, req.ToolChoice, remoteHistory.Sequence)
+	} else if len(priorTranscriptMsgs) > 0 && s.syncTracker != nil && s.syncTracker.IsSessionSynced(convID) {
 		isResumeTurn = true
 		prompt, renderErr = RenderTurnPromptWithTools(systemMsgs, currentTurnMsgs, req.Tools, req.ToolChoice)
 	} else if len(priorTranscriptMsgs) > 0 {
@@ -240,6 +262,15 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 	}
 
 	stopSeqs := parseStopSequences(req.Stop)
+	responseFormatType := ""
+	if req.ResponseFormat != nil {
+		responseFormatType = req.ResponseFormat.Type
+	}
+	structuredOutputRequested := schemaToPass != "" || req.ResponseFormat != nil || hasTools
+	replayFingerprint := prompt
+	if remoteHistory.Enabled {
+		replayFingerprint = remoteReplayFingerprint(prompt, req.Model, schemaToPass, stopSeqs, responseFormatType, structuredOutputRequested)
+	}
 	wantUsage := false
 	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
 		wantUsage = true
@@ -293,6 +324,30 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 		// Execution context bounded by 90s execution cap
 		execCtx, execCancel := context.WithTimeout(jobCtx, defaultMaxExecutionDuration)
 		defer execCancel()
+
+		var replayResult *RemoteReplayResult
+		remoteReplayOwner := false
+		if remoteHistory.Explicit {
+			var replayErr error
+			replayResult, remoteReplayOwner, replayErr = s.getRemoteReplayLedger().Acquire(convID, remoteHistory, replayFingerprint)
+			if replayErr != nil {
+				replayType := "remote_request_capacity"
+				if errors.Is(replayErr, ErrRemoteReplayInFlight) {
+					replayType = "remote_request_in_progress"
+				}
+				turnErr = &AgyError{Type: replayType, Detail: replayErr.Error()}
+				return
+			}
+		}
+
+		var replayFinalized bool
+		if remoteReplayOwner {
+			defer func() {
+				if !replayFinalized {
+					s.getRemoteReplayLedger().Abort(convID, remoteHistory, replayFingerprint)
+				}
+			}()
+		}
 
 		if req.Stream {
 			flusher, ok := w.(http.Flusher)
@@ -396,6 +451,9 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 			}
 
 			var cumText strings.Builder
+			if replayResult != nil {
+				cumText.WriteString(replayResult.Response)
+			}
 			stopped := false
 			streamCb := func(delta string) error {
 				if jobCtx.Err() != nil || reqCtx.Err() != nil {
@@ -449,19 +507,28 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 			}
 
 			var actualUsage *AgyUsage
-			_, streamErr := s.executor.Execute(execCtx, prompt, convID, AgyCallOptions{
-				Profile:                   ProfileAPI,
-				Model:                     req.Model,
-				Stream:                    true,
-				StreamCallback:            streamCb,
-				Logger:                    s.logger,
-				JSONSchema:                schemaToPass,
-				StructuredOutputRequested: schemaToPass != "" || req.ResponseFormat != nil || hasTools,
-				UsageCallback: func(u *AgyUsage) {
-					actualUsage = u
-				},
-			})
-			if streamErr != nil && isResumeTurn && !streamHeadersSent.Load() {
+			var streamErr error
+			if replayResult != nil {
+				actualUsage = cloneAgyUsage(replayResult.Usage)
+			} else {
+				_, streamErr = s.executor.Execute(execCtx, prompt, convID, AgyCallOptions{
+					Profile:                   ProfileAPI,
+					Model:                     req.Model,
+					Stream:                    true,
+					StreamCallback:            streamCb,
+					Logger:                    s.logger,
+					JSONSchema:                schemaToPass,
+					StructuredOutputRequested: structuredOutputRequested,
+					UsageCallback: func(u *AgyUsage) {
+						actualUsage = u
+					},
+				})
+			}
+			if remoteReplayOwner && streamErr != nil {
+				s.getRemoteReplayLedger().Abort(convID, remoteHistory, replayFingerprint)
+				replayFinalized = true
+			}
+			if streamErr != nil && isResumeTurn && shouldFallbackAfterRemoteResumeFailure(remoteHistory.Enabled, streamErr) && !streamHeadersSent.Load() {
 				var ae *AgyError
 				if errors.As(streamErr, &ae) && ae.Type == "session_resume_failed" {
 					log.Printf("[Compaction Fallback] session resume failed for %s, falling back to structured compaction", reqID)
@@ -477,7 +544,7 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 							StreamCallback:            streamCb,
 							Logger:                    s.logger,
 							JSONSchema:                schemaToPass,
-							StructuredOutputRequested: schemaToPass != "" || req.ResponseFormat != nil || hasTools,
+							StructuredOutputRequested: structuredOutputRequested,
 							UsageCallback: func(u *AgyUsage) {
 								actualUsage = u
 							},
@@ -485,7 +552,7 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 					}
 				}
 			}
-			if streamErr == nil && s.syncTracker != nil {
+			if streamErr == nil && s.syncTracker != nil && !remoteHistory.Enabled {
 				s.syncTracker.MarkSessionSynced(convID, historyHash, len(req.Messages))
 			}
 			if streamErr != nil {
@@ -647,6 +714,26 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 						Retryable: false,
 					}
 				}
+				if replayResult != nil && cumText.Len() > 0 {
+					content := cumText.String()
+					if len(stopSeqs) > 0 {
+						content, _ = applyStopSequences(content, stopSeqs)
+					}
+					if content != "" {
+						contentChunk := ChatCompletionChunk{
+							ID:      "chatcmpl-" + reqID,
+							Object:  "chat.completion.chunk",
+							Created: created,
+							Model:   req.Model,
+							Choices: []ChunkChoice{{Index: 0, Delta: ChunkDelta{Content: content}, FinishReason: nil}},
+						}
+						contentBytes, _ := json.Marshal(contentChunk)
+						if err := writeEvent(contentBytes); err != nil {
+							turnErr = err
+							return
+						}
+					}
+				}
 				finishChunk := ChatCompletionChunk{
 					ID:               "chatcmpl-" + reqID,
 					Object:           "chat.completion.chunk",
@@ -662,38 +749,71 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 				}
 			}
 
+			if remoteReplayOwner {
+				s.getRemoteReplayLedger().Complete(convID, remoteHistory, replayFingerprint, cumText.String(), actualUsage)
+				replayFinalized = true
+			}
+
 			// Usage chunk before [DONE] if requested and available
 			if wantUsage && actualUsage != nil {
-				usageChunk := ChatCompletionChunk{
-					ID:      "chatcmpl-" + reqID,
-					Object:  "chat.completion.chunk",
-					Created: created,
-					Model:   req.Model,
-					Choices: []ChunkChoice{},
-					Usage:   mapAgyUsageToOpenAI(actualUsage),
-				}
-				uBytes, _ := json.Marshal(usageChunk)
-				if err := writeEvent(uBytes); err != nil {
-					turnErr = err
-					return
+				mappedUsage := mapAgyUsageForRequest(actualUsage, remoteHistory.Enabled)
+				if mappedUsage != nil {
+					usageChunk := ChatCompletionChunk{
+						ID:      "chatcmpl-" + reqID,
+						Object:  "chat.completion.chunk",
+						Created: created,
+						Model:   req.Model,
+						Choices: []ChunkChoice{},
+						Usage:   mappedUsage,
+					}
+					uBytes, _ := json.Marshal(usageChunk)
+					if err := writeEvent(uBytes); err != nil {
+						turnErr = err
+						return
+					}
 				}
 			}
 
 			_ = writeRaw("data: [DONE]\n\n")
 		} else {
 			var actualUsage *AgyUsage
-			resp, nonStreamErr := s.executor.Execute(execCtx, prompt, convID, AgyCallOptions{
-				Profile:                   ProfileAPI,
-				Model:                     req.Model,
-				Stream:                    false,
-				Logger:                    s.logger,
-				JSONSchema:                schemaToPass,
-				StructuredOutputRequested: schemaToPass != "" || req.ResponseFormat != nil || hasTools,
-				UsageCallback: func(u *AgyUsage) {
-					actualUsage = u
-				},
-			})
-			if nonStreamErr != nil && isResumeTurn {
+			var resp string
+			var nonStreamErr error
+			if replayResult != nil {
+				resp = replayResult.Response
+				actualUsage = cloneAgyUsage(replayResult.Usage)
+			} else {
+				resp, nonStreamErr = s.executor.Execute(execCtx, prompt, convID, AgyCallOptions{
+					Profile:                   ProfileAPI,
+					Model:                     req.Model,
+					Stream:                    false,
+					Logger:                    s.logger,
+					JSONSchema:                schemaToPass,
+					StructuredOutputRequested: structuredOutputRequested,
+					UsageCallback: func(u *AgyUsage) {
+						actualUsage = u
+					},
+				})
+			}
+			if remoteReplayOwner {
+				if nonStreamErr != nil {
+					s.getRemoteReplayLedger().Abort(convID, remoteHistory, replayFingerprint)
+					replayFinalized = true
+				} else if hasTools {
+					if _, validationErr := ParseAndValidateAgyEnvelope(resp, req.Tools, parsedToolChoice); validationErr != nil {
+						nonStreamErr = &AgyError{Type: "invalid_tool_envelope", Detail: validationErr.Error()}
+						s.getRemoteReplayLedger().Abort(convID, remoteHistory, replayFingerprint)
+						replayFinalized = true
+					} else {
+						s.getRemoteReplayLedger().Complete(convID, remoteHistory, replayFingerprint, resp, actualUsage)
+						replayFinalized = true
+					}
+				} else {
+					s.getRemoteReplayLedger().Complete(convID, remoteHistory, replayFingerprint, resp, actualUsage)
+					replayFinalized = true
+				}
+			}
+			if nonStreamErr != nil && isResumeTurn && shouldFallbackAfterRemoteResumeFailure(remoteHistory.Enabled, nonStreamErr) {
 				var ae *AgyError
 				if errors.As(nonStreamErr, &ae) && ae.Type == "session_resume_failed" {
 					log.Printf("[Compaction Fallback] session resume failed for %s, falling back to structured compaction", reqID)
@@ -708,7 +828,7 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 							Stream:                    false,
 							Logger:                    s.logger,
 							JSONSchema:                schemaToPass,
-							StructuredOutputRequested: schemaToPass != "" || req.ResponseFormat != nil || hasTools,
+							StructuredOutputRequested: structuredOutputRequested,
 							UsageCallback: func(u *AgyUsage) {
 								actualUsage = u
 							},
@@ -716,7 +836,7 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 					}
 				}
 			}
-			if nonStreamErr == nil && s.syncTracker != nil {
+			if nonStreamErr == nil && s.syncTracker != nil && !remoteHistory.Enabled {
 				s.syncTracker.MarkSessionSynced(convID, historyHash, len(req.Messages))
 			}
 			if len(stopSeqs) > 0 && nonStreamErr == nil && !hasTools {
@@ -821,6 +941,14 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 			case "invalid_tool_envelope":
 				status = http.StatusBadRequest
 				code = "invalid_tool_envelope"
+			case "remote_request_in_progress":
+				status = http.StatusServiceUnavailable
+				code = "remote_request_in_progress"
+				retry = true
+			case "remote_request_capacity":
+				status = http.StatusServiceUnavailable
+				code = "remote_request_capacity"
+				retry = true
 			}
 		}
 		if !streamHeadersSent.Load() {
@@ -881,7 +1009,7 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 				Created: time.Now().Unix(),
 				Model:   req.Model,
 				Choices: []ChatCompletionChoice{choice},
-				Usage:   mapAgyUsageToOpenAI(turnUsage),
+				Usage:   mapAgyUsageForRequest(turnUsage, remoteHistory.Enabled),
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
@@ -911,7 +1039,7 @@ func (s *OpenAICompatibleServer) handleChatCompletions(w http.ResponseWriter, r 
 						FinishReason: "stop",
 					},
 				},
-				Usage:            mapAgyUsageToOpenAI(turnUsage),
+				Usage:            mapAgyUsageForRequest(turnUsage, remoteHistory.Enabled),
 				XGeminiConnector: ext,
 			}
 			w.Header().Set("Content-Type", "application/json")

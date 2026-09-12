@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/http"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -234,5 +235,152 @@ func TestSessionSync_RestartDoesNotDuplicateBootstrap(t *testing.T) {
 	// Different conversation ID must not be synced
 	if tracker2.IsSessionSynced("session-other-999") {
 		t.Fatalf("unrelated session should not be synced")
+	}
+}
+
+func TestRemoteHistory_CurrentOnlyPromptUsesSystemAndDelta(t *testing.T) {
+	system := []ChatMessage{{Role: "system", Content: "permanent Hermes context"}}
+	first := []ChatMessage{{Role: "user", Content: "current question"}}
+	toolDelta := []ChatMessage{{Role: "tool", ToolCallID: "call-1", Name: "lookup", Content: "fresh result"}}
+
+	firstPrompt, err := RenderRemoteHistoryPrompt(system, first, nil, nil, 1)
+	if err != nil {
+		t.Fatalf("first prompt: %v", err)
+	}
+	if !strings.Contains(firstPrompt, "permanent Hermes context") || !strings.Contains(firstPrompt, "current question") {
+		t.Fatalf("first prompt lost permanent/current content: %s", firstPrompt)
+	}
+	if strings.Contains(firstPrompt, "fresh result") {
+		t.Fatalf("first prompt unexpectedly contains tool delta: %s", firstPrompt)
+	}
+
+	deltaPrompt, err := RenderRemoteHistoryPrompt(system, toolDelta, nil, nil, 2)
+	if err != nil {
+		t.Fatalf("delta prompt: %v", err)
+	}
+	if !strings.Contains(deltaPrompt, "permanent Hermes context") || !strings.Contains(deltaPrompt, "fresh result") {
+		t.Fatalf("delta prompt lost system/delta content: %s", deltaPrompt)
+	}
+	if strings.Contains(deltaPrompt, "current question") {
+		t.Fatalf("delta prompt replayed the original user message: %s", deltaPrompt)
+	}
+}
+
+func TestRemoteHistory_ParsesExplicitContract(t *testing.T) {
+	headers := make(http.Header)
+	headers.Set(remoteHistoryModeHeader, remoteHistoryCurrentOnly)
+	headers.Set(remoteHistoryOwnerHeader, remoteHistoryOwnerAGY)
+	headers.Set(remoteHistoryTurnIDHeader, "turn-1")
+	headers.Set(remoteHistorySequenceHeader, "2")
+	request, err := ParseRemoteHistoryRequest(headers)
+	if err != nil || !request.Enabled || request.TurnID != "turn-1" || request.Sequence != 2 {
+		t.Fatalf("unexpected parsed remote contract: %+v err=%v", request, err)
+	}
+	incomplete := make(http.Header)
+	incomplete.Set(remoteHistoryModeHeader, remoteHistoryCurrentOnly)
+	if _, err := ParseRemoteHistoryRequest(incomplete); err == nil {
+		t.Fatal("incomplete remote contract must be rejected")
+	}
+	oversized := make(http.Header)
+	oversized.Set(remoteHistoryModeHeader, remoteHistoryCurrentOnly)
+	oversized.Set(remoteHistoryOwnerHeader, remoteHistoryOwnerAGY)
+	oversized.Set(remoteHistoryTurnIDHeader, strings.Repeat("x", maxRemoteReplayTurnIDBytes+1))
+	oversized.Set(remoteHistorySequenceHeader, "1")
+	if _, err := ParseRemoteHistoryRequest(oversized); err == nil {
+		t.Fatal("oversized turn ID must be rejected")
+	}
+	control := make(http.Header)
+	control.Set(remoteHistoryModeHeader, remoteHistoryCurrentOnly)
+	control.Set(remoteHistoryOwnerHeader, remoteHistoryOwnerAGY)
+	control.Set(remoteHistoryTurnIDHeader, "turn-\x00-1")
+	control.Set(remoteHistorySequenceHeader, "1")
+	if _, err := ParseRemoteHistoryRequest(control); err == nil {
+		t.Fatal("control-character turn ID must be rejected")
+	}
+}
+
+func TestRemoteHistory_RejectsEmptyToolDelta(t *testing.T) {
+	_, err := RenderRemoteHistoryPrompt(nil, []ChatMessage{{Role: "assistant", Content: "not a tool call"}}, nil, nil, 2)
+	if err == nil {
+		t.Fatal("empty remote tool delta must be rejected")
+	}
+}
+
+func TestRemoteHistory_ResumeFailureDoesNotFallBackToCompaction(t *testing.T) {
+	if shouldFallbackAfterRemoteResumeFailure(true, &AgyError{Type: "session_resume_failed"}) {
+		t.Fatal("remote current-only route must never fall back to full-history compaction")
+	}
+	if !shouldFallbackAfterRemoteResumeFailure(false, &AgyError{Type: "session_resume_failed"}) {
+		t.Fatal("legacy route should retain its existing fallback behavior")
+	}
+}
+
+func TestMapAgyUsage_RejectsUnboundedInputAnchor(t *testing.T) {
+	usage := &AgyUsage{InputTokens: 310_567_811, OutputTokens: 10, TotalTokens: 310_567_821}
+	if got := mapAgyUsageToOpenAI(usage); got != nil {
+		t.Fatalf("unbounded usage must not be exposed as an OpenAI prompt anchor: %+v", got)
+	}
+}
+
+func TestMapAgyUsage_PreservesSaneUsage(t *testing.T) {
+	got := mapAgyUsageToOpenAI(&AgyUsage{InputTokens: 1234, OutputTokens: 56, TotalTokens: 1290})
+	if got == nil || got.PromptTokens != 1234 || got.CompletionTokens != 56 || got.TotalTokens != 1290 {
+		t.Fatalf("sane usage was not mapped: %+v", got)
+	}
+}
+func TestRemoteHistory_SplitsAndRejectsPriorTranscript(t *testing.T) {
+	priorAndCurrent := []ChatMessage{
+		{Role: "system", Content: "permanent"},
+		{Role: "user", Content: "old"},
+		{Role: "user", Content: "current"},
+	}
+	if _, _, err := SplitRemoteHistoryMessages(priorAndCurrent, 1); err == nil {
+		t.Fatal("remote sequence 1 must reject prior transcript messages")
+	}
+	validDelta := []ChatMessage{
+		{Role: "system", Content: "permanent"},
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "call-1", Type: "function"}}},
+		{Role: "tool", ToolCallID: "call-1", Content: "result"},
+	}
+	system, current, err := SplitRemoteHistoryMessages(validDelta, 2)
+	if err != nil || len(system) != 1 || len(current) != 2 {
+		t.Fatalf("valid remote delta was rejected: system=%d current=%d err=%v", len(system), len(current), err)
+	}
+}
+
+func TestRemoteHistory_RejectsMismatchedToolPair(t *testing.T) {
+	_, _, err := SplitRemoteHistoryMessages([]ChatMessage{
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "call-1", Type: "function"}, {ID: "call-2", Type: "function"}}},
+		{Role: "tool", ToolCallID: "call-1", Content: "result"},
+	}, 2)
+	if err == nil {
+		t.Fatal("incomplete tool result set must be rejected")
+	}
+	_, _, err = SplitRemoteHistoryMessages([]ChatMessage{
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "call-1", Type: "function"}, {ID: "call-1", Type: "function"}}},
+		{Role: "tool", ToolCallID: "call-1", Content: "result"},
+	}, 2)
+	if err == nil {
+		t.Fatal("duplicate assistant tool-call IDs must be rejected")
+	}
+	_, _, err = SplitRemoteHistoryMessages([]ChatMessage{
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "call-1", Type: "function"}}},
+		{Role: "tool", ToolCallID: "call-other", Content: "result"},
+	}, 2)
+	if err == nil {
+		t.Fatal("mismatched tool result must be rejected")
+	}
+}
+
+func TestRemoteReplayFingerprintIncludesRequestShape(t *testing.T) {
+	base := remoteReplayFingerprint("prompt", "model-a", "schema-a", []string{"STOP"}, "json_schema", true)
+	for name, other := range map[string]string{
+		"model":  remoteReplayFingerprint("prompt", "model-b", "schema-a", []string{"STOP"}, "json_schema", true),
+		"schema": remoteReplayFingerprint("prompt", "model-a", "schema-b", []string{"STOP"}, "json_schema", true),
+		"stop":   remoteReplayFingerprint("prompt", "model-a", "schema-a", []string{"END"}, "json_schema", true),
+	} {
+		if base == other {
+			t.Errorf("fingerprint did not include %s", name)
+		}
 	}
 }

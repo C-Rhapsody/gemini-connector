@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"os/exec"
 	"strings"
@@ -29,7 +30,12 @@ const (
 	defaultMaxAggregateBytes    = 768 * 1024      // 768 KiB
 	defaultMaxOutputBytes       = 4 * 1024 * 1024 // 4 MiB
 	defaultHeartbeatInterval    = 15 * time.Second
+	// Usage is a per-request anchor for Hermes. Values beyond this bound are
+	// treated as cumulative/corrupt telemetry, never clamped into a false anchor.
+	maxReportedUsageTokens = 16 * 1024 * 1024
 )
+
+var invalidRemoteUsageCount atomic.Uint64
 
 type APIErrorBody struct {
 	Message string  `json:"message"`
@@ -286,8 +292,26 @@ type UsageInfo struct {
 	CompletionTokensDetails *CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
 }
 
+func isSaneAgyUsage(u *AgyUsage) bool {
+	if u == nil {
+		return false
+	}
+	for _, value := range []int{u.InputTokens, u.OutputTokens, u.ThinkingTokens, u.CacheReadTokens, u.TotalTokens} {
+		if value < 0 || value > maxReportedUsageTokens {
+			return false
+		}
+	}
+	if u.TotalTokens > 0 && u.TotalTokens < u.InputTokens+u.OutputTokens {
+		return false
+	}
+	return true
+}
+
 func mapAgyUsageToOpenAI(u *AgyUsage) *UsageInfo {
 	if u == nil {
+		return nil
+	}
+	if !isSaneAgyUsage(u) {
 		return nil
 	}
 	ui := &UsageInfo{
@@ -306,6 +330,21 @@ func mapAgyUsageToOpenAI(u *AgyUsage) *UsageInfo {
 		}
 	}
 	return ui
+}
+
+func mapAgyUsageToOpenAIRemote(u *AgyUsage) *UsageInfo {
+	if u != nil && !isSaneAgyUsage(u) {
+		invalidRemoteUsageCount.Add(1)
+		log.Printf("[Usage] ignored invalid AGY usage for remote-history route")
+		return nil
+	}
+	return mapAgyUsageToOpenAI(u)
+}
+func mapAgyUsageForRequest(u *AgyUsage, remoteHistory bool) *UsageInfo {
+	if remoteHistory {
+		return mapAgyUsageToOpenAIRemote(u)
+	}
+	return mapAgyUsageToOpenAI(u)
 }
 
 func parseStopSequences(stop any) []string {
@@ -495,20 +534,23 @@ type OpenAICompatibleServer struct {
 	heartbeatInterval time.Duration
 	convIDProvider    func() string
 	syncTracker       *SessionSyncTracker
+	remoteReplayMu    sync.Mutex
+	remoteReplay      *RemoteReplayLedger
 }
 
 func NewOpenAICompatibleServer(apiKey string, turns *TurnCoordinator, logger *APILogger, convIDProvider ...func() string) *OpenAICompatibleServer {
 	ctx, cancel := context.WithCancel(context.Background())
 	executor := newAgyExecutor()
 	s := &OpenAICompatibleServer{
-		apiKeyHash:  sha256.Sum256([]byte(apiKey)),
-		catalog:     NewModelCatalog(),
-		turns:       turns,
-		logger:      logger,
-		executor:    executor,
-		rootCtx:     ctx,
-		cancelRoot:  cancel,
-		syncTracker: NewSessionSyncTracker(""),
+		apiKeyHash:   sha256.Sum256([]byte(apiKey)),
+		catalog:      NewModelCatalog(),
+		turns:        turns,
+		logger:       logger,
+		executor:     executor,
+		rootCtx:      ctx,
+		cancelRoot:   cancel,
+		syncTracker:  NewSessionSyncTracker(""),
+		remoteReplay: NewRemoteReplayLedger(),
 	}
 	if len(convIDProvider) > 0 && convIDProvider[0] != nil {
 		s.convIDProvider = convIDProvider[0]
@@ -525,6 +567,15 @@ func (s *OpenAICompatibleServer) getConversationID() string {
 
 func (s *OpenAICompatibleServer) SetConversationIDProvider(provider func() string) {
 	s.convIDProvider = provider
+}
+
+func (s *OpenAICompatibleServer) getRemoteReplayLedger() *RemoteReplayLedger {
+	s.remoteReplayMu.Lock()
+	defer s.remoteReplayMu.Unlock()
+	if s.remoteReplay == nil {
+		s.remoteReplay = NewRemoteReplayLedger()
+	}
+	return s.remoteReplay
 }
 
 func (s *OpenAICompatibleServer) Drain() {
