@@ -801,18 +801,243 @@ func TestRenderRichHTML(t *testing.T) {
 		}
 	})
 
-	t.Run("code containing literal LaTeX remains code and never restores as tg-math", func(t *testing.T) {
-		in := "Code: `\\(x = 1\\)` and block:\n```\n\\(y = 2\\)\n```"
-		got, err := renderRichHTML(in, "raw")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if strings.Contains(got, "<tg-math>") {
-			t.Errorf("code blocks must never contain <tg-math>, got %q", got)
-		}
-		if !strings.Contains(got, "<code>\\(x = 1\\)</code>") {
-			t.Errorf("expected inline code with literal LaTeX, got %q", got)
-		}
+	t.Run("markdown fenced code block is unwrapped as document in Rich mode", func(t *testing.T) {
+		t.Run("single markdown code block converts to rich structure without pre tags", func(t *testing.T) {
+			in := "```markdown\n# Title\n\nParagraph text.\n\n- item 1\n- item 2\n```"
+			got, err := renderRichHTML(in, "raw")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if strings.Contains(got, "<pre>") || strings.Contains(got, "language-markdown") {
+				t.Errorf("expected no pre or language-markdown tag, got %q", got)
+			}
+			want := "<h1>Title</h1><p>Paragraph text.</p><ul><li>item 1</li><li>item 2</li></ul>"
+			if got != want {
+				t.Errorf("got %q, want %q", got, want)
+			}
+		})
+
+		t.Run("multiple markdown blocks between explanations preserve order and boundaries", func(t *testing.T) {
+			in := "Intro paragraph.\n\n```markdown\n# Section 1\n\nContent 1\n```\n\nMiddle text.\n\n```markdown\n## Section 2\n\nContent 2\n```\n\nOutro text."
+			got, err := renderRichHTML(in, "raw")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			want := "<p>Intro paragraph.</p><h1>Section 1</h1><p>Content 1</p><p>Middle text.</p><h2>Section 2</h2><p>Content 2</p><p>Outro text.</p>"
+			if got != want {
+				t.Errorf("got %q, want %q", got, want)
+			}
+		})
+
+		t.Run("inline and block math inside markdown code block are rendered as math tags", func(t *testing.T) {
+			in := "```markdown\n미적분학 핵심 정리\n\n가우스 적분:\n\\[\\int_{-\\infty}^{\\infty} e^{-x^2} \\, dx = \\sqrt{\\pi}\\]\n\n인라인 \\(E = mc^2\\) 및 $$a^2 + b^2 = c^2$$\n```"
+			got, err := renderRichHTML(in, "raw")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !strings.Contains(got, "<tg-math-block>\\int_{-\\infty}^{\\infty} e^{-x^2} \\, dx = \\sqrt{\\pi}</tg-math-block>") {
+				t.Errorf("missing expected block math in %q", got)
+			}
+			if !strings.Contains(got, "<tg-math>E = mc^2</tg-math>") {
+				t.Errorf("missing expected inline math in %q", got)
+			}
+			if !strings.Contains(got, "<tg-math-block>a^2 + b^2 = c^2</tg-math-block>") {
+				t.Errorf("missing expected $$ block math in %q", got)
+			}
+			if strings.Contains(got, "<pre>") {
+				t.Errorf("expected no pre tag, got %q", got)
+			}
+		})
+
+		t.Run("matrix with ampersands inside markdown block with numeric escape", func(t *testing.T) {
+			in := "```markdown\n행렬 정의:\n\\[\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}\\]\n```"
+			got, err := renderRichHTML(in, "numeric")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			wantMath := "<tg-math-block>\\begin{pmatrix} a &#38; b \\\\ c &#38; d \\end{pmatrix}</tg-math-block>"
+			if !strings.Contains(got, wantMath) {
+				t.Errorf("expected numeric-escaped matrix %q, got %q", wantMath, got)
+			}
+
+			// Raw profile should reject ampersand
+			_, err = renderRichHTML(in, "raw")
+			if err == nil {
+				t.Errorf("expected error in raw profile for ampersand, got nil")
+			}
+		})
+
+		t.Run("actual code block and inline code inside markdown block are preserved", func(t *testing.T) {
+			in := "````markdown\n# Example\n\nInline `code \\(x = 1\\)` and block:\n\n```python\ndef foo():\n    # \\(not math\\)\n    return 42\n```\n````"
+			got, err := renderRichHTML(in, "raw")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			// Outer markdown should be unwrapped
+			if strings.Contains(got, "language-markdown") {
+				t.Errorf("expected language-markdown to be unwrapped, got %q", got)
+			}
+			// Inner python block should be preserved as pre/code
+			if !strings.Contains(got, `<pre><code class="language-python">def foo():`) {
+				t.Errorf("expected inner python code block to be preserved, got %q", got)
+			}
+			// Math inside python code or inline code must NOT become tg-math
+			if strings.Contains(got, "<tg-math>") {
+				t.Errorf("math inside code must NOT be restored as tg-math, got %q", got)
+			}
+			if !strings.Contains(got, "<code>code \\(x = 1\\)</code>") {
+				t.Errorf("expected inline code with literal LaTeX preserved, got %q", got)
+			}
+		})
+
+		t.Run("nested markdown code block inside outer markdown block is not recursively expanded", func(t *testing.T) {
+			in := "````markdown\n# Outer\n\n```markdown\n# Inner\n```\n````"
+			got, err := renderRichHTML(in, "raw")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			// Outer should be unwrapped into h1
+			if !strings.Contains(got, "<h1>Outer</h1>") {
+				t.Errorf("expected <h1>Outer</h1>, got %q", got)
+			}
+			// Inner markdown block must be preserved as literal pre/code (no recursion)
+			if !strings.Contains(got, `<pre><code class="language-markdown"># Inner`) {
+				t.Errorf("expected inner markdown code block to be preserved as code, got %q", got)
+			}
+		})
+
+		t.Run("non-target code blocks are preserved as literal code", func(t *testing.T) {
+			cases := []struct {
+				name string
+				in   string
+				want string
+			}{
+				{
+					name: "go code block",
+					in:   "```go\nfunc main() {}\n```",
+					want: "<pre><code class=\"language-go\">func main() {}\n</code></pre>",
+				},
+				{
+					name: "python code block",
+					in:   "```python\nprint('hello')\n```",
+					want: "<pre><code class=\"language-python\">print(&#39;hello&#39;)\n</code></pre>",
+				},
+				{
+					name: "json code block",
+					in:   "```json\n{\"a\": 1}\n```",
+					want: "<pre><code class=\"language-json\">{&#34;a&#34;: 1}\n</code></pre>",
+				},
+				{
+					name: "latex code block",
+					in:   "```latex\n\\[x = 1\\]\n```",
+					want: "<pre><code class=\"language-latex\">\\[x = 1\\]\n</code></pre>",
+				},
+				{
+					name: "unspecified language code block",
+					in:   "```\nsome code\n```",
+					want: "<pre><code>some code\n</code></pre>",
+				},
+				{
+					name: "md code block (not markdown)",
+					in:   "```md\n# Not Unwrapped\n```",
+					want: "<pre><code class=\"language-md\"># Not Unwrapped\n</code></pre>",
+				},
+				{
+					name: "text code block",
+					in:   "```text\nplain text\n```",
+					want: "<pre><code class=\"language-text\">plain text\n</code></pre>",
+				},
+				{
+					name: "indented code block",
+					in:   "Paragraph:\n\n    indented code\n    line 2",
+					want: "<p>Paragraph:</p><pre>indented code\nline 2\n</pre>",
+				},
+			}
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					got, err := renderRichHTML(tc.in, "raw")
+					if err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
+					if got != tc.want {
+						t.Errorf("got %q, want %q", got, tc.want)
+					}
+				})
+			}
+		})
+
+		t.Run("parser edge cases: tilde fence, long fence, unclosed fence", func(t *testing.T) {
+			t.Run("tilde fence ~~~markdown", func(t *testing.T) {
+				in := "~~~markdown\n# Tilde Title\n\nContent\n~~~"
+				got, err := renderRichHTML(in, "raw")
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				want := "<h1>Tilde Title</h1><p>Content</p>"
+				if got != want {
+					t.Errorf("got %q, want %q", got, want)
+				}
+			})
+
+			t.Run("5-backtick long fence", func(t *testing.T) {
+				in := "`````markdown\n# Deep Title\n`````"
+				got, err := renderRichHTML(in, "raw")
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				want := "<h1>Deep Title</h1>"
+				if got != want {
+					t.Errorf("got %q, want %q", got, want)
+				}
+			})
+
+			t.Run("unclosed markdown fence extends to EOF", func(t *testing.T) {
+				in := "```markdown\n# Unclosed Title\n\nRemaining text"
+				got, err := renderRichHTML(in, "raw")
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				want := "<h1>Unclosed Title</h1><p>Remaining text</p>"
+				if got != want {
+					t.Errorf("got %q, want %q", got, want)
+				}
+			})
+
+			t.Run("markdown with additional info string attributes", func(t *testing.T) {
+				in := "```markdown title=\"demo.md\"\n# Attributed Title\n```"
+				got, err := renderRichHTML(in, "raw")
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				want := "<h1>Attributed Title</h1>"
+				if got != want {
+					t.Errorf("got %q, want %q", got, want)
+				}
+			})
+		})
+
+		t.Run("korean, emoji, link, emphasis and special characters in markdown block", func(t *testing.T) {
+			in := "```markdown\n# 안녕하세요 🚀\n\n**굵은 글씨**와 *기울임*, 그리고 [구글](https://google.com)\n\nValues: x < 10 && y > 20\n```"
+			got, err := renderRichHTML(in, "raw")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			want := "<h1>안녕하세요 🚀</h1><p><b>굵은 글씨</b>와 <i>기울임</i>, 그리고 <a href=\"https://google.com\">구글</a></p><p>Values: x &lt; 10 &amp;&amp; y &gt; 20</p>"
+			if got != want {
+				t.Errorf("got %q, want %q", got, want)
+			}
+		})
+
+		t.Run("standard HTML convertMarkdownToTelegramHTML keeps markdown block as code", func(t *testing.T) {
+			in := "```markdown\n# Title\n```"
+			got := convertMarkdownToTelegramHTML(in)
+			if !strings.Contains(got, `<pre><code class="language-markdown"># Title`) {
+				t.Errorf("standard HTML must keep markdown code block as code, got %q", got)
+			}
+			if strings.Contains(got, "<h1>") {
+				t.Errorf("standard HTML must never produce <h1>, got %q", got)
+			}
+		})
 	})
 }
 
@@ -1342,6 +1567,51 @@ func TestTelegramAdapter_Send_RichIntegration(t *testing.T) {
 		}
 		if sendOneCalled == 0 {
 			t.Errorf("expected standard sendOne path to be called")
+		}
+	})
+
+	t.Run("rich wire payload unwraps markdown code block and delivers rendered document with math in Send path", func(t *testing.T) {
+		var capturedHTML string
+		adapter := &TelegramAdapter{
+			chatID: 12345,
+			richConfig: TelegramRichConfig{
+				Enabled:    true,
+				ChatID:     12345,
+				MathEscape: "raw",
+			},
+			makeRequestFn: func(endpoint string, params tgbotapi.Params) (*tgbotapi.APIResponse, error) {
+				if endpoint == "sendRichMessage" {
+					var decoded struct {
+						HTML *string `json:"html"`
+					}
+					if err := json.Unmarshal([]byte(params["rich_message"]), &decoded); err == nil && decoded.HTML != nil {
+						capturedHTML = *decoded.HTML
+					}
+					return &tgbotapi.APIResponse{
+						Ok:     true,
+						Result: []byte(`{"message_id": 999, "chat": {"id": 12345}}`),
+					}, nil
+				}
+				return &tgbotapi.APIResponse{Ok: false}, errors.New("unexpected endpoint")
+			},
+			collectDeliverablesFn: func(after time.Time, exclude exclusionSet) []deliverable { return nil },
+		}
+
+		inMarkdown := "AGY output:\n\n```markdown\n# 미적분학 정리\n\n가우스 적분:\n\\[\\int_{-\\infty}^{\\infty} e^{-x^2} \\, dx = \\sqrt{\\pi}\\]\n\n- 항목 1\n- 항목 2\n```\n\n끝."
+
+		wantHTML := "<p>AGY output:</p>" +
+			"<h1>미적분학 정리</h1>" +
+			"<p>가우스 적분:</p>" +
+			"<tg-math-block>\\int_{-\\infty}^{\\infty} e^{-x^2} \\, dx = \\sqrt{\\pi}</tg-math-block>" +
+			"<ul><li>항목 1</li><li>항목 2</li></ul>" +
+			"<p>끝.</p>"
+
+		err := adapter.Send("12345", inMarkdown, aiOpt)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if capturedHTML != wantHTML {
+			t.Errorf("captured rich_message.html mismatch:\ngot:  %q\nwant: %q", capturedHTML, wantHTML)
 		}
 	})
 }

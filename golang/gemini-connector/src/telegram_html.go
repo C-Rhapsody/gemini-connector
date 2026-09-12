@@ -317,9 +317,14 @@ func (r *telegramHTMLRenderer) renderThematicBreak(w util.BufWriter, _ []byte, _
 	return ast.WalkContinue, nil
 }
 
-func (r *telegramHTMLRenderer) renderCodeBlock(w util.BufWriter, _ []byte, _ ast.Node, entering bool) (ast.WalkStatus, error) {
+func (r *telegramHTMLRenderer) renderCodeBlock(w util.BufWriter, source []byte, n ast.Node, entering bool) (ast.WalkStatus, error) {
 	if entering {
 		_, _ = w.Write(tagPreOpen)
+		cb := n.(*ast.CodeBlock)
+		for i := 0; i < cb.Lines().Len(); i++ {
+			seg := cb.Lines().At(i)
+			_, _ = w.WriteString(escapeHTML(string(seg.Value(source))))
+		}
 	} else {
 		_, _ = w.Write(tagPreClose)
 		if !r.richMode {

@@ -544,6 +544,183 @@ func isolateMathBlockPlaceholder(html string, placeholder string, blockTag strin
 	return html[:pOpenIdx] + sb.String() + html[pCloseIdx+len("</p>"):]
 }
 
+// unwrapMarkdownCodeBlocks scans markdown text and unwraps top-level fenced code blocks
+// whose language is explicitly "markdown", turning them into raw Markdown document content.
+// Non-markdown code blocks (go, python, md, text, latex, empty, etc.) and indented
+// code blocks are left intact as code. Nested code blocks inside the unwrapped
+// markdown block are also preserved because only the outer matching fence is unwrapped.
+func unwrapMarkdownCodeBlocks(s string) string {
+	n := len(s)
+	if n == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.Grow(n)
+
+	i := 0
+	for i < n {
+		leadSpaces := 0
+		for i+leadSpaces < n && s[i+leadSpaces] == ' ' && leadSpaces < 3 {
+			leadSpaces++
+		}
+		idx := i + leadSpaces
+		if idx < n && (s[idx] == '`' || s[idx] == '~') {
+			fenceChar := s[idx]
+			fenceLen := 0
+			for idx+fenceLen < n && s[idx+fenceLen] == fenceChar {
+				fenceLen++
+			}
+			if fenceLen >= 3 {
+				fenceEnd := idx + fenceLen
+				lineEnd := strings.IndexByte(s[fenceEnd:], '\n')
+				var infoStr string
+				var nextLineStart int
+				if lineEnd == -1 {
+					infoStr = s[fenceEnd:]
+					nextLineStart = n
+				} else {
+					infoStr = s[fenceEnd : fenceEnd+lineEnd]
+					nextLineStart = fenceEnd + lineEnd + 1
+				}
+
+				trimmedInfo := strings.TrimSpace(infoStr)
+				validFence := true
+				if fenceChar == '`' && strings.ContainsRune(trimmedInfo, '`') {
+					validFence = false
+				}
+
+				if validFence {
+					fields := strings.Fields(trimmedInfo)
+					lang := ""
+					if len(fields) > 0 {
+						lang = strings.ToLower(fields[0])
+					}
+
+					if lang == "markdown" {
+						contentStart := nextLineStart
+						closeStart := -1
+						closeEnd := -1
+						searchPos := contentStart
+
+						for searchPos < n {
+							curLineStart := searchPos
+							curLeadSpaces := 0
+							for searchPos+curLeadSpaces < n && s[searchPos+curLeadSpaces] == ' ' && curLeadSpaces < 3 {
+								curLeadSpaces++
+							}
+							cPos := searchPos + curLeadSpaces
+							if cPos < n && s[cPos] == fenceChar {
+								cLen := 0
+								for cPos+cLen < n && s[cPos+cLen] == fenceChar {
+									cLen++
+								}
+								if cLen >= fenceLen {
+									restStart := cPos + cLen
+									restEnd := strings.IndexByte(s[restStart:], '\n')
+									var rest string
+									if restEnd == -1 {
+										rest = s[restStart:]
+										if strings.TrimSpace(rest) == "" {
+											closeStart = curLineStart
+											closeEnd = n
+											break
+										}
+									} else {
+										rest = s[restStart : restStart+restEnd]
+										if strings.TrimSpace(rest) == "" {
+											closeStart = curLineStart
+											closeEnd = restStart + restEnd + 1
+											break
+										}
+									}
+								}
+							}
+							nextNL := strings.IndexByte(s[searchPos:], '\n')
+							if nextNL == -1 {
+								break
+							}
+							searchPos += nextNL + 1
+						}
+
+						if closeStart != -1 {
+							sb.WriteString(s[contentStart:closeStart])
+							i = closeEnd
+							continue
+						} else {
+							sb.WriteString(s[contentStart:])
+							i = n
+							continue
+						}
+					} else {
+						// Non-markdown code block: keep the whole block intact
+						contentStart := nextLineStart
+						closeEnd := -1
+						searchPos := contentStart
+
+						for searchPos < n {
+							curLeadSpaces := 0
+							for searchPos+curLeadSpaces < n && s[searchPos+curLeadSpaces] == ' ' && curLeadSpaces < 3 {
+								curLeadSpaces++
+							}
+							cPos := searchPos + curLeadSpaces
+							if cPos < n && s[cPos] == fenceChar {
+								cLen := 0
+								for cPos+cLen < n && s[cPos+cLen] == fenceChar {
+									cLen++
+								}
+								if cLen >= fenceLen {
+									restStart := cPos + cLen
+									restEnd := strings.IndexByte(s[restStart:], '\n')
+									var rest string
+									if restEnd == -1 {
+										rest = s[restStart:]
+										if strings.TrimSpace(rest) == "" {
+											closeEnd = n
+											break
+										}
+									} else {
+										rest = s[restStart : restStart+restEnd]
+										if strings.TrimSpace(rest) == "" {
+											closeEnd = restStart + restEnd + 1
+											break
+										}
+									}
+								}
+							}
+							nextNL := strings.IndexByte(s[searchPos:], '\n')
+							if nextNL == -1 {
+								break
+							}
+							searchPos += nextNL + 1
+						}
+
+						if closeEnd != -1 {
+							sb.WriteString(s[i:closeEnd])
+							i = closeEnd
+							continue
+						} else {
+							sb.WriteString(s[i:])
+							i = n
+							continue
+						}
+					}
+				}
+			}
+		}
+
+		nextNL := strings.IndexByte(s[i:], '\n')
+		if nextNL == -1 {
+			sb.WriteString(s[i:])
+			break
+		}
+		sb.WriteString(s[i : i+nextNL+1])
+		i += nextNL + 1
+	}
+
+	return sb.String()
+}
+
 // renderRichHTML tokenizes LaTeX math, renders the remaining markdown to Telegram HTML,
 // verifies placeholder integrity, and restores math tokens as <tg-math> or <tg-math-block>.
 func renderRichHTML(s string, mathEscape string) (string, error) {
@@ -551,9 +728,11 @@ func renderRichHTML(s string, mathEscape string) (string, error) {
 		return "", nil
 	}
 
-	masked, tokens := tokenizeLaTeX(s)
+	unwrapped := unwrapMarkdownCodeBlocks(s)
+
+	masked, tokens := tokenizeLaTeX(unwrapped)
 	if len(tokens) == 0 {
-		return convertMarkdownToTelegramRichHTML(s), nil
+		return convertMarkdownToTelegramRichHTML(unwrapped), nil
 	}
 
 	html := convertMarkdownToTelegramRichHTML(masked)
