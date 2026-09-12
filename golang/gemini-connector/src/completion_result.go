@@ -119,56 +119,14 @@ func BuildCompletionResult(
 		candidate = accumulatedDeltas
 	}
 
-	// If native tools executed:
-	// Any non-empty response is the final text response from the native tool execution.
-	// We NEVER return client tool calls for already-executed native tools.
-	if res.SawNativeTool {
-		if candidate == "" {
+	if strings.TrimSpace(candidate) == "" {
+		if res.SawNativeTool {
 			res.IsError = true
 			res.ErrorCode = "native_tool_containment_violation"
 			res.ErrorMessage = "Native tool execution produced no final response text"
 			res.HTTPStatus = 400
 			return res
 		}
-
-		finalText := candidate
-		if len(stopSeqs) > 0 {
-			truncated, matched := applyStopSequences(finalText, stopSeqs)
-			if matched {
-				res.WasTruncatedByStop = true
-				finalText = truncated
-			}
-		}
-		res.Text = finalText
-		res.FinishReason = "stop"
-		return res
-	}
-
-	// If no tools in request:
-	if !hasTools {
-		if candidate == "" {
-			res.IsError = true
-			res.ErrorCode = "upstream_no_output"
-			res.ErrorMessage = "Upstream model produced no output"
-			res.HTTPStatus = 502
-			return res
-		}
-
-		finalText := candidate
-		if len(stopSeqs) > 0 {
-			truncated, matched := applyStopSequences(finalText, stopSeqs)
-			if matched {
-				res.WasTruncatedByStop = true
-				finalText = truncated
-			}
-		}
-		res.Text = finalText
-		res.FinishReason = "stop"
-		return res
-	}
-
-	// When tools are provided, try parsing tool envelope
-	if candidate == "" {
 		res.IsError = true
 		res.ErrorCode = "upstream_no_output"
 		res.ErrorMessage = "Upstream model produced no output"
@@ -176,7 +134,23 @@ func BuildCompletionResult(
 		return res
 	}
 
-	// Attempt envelope parsing
+	// If no tools in request, connector did not request an internal envelope.
+	// Preserve plain text and user-intended JSON without unwrapping.
+	if !hasTools {
+		finalText := candidate
+		if len(stopSeqs) > 0 {
+			truncated, matched := applyStopSequences(finalText, stopSeqs)
+			if matched {
+				res.WasTruncatedByStop = true
+				finalText = truncated
+			}
+		}
+		res.Text = finalText
+		res.FinishReason = "stop"
+		return res
+	}
+
+	// When tools are provided, validate against the internal envelope contract.
 	env, envErr := ParseAndValidateAgyEnvelope(candidate, tools, toolChoice)
 	if envErr == nil && env != nil {
 		if env.Type == "tool_call" {
@@ -197,11 +171,23 @@ func BuildCompletionResult(
 			return res
 		}
 
-		// env.Type == "final"
-		finalText := ""
-		if env.Content != nil {
-			finalText = *env.Content
+		// env.Type == "final": extract content
+		if env.Content == nil || strings.TrimSpace(*env.Content) == "" {
+			if res.SawNativeTool {
+				res.IsError = true
+				res.ErrorCode = "native_tool_containment_violation"
+				res.ErrorMessage = "Native tool execution produced no final response text"
+				res.HTTPStatus = 400
+				return res
+			}
+			res.IsError = true
+			res.ErrorCode = "upstream_no_output"
+			res.ErrorMessage = "Upstream model produced no output"
+			res.HTTPStatus = 502
+			return res
 		}
+
+		finalText := *env.Content
 		if len(stopSeqs) > 0 {
 			truncated, matched := applyStopSequences(finalText, stopSeqs)
 			if matched {
@@ -214,8 +200,11 @@ func BuildCompletionResult(
 		return res
 	}
 
-	// Not a formal envelope: when tools are enabled and toolChoice != "none", malformed envelope is an error
-	if toolChoice.Mode != "none" {
+	// Not a valid envelope:
+	// If candidate was an attempt at an envelope (starts with '{' or '```' or has tool_call markers),
+	// or if toolChoice.Mode != "none" when no native tools ran:
+	// it must fail validation rather than leaking malformed envelopes as raw success text.
+	if isEnvelopeAttempt(candidate) || (!res.SawNativeTool && toolChoice.Mode != "none") {
 		res.IsError = true
 		res.ErrorCode = "invalid_tool_envelope"
 		res.ErrorMessage = fmt.Sprintf("Tool envelope validation failed: %v", envErr)
@@ -223,7 +212,8 @@ func BuildCompletionResult(
 		return res
 	}
 
-	// Otherwise, plain text response is accepted as final content
+	// Otherwise, plain text response is accepted as final content (e.g. after native tool execution
+	// where AGY produced plain text output, or when toolChoice.Mode == "none").
 	finalText := candidate
 	if len(stopSeqs) > 0 {
 		truncated, matched := applyStopSequences(finalText, stopSeqs)
@@ -406,3 +396,28 @@ func ParseNDJSONBytes(
 		stopSeqs,
 	), nil
 }
+
+// isEnvelopeAttempt checks if the raw candidate string appears to be an attempt
+// to output a structured JSON envelope (pure JSON or markdown codeblock).
+func isEnvelopeAttempt(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	if strings.HasPrefix(trimmed, "```json") {
+		return true
+	}
+	if strings.HasPrefix(trimmed, "```") {
+		inner := strings.TrimPrefix(trimmed, "```")
+		inner = strings.TrimSuffix(inner, "```")
+		inner = strings.TrimSpace(inner)
+		if strings.HasPrefix(inner, "{") {
+			return true
+		}
+	}
+	if strings.HasPrefix(trimmed, "{") {
+		return true
+	}
+	if strings.Contains(trimmed, "<tool_call>") || strings.Contains(trimmed, "</tool_call>") {
+		return true
+	}
+	return false
+}
+
