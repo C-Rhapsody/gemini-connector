@@ -499,10 +499,10 @@ func renderRichHTML(s string, mathEscape string) (string, error) {
 
 	masked, tokens := tokenizeLaTeX(s)
 	if len(tokens) == 0 {
-		return convertMarkdownToTelegramHTML(s), nil
+		return convertMarkdownToTelegramRichHTML(s), nil
 	}
 
-	html := convertMarkdownToTelegramHTML(masked)
+	html := convertMarkdownToTelegramRichHTML(masked)
 
 	// Verify all placeholders are present exactly once and restore them
 	for _, tok := range tokens {

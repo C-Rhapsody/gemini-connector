@@ -397,23 +397,147 @@ func TestTokenizeLaTeX(t *testing.T) {
 }
 
 func TestRenderRichHTML(t *testing.T) {
-	t.Run("no-math input produces byte-identical output to convertMarkdownToTelegramHTML", func(t *testing.T) {
-		inputs := []string{
-			"Hello **world**",
-			"# Heading\nParagraph with *italic* and [link](https://example.com)",
-			"- item 1\n- item 2\n  - nested",
-			"> a blockquote with <code>code</code>",
-			"```go\nfunc main() {}\n```",
+	t.Run("rich contract verifies paragraphs and intra-paragraph line breaks", func(t *testing.T) {
+		in := "Line 1\nLine 2\n\nLine 3"
+		got, err := renderRichHTML(in, "raw")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
 		}
-		for _, in := range inputs {
-			want := convertMarkdownToTelegramHTML(in)
+		want := "<p>Line 1<br>Line 2</p><p>Line 3</p>"
+		if got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+
+	t.Run("rich contract verifies basic markdown elements", func(t *testing.T) {
+		cases := []struct {
+			name string
+			in   string
+			want string
+		}{
+			{
+				name: "single paragraph with bold",
+				in:   "Hello **world**",
+				want: "<p>Hello <b>world</b></p>",
+			},
+			{
+				name: "heading followed by paragraph with italic and link",
+				in:   "# Heading\nParagraph with *italic* and [link](https://example.com)",
+				want: "<b>Heading</b>\n<p>Paragraph with <i>italic</i> and <a href=\"https://example.com\">link</a></p>",
+			},
+			{
+				name: "nested unordered list preserves bullet layout without p tags",
+				in:   "- item 1\n- item 2\n  - nested",
+				want: "• item 1\n• item 2\n  ◦ nested\n",
+			},
+			{
+				name: "blockquote without unwanted p wrapping",
+				in:   "> a blockquote with `code`",
+				want: "<blockquote>a blockquote with <code>code</code></blockquote>\n",
+			},
+			{
+				name: "fenced code block preserves raw newlines without br or p tags",
+				in:   "```go\nfunc main() {}\n```",
+				want: "<pre><code class=\"language-go\">func main() {}\n</code></pre>\n",
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				got, err := renderRichHTML(tc.in, "raw")
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if got != tc.want {
+					t.Errorf("got:\n  %q\nwant:\n  %q", got, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("rich contract verifies soft and hard line breaks", func(t *testing.T) {
+		t.Run("soft line break produces br", func(t *testing.T) {
+			in := "Soft\nBreak\nTest"
 			got, err := renderRichHTML(in, "raw")
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
+			want := "<p>Soft<br>Break<br>Test</p>"
 			if got != want {
-				t.Errorf("expected byte-identical output:\ngot:  %q\nwant: %q", got, want)
+				t.Errorf("got %q, want %q", got, want)
 			}
+		})
+
+		t.Run("hard line break with trailing spaces produces br", func(t *testing.T) {
+			in := "Hard  \nBreak  \nSpaces"
+			got, err := renderRichHTML(in, "raw")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			want := "<p>Hard<br>Break<br>Spaces</p>"
+			if got != want {
+				t.Errorf("got %q, want %q", got, want)
+			}
+		})
+
+		t.Run("hard line break with trailing backslash produces br", func(t *testing.T) {
+			in := "Backslash\\\nBreak"
+			got, err := renderRichHTML(in, "raw")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			want := "<p>Backslash<br>Break</p>"
+			if got != want {
+				t.Errorf("got %q, want %q", got, want)
+			}
+		})
+
+		t.Run("multiple blank lines between paragraphs collapse into paragraph boundaries", func(t *testing.T) {
+			in := "Para 1\n\n\n\nPara 2"
+			got, err := renderRichHTML(in, "raw")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			want := "<p>Para 1</p><p>Para 2</p>"
+			if got != want {
+				t.Errorf("got %q, want %q", got, want)
+			}
+		})
+	})
+
+	t.Run("rich contract verifies korean and emoji with formatting", func(t *testing.T) {
+		in := "안녕하세요 **세계**\n🚀 로켓 발사!"
+		got, err := renderRichHTML(in, "raw")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := "<p>안녕하세요 <b>세계</b><br>🚀 로켓 발사!</p>"
+		if got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+
+	t.Run("rich contract verifies special characters and literal escaping", func(t *testing.T) {
+		in := "Values: x < 10 && y > 20 & z != 0\nSecond line: `foo < bar && baz > qux`"
+		got, err := renderRichHTML(in, "raw")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := "<p>Values: x &lt; 10 &amp;&amp; y &gt; 20 &amp; z != 0<br>Second line: <code>foo &lt; bar &amp;&amp; baz &gt; qux</code></p>"
+		if got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+
+	t.Run("standard HTML convertMarkdownToTelegramHTML is completely unchanged", func(t *testing.T) {
+		in := "Line 1\nLine 2\n\nLine 3"
+		got := convertMarkdownToTelegramHTML(in)
+		if strings.Contains(got, "<p>") || strings.Contains(got, "</p>") || strings.Contains(got, "<br>") {
+			t.Errorf("standard HTML must NEVER contain <p> or <br> tags, got %q", got)
+		}
+		want := "Line 1\nLine 2\nLine 3"
+		if got != want {
+			t.Errorf("standard HTML got %q, want %q", got, want)
 		}
 	})
 
@@ -870,6 +994,119 @@ func TestTelegramAdapter_Send_RichIntegration(t *testing.T) {
 		}
 		if len(attachmentSent) != 1 || attachmentSent[0] != "/tmp/chart.png" {
 			t.Errorf("expected attachment to be sent, got %v", attachmentSent)
+		}
+	})
+
+	t.Run("rich wire payload contains Rich HTML with p and br tags", func(t *testing.T) {
+		var capturedHTML string
+		adapter := &TelegramAdapter{
+			chatID: 12345,
+			richConfig: TelegramRichConfig{
+				Enabled:    true,
+				ChatID:     12345,
+				MathEscape: "raw",
+			},
+			makeRequestFn: func(endpoint string, params tgbotapi.Params) (*tgbotapi.APIResponse, error) {
+				if endpoint == "sendRichMessage" {
+					var decoded struct {
+						HTML *string `json:"html"`
+					}
+					if err := json.Unmarshal([]byte(params["rich_message"]), &decoded); err == nil && decoded.HTML != nil {
+						capturedHTML = *decoded.HTML
+					}
+					return &tgbotapi.APIResponse{
+						Ok:     true,
+						Result: []byte(`{"message_id": 999, "chat": {"id": 12345}}`),
+					}, nil
+				}
+				return &tgbotapi.APIResponse{Ok: false}, errors.New("unexpected endpoint")
+			},
+			collectDeliverablesFn: func(after time.Time, exclude exclusionSet) []deliverable { return nil },
+		}
+
+		err := adapter.Send("12345", "Line 1\nLine 2\n\nLine 3", aiOpt)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := "<p>Line 1<br>Line 2</p><p>Line 3</p>"
+		if capturedHTML != want {
+			t.Errorf("captured rich_message.html = %q, want %q", capturedHTML, want)
+		}
+	})
+
+	t.Run("definitive 400 fallback sends standard HTML without p and br tags", func(t *testing.T) {
+		var fallbackText string
+		var fallbackParseMode string
+		adapter := &TelegramAdapter{
+			chatID: 12345,
+			richConfig: TelegramRichConfig{
+				Enabled:    true,
+				ChatID:     12345,
+				MathEscape: "raw",
+			},
+			makeRequestFn: func(endpoint string, params tgbotapi.Params) (*tgbotapi.APIResponse, error) {
+				return &tgbotapi.APIResponse{
+					Ok:          false,
+					ErrorCode:   400,
+					Description: "Bad Request: can't parse rich_message",
+				}, &tgbotapi.Error{Code: 400, Message: "Bad Request: can't parse rich_message"}
+			},
+			sendOneFn: func(chatID int64, text string, parseMode string, replyToID int) error {
+				fallbackText = text
+				fallbackParseMode = parseMode
+				return nil
+			},
+			collectDeliverablesFn: func(after time.Time, exclude exclusionSet) []deliverable { return nil },
+		}
+
+		err := adapter.Send("12345", "Line 1\nLine 2\n\nLine 3", aiOpt)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if fallbackParseMode != tgbotapi.ModeHTML {
+			t.Errorf("expected fallback parseMode HTML, got %q", fallbackParseMode)
+		}
+		if strings.Contains(fallbackText, "<p>") || strings.Contains(fallbackText, "<br>") {
+			t.Errorf("fallback message must NOT contain rich tags (<p>, <br>), got %q", fallbackText)
+		}
+		want := "Line 1\nLine 2\nLine 3"
+		if fallbackText != want {
+			t.Errorf("fallback message got %q, want %q", fallbackText, want)
+		}
+	})
+
+	t.Run("tag expansion crossing 4000 limit triggers fallback chunk path", func(t *testing.T) {
+		var richCalled int
+		var sendOneCalled int
+		adapter := &TelegramAdapter{
+			chatID: 12345,
+			richConfig: TelegramRichConfig{
+				Enabled:    true,
+				ChatID:     12345,
+				MathEscape: "raw",
+			},
+			makeRequestFn: func(endpoint string, params tgbotapi.Params) (*tgbotapi.APIResponse, error) {
+				richCalled++
+				return &tgbotapi.APIResponse{Ok: true}, nil
+			},
+			sendOneFn: func(chatID int64, text string, parseMode string, replyToID int) error {
+				sendOneCalled++
+				return nil
+			},
+			collectDeliverablesFn: func(after time.Time, exclude exclusionSet) []deliverable { return nil },
+		}
+
+		// 3995 'a's: raw text is <= 4000, but wrapped in <p>...</p> (7 extra bytes) it becomes 4002 > 4000.
+		text3995 := strings.Repeat("a", 3995)
+		err := adapter.Send("12345", text3995, aiOpt)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if richCalled != 0 {
+			t.Errorf("expected Rich to be bypassed when rendered HTML exceeds limit, got %d calls", richCalled)
+		}
+		if sendOneCalled == 0 {
+			t.Errorf("expected standard sendOne path to be called")
 		}
 	})
 }

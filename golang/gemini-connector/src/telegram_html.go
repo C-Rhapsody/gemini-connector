@@ -37,12 +37,22 @@ import (
 // A custom bold parser relaxes CommonMark flanking rules so that Korean text
 // like **"제목"**뒤에조사 or ** 강조 ** still renders as bold.
 func convertMarkdownToTelegramHTML(s string) string {
+	return convertMarkdownToTelegramHTMLWithMode(s, false)
+}
+
+// convertMarkdownToTelegramRichHTML converts a Markdown string into Telegram Rich HTML,
+// producing <p>...</p> for paragraphs and <br> for intra-paragraph line breaks.
+func convertMarkdownToTelegramRichHTML(s string) string {
+	return convertMarkdownToTelegramHTMLWithMode(s, true)
+}
+
+func convertMarkdownToTelegramHTMLWithMode(s string, richMode bool) string {
 	if s == "" {
 		return ""
 	}
 	var buf bytes.Buffer
 	lw := newLineTrackingWriter(&buf)
-	r := &telegramHTMLRenderer{out: lw}
+	r := &telegramHTMLRenderer{out: lw, richMode: richMode}
 	md := goldmark.New(
 		goldmark.WithExtensions(extension.Table),
 		goldmark.WithParserOptions(
@@ -141,6 +151,9 @@ var (
 	tagAEnd       = []byte{0x3C, 0x2F, 0x61, 0x3E}                                                       //</a>
 	tagQuoteAttr  = []byte{0x22, 0x3E}                                                                   // ">
 	tagGT         = []byte{0x3E}                                                                         // >
+	tagPOpen      = []byte{0x3C, 0x70, 0x3E}                                                             // <p>
+	tagPClose     = []byte{0x3C, 0x2F, 0x70, 0x3E}                                                       // </p>
+	tagBROpen     = []byte{0x3C, 0x62, 0x72, 0x3E}                                                       // <br>
 	newline       = []byte{0x0A}
 )
 
@@ -161,6 +174,8 @@ type telegramHTMLRenderer struct {
 	// inCodeSpan counts nesting inside inline code spans, whose literal
 	// content must be exempt from prose normalizations (LaTeX arrows etc.).
 	inCodeSpan int
+	// richMode enables Telegram Rich Text HTML rules (<p>...</p> and <br>).
+	richMode bool
 }
 
 // ensureLineStart writes a newline unless the output already sits at one.
@@ -226,7 +241,24 @@ func (r *telegramHTMLRenderer) separateBlocks(w util.BufWriter, n ast.Node) {
 	}
 }
 
+func isInside(n ast.Node, kind ast.NodeKind) bool {
+	for p := n.Parent(); p != nil; p = p.Parent() {
+		if p.Kind() == kind {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *telegramHTMLRenderer) renderParagraph(w util.BufWriter, _ []byte, n ast.Node, entering bool) (ast.WalkStatus, error) {
+	if r.richMode && !isInside(n, ast.KindListItem) && !isInside(n, ast.KindBlockquote) {
+		if entering {
+			_, _ = w.Write(tagPOpen)
+		} else {
+			_, _ = w.Write(tagPClose)
+		}
+		return ast.WalkContinue, nil
+	}
 	if !entering {
 		r.separateBlocks(w, n)
 	}
@@ -370,10 +402,12 @@ func (r *telegramHTMLRenderer) renderText(w util.BufWriter, source []byte, n ast
 			value = normalizeLatexArrows(value)
 		}
 		_, _ = w.WriteString(escapeHTML(value))
-		if textNode.HardLineBreak() {
-			_, _ = w.WriteString("\n")
-		} else if textNode.SoftLineBreak() {
-			_, _ = w.WriteString("\n")
+		if textNode.HardLineBreak() || textNode.SoftLineBreak() {
+			if r.richMode && r.inCodeSpan == 0 {
+				_, _ = w.Write(tagBROpen)
+			} else {
+				_, _ = w.WriteString("\n")
+			}
 		}
 	}
 	return ast.WalkContinue, nil
